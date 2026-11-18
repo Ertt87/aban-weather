@@ -1,0 +1,935 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0, viewport-fit=cover" />
+  <meta name="theme-color" content="#060911" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Абан Метео v4" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="description" content="Оперативное метеотабло п. Абан (Красноярский край, ВМО 29485): Супер-Ансамбль WeatherNext 3 + Open-Meteo, архив ERA5-Land с 1940 г., 35-дневный вероятностный прогноз и полевые метрики." />
+  <link rel="manifest" href="./manifest.webmanifest" />
+  <link rel="icon" type="image/svg+xml" href="./assets/icon.svg" />
+  <link rel="apple-touch-icon" href="./assets/icon.svg" />
+  <link rel="stylesheet" href="./css/styles.css" />
+  <title>п. Абан • Метео v4 • ВМО 29485</title>
+</head>
+<body>
+  <!-- Toast Notification Container -->
+  <div id="toastContainer" class="toast-container" aria-live="polite"></div>
+
+  <!-- Settings, API Key, Units, Cache & Model Leaderboard Modal -->
+  <div id="settingsModal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="settingsModalTitle">
+    <div class="glass-panel modal-dialog">
+      <div class="panel-head">
+        <div class="flex items-center gap-2.5">
+          <div class="header-brand__icon">
+            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+            </svg>
+          </div>
+          <div>
+            <h3 id="settingsModalTitle" class="text-base font-bold text-white" style="margin:0">Настройки API, MOS-лидерборд и Офлайн-кэш</h3>
+            <p class="text-xs text-slate-400" style="margin:0">Станция п. Абан (ВМО 29485 • 56.68°N, 96.07°E • 246 м)</p>
+          </div>
+        </div>
+        <button id="btnCloseSettings" type="button" class="btn-action" aria-label="Закрыть настройки">✕</button>
+      </div>
+
+      <!-- 1. Google Weather API Key Config -->
+      <div class="sub-card p-4 flex flex-col gap-2.5">
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <span class="text-xs font-mono uppercase tracking-wider text-sky-400 font-bold">
+            🛰️ 1. Ключ Google Maps Platform Weather API (WeatherNext 3)
+          </span>
+          <span id="modalKeyStatusBadge" class="badge-mono">Ключ не задан</span>
+        </div>
+        <p class="text-xs text-slate-300" style="margin:0">
+          Загружает 10-дневный (<code>days=10</code>) и 240-часовой прогноз напрямую с <code>weather.googleapis.com/v1</code>. Ключ сохраняется только локально в браузере (<code>localStorage</code>).
+        </p>
+        <div class="flex flex-wrap gap-2">
+          <input id="googleApiKeyInput" type="password" autocomplete="off" placeholder="Вставьте ключ Google Weather API..." class="date-input flex-1" style="min-width:210px" />
+          <button id="btnSaveApiKey" type="button" class="btn-action btn-action--solid">Сохранить и обновить</button>
+          <button id="btnTestApiKey" type="button" class="btn-action btn-action--primary">Тест 10д/240ч</button>
+        </div>
+        <div id="apiKeyTestResult" class="text-xs font-mono text-slate-400">
+          Без ключа Супер-Ансамбль работает на базе ECMWF + AIFS + ICON + GFS + MET Norway.
+        </div>
+      </div>
+
+      <!-- 2. Units & Pressure Reference -->
+      <div class="sub-card p-4 flex flex-col gap-3">
+        <div class="text-xs font-mono uppercase tracking-wider text-indigo-300 font-bold">
+          📏 2. Единицы измерения и приведение давления
+        </div>
+        <div class="grid grid-cols-3 gap-2">
+          <button id="modalUnitMetric" type="button" class="btn-action btn-action--solid font-mono">°C, м/с, мм</button>
+          <button id="modalUnitImperial" type="button" class="btn-action font-mono">°F, mph</button>
+          <button id="modalUnitDual" type="button" class="btn-action font-mono">Двойной °C/°F</button>
+        </div>
+        <div class="grid grid-cols-2 gap-2">
+          <button id="modalPressStation" type="button" class="btn-action font-mono">🏔️ Станция 246 м Абан</button>
+          <button id="modalPressMsl" type="button" class="btn-action font-mono">🌊 Приведено к ур. моря (MSL)</button>
+        </div>
+      </div>
+
+      <!-- 3. Open-Meteo Model Preference -->
+      <div class="sub-card p-4 flex flex-col gap-2.5">
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <span class="text-xs font-mono uppercase tracking-wider text-emerald-400 font-bold">
+            🌍 3. Предпочтительная модель Open-Meteo
+          </span>
+          <span class="text-[11px] font-mono text-emerald-300">14д ретро + 16д/35д</span>
+        </div>
+        <div class="grid grid-cols-2 sm:grid-cols-4 gap-2" id="omModelSelectorGroup">
+          <button id="omModelBtn-multi" data-om-model="multi" type="button" class="source-btn source-btn-active flex-col" style="align-items:flex-start">
+            <span class="font-bold">Супер-Ансамбль</span>
+            <span class="text-[10px] text-slate-400">4 модели + MOS</span>
+          </button>
+          <button id="omModelBtn-ecmwf_ifs025" data-om-model="ecmwf_ifs025" type="button" class="source-btn flex-col" style="align-items:flex-start">
+            <span class="font-bold">ECMWF IFS</span>
+            <span class="text-[10px] text-slate-400">0.25° Европа</span>
+          </button>
+          <button id="omModelBtn-ecmwf_aifs025" data-om-model="ecmwf_aifs025" type="button" class="source-btn flex-col" style="align-items:flex-start">
+            <span class="font-bold">ECMWF AIFS</span>
+            <span class="text-[10px] text-slate-400">AI-физика 0.25°</span>
+          </button>
+          <button id="omModelBtn-gfs_seamless" data-om-model="gfs_seamless" type="button" class="source-btn flex-col" style="align-items:flex-start">
+            <span class="font-bold">NOAA GFS</span>
+            <span class="text-[10px] text-slate-400">Глобальная</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- 4. 14-Day Model MAE Leaderboard (MOS) -->
+      <div id="mosLeaderboardSection" class="sub-card p-4 flex flex-col gap-2.5">
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <span class="text-xs font-mono uppercase tracking-wider text-purple-300 font-bold">
+            🏆 4. Рейтинг точности моделей (MOS за 14 дней • Абан)
+          </span>
+          <span id="mosBestBadge" class="badge-mono">Лидер: расчёт...</span>
+        </div>
+        <p id="mosSummaryLine" class="text-xs text-slate-400" style="margin:0">
+          Сравнение вчерашних прогнозов моделей с фактической температурой (день 08–20ч и ночь 20–08ч).
+        </p>
+        <div class="data-table-wrap">
+          <table class="data-table" style="min-width:520px">
+            <thead>
+              <tr>
+                <th>Модель</th>
+                <th>MAE (°C)</th>
+                <th>Bias день</th>
+                <th>Bias ночь</th>
+                <th>Вес MOS</th>
+                <th>Выборка</th>
+              </tr>
+            </thead>
+            <tbody id="mosLeaderboardBody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- 5. Offline Cache Manager + JSON Export/Import -->
+      <div class="sub-card p-4 flex flex-col gap-2.5">
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <span class="text-xs font-mono uppercase tracking-wider text-amber-400 font-bold">
+            💾 5. Автономный офлайн-кэш и архивные срезы
+          </span>
+          <span id="modalCacheSizeBadge" class="text-[11px] font-mono text-amber-300">Кэш: проверка...</span>
+        </div>
+        <div id="modalCacheMetaInfo" class="p-3 rounded-xl text-xs font-mono text-slate-300" style="background:#050811;border:1px solid rgba(30,41,59,0.9)">
+          Последний слепок: проверка...
+        </div>
+        <div class="grid grid-cols-2 sm:grid-cols-4 gap-2">
+          <button id="btnSaveCache" type="button" class="btn-action btn-action--amber font-mono">💾 В память</button>
+          <button id="btnExportJson" type="button" class="btn-action font-mono">⬇️ Экспорт JSON</button>
+          <label class="btn-action font-mono text-sky-300 cursor-pointer">
+            <span>⬆️ Импорт JSON</span>
+            <input id="inputImportJson" type="file" accept=".json,application/json" class="hidden" />
+          </label>
+          <button id="btnClearCache" type="button" class="btn-action btn-action--danger font-mono">🗑️ Очистить</button>
+        </div>
+      </div>
+
+      <!-- 6. Mobile Home Screen PWA Guide -->
+      <div class="p-4 rounded-xl flex flex-col gap-1.5" style="background:rgba(30,27,75,0.45);border:1px solid rgba(99,102,241,0.32)">
+        <div class="text-xs font-mono uppercase tracking-wider text-indigo-300 font-bold">
+          📱 6. Установка PWA на главный экран смартфона
+        </div>
+        <div class="text-xs text-slate-300">
+          • <strong>Android (Chrome):</strong> меню <code>⋮</code> → <strong>«Установить приложение»</strong>.<br />
+          • <strong>iPhone (Safari):</strong> кнопка <strong>«Поделиться»</strong> → <strong>«На экран „Домой“»</strong>.
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Top Compact Sticky Header -->
+  <header class="app-header">
+    <div class="app-header__inner">
+      <!-- Left: Station Title, Status, MOS Pill -->
+      <div class="header-brand">
+        <div class="header-brand__icon" aria-hidden="true">
+          <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 15a4 4 0 004 4h9a5 5 0 10-.1-9.999 5.002 5.002 0 10-9.78 2.096A4.001 4.001 0 003 15z" />
+          </svg>
+        </div>
+        <div class="min-w-0">
+          <div class="header-brand__title-row">
+            <h1 class="header-brand__title">п. Абан • Метео v4 • ВМО 29485</h1>
+            <span id="liveStatusPill" class="status-pill status-pill--reference">
+              <span id="liveStatusDot" class="status-dot"></span>
+              <span id="liveStatusText">ЭТАЛОН</span>
+            </span>
+            <button id="mosStatusPill" type="button" class="mos-pill" title="Открыть 14-дневный рейтинг точности моделей MOS">
+              <span id="mosStatusText">MOS: авто</span>
+            </button>
+          </div>
+          <div class="header-brand__meta">
+            <span>56.68°N, 96.07°E • 246 м • UTC+7</span>
+            <span>•</span>
+            <span id="syncTimestampText" class="text-slate-300 truncate">Синхр.: загрузка...</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Right: Quick Controls -->
+      <div class="header-actions">
+        <button id="refreshDataBtn" type="button" class="btn-action btn-action--primary" title="Обновить метеоданные">
+          <svg id="refreshSpinnerIcon" class="w-4 h-4 text-sky-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+          </svg>
+          <span class="hidden sm-inline">Обновить</span>
+        </button>
+
+        <button id="btnPressureToggle" type="button" class="btn-action font-mono" title="Переключить давление: станция 246 м Абан / уровень моря (MSL)">
+          <span id="pressureToggleText">246м Абан</span>
+        </button>
+
+        <div class="segmented-group desktop-only-flex" role="group" aria-label="Единицы температуры">
+          <button id="btnUnitMetric" type="button" class="segmented-btn is-active">°C</button>
+          <button id="btnUnitImperial" type="button" class="segmented-btn">°F</button>
+          <button id="btnUnitDual" type="button" class="segmented-btn">°C+°F</button>
+        </div>
+
+        <button id="btnShareSummary" type="button" class="btn-action" title="Поделиться или скопировать сводку для Telegram">
+          <svg class="w-4 h-4 text-sky-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8.684 13.342C8.886 12.938 9 12.482 9 12c0-.482-.114-.938-.316-1.342m0 2.684a3 3 0 110-2.684m0 2.684l6.632 3.316m-6.632-6l6.632-3.316m0 0a3 3 0 105.367-2.684 3 3 0 00-5.367 2.684zm0 9.316a3 3 0 105.368 2.684 3 3 0 00-5.368-2.684z" />
+          </svg>
+          <span class="desktop-only-inline">Сводка</span>
+        </button>
+
+        <button id="btnOpenSettings" type="button" class="btn-action font-mono" title="Настройки, API-ключ, MOS-таблица и кэш">
+          <span>⚙️</span>
+          <span class="hidden sm-inline">API и MOS</span>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <!-- Main Content -->
+  <main class="app-main">
+    <!-- SECTION 1: Current Weather & Dynamic Control Milestone -->
+    <section id="sec-now" class="section-anchor hero-grid">
+      <!-- Current Weather Card -->
+      <div class="glass-panel panel-pad">
+        <div class="panel-head">
+          <h2 class="panel-title">
+            <span class="status-dot text-emerald-400"></span>
+            <span>Сейчас в п. Абан</span>
+          </h2>
+          <span id="currentObsTimeBadge" class="badge-mono">UTC+7 • Абан</span>
+        </div>
+
+        <div class="hero-current-body">
+          <!-- Main Temp & Wet Bulb -->
+          <div class="hero-temp-block">
+            <div id="currentWeatherIcon" class="hero-icon-box"></div>
+            <div class="min-w-0">
+              <div class="flex items-baseline gap-2 flex-wrap">
+                <span id="currentTempDisplay" class="hero-temp-val">--°C</span>
+                <span id="currentTempSecondary" class="text-sm font-mono text-slate-400"></span>
+              </div>
+              <p id="currentCondText" class="text-sm font-bold text-slate-100 mt-1" style="margin-bottom:0.15rem">Загрузка сводки...</p>
+              <p class="text-xs font-mono text-slate-400" style="margin:0">
+                Ощущ.: <strong id="currentFeelsDisplay" class="text-sky-300">--</strong>
+                • <span title="Температура смоченного термометра (Stull)">Tw: <strong id="currentWetBulbDisplay" class="text-cyan-300">--</strong></span>
+              </p>
+            </div>
+          </div>
+
+          <!-- 2x2 Telemetry Grid -->
+          <div class="hero-telemetry-grid">
+            <div class="metric-box">
+              <div class="metric-box__head">
+                <span>Ветер</span>
+                <span id="currentWindDirTag" class="font-mono text-sky-400 font-bold">--</span>
+              </div>
+              <div id="currentWindDisplay" class="metric-box__val">-- м/с</div>
+              <div id="currentGustSub" class="metric-box__sub text-amber-300">Порывы --</div>
+            </div>
+
+            <div class="metric-box">
+              <div class="metric-box__head">
+                <span>Осадки и снег</span>
+                <span id="currentPrecipPhaseTag" class="badge-mono" style="padding:0.05rem 0.38rem;font-size:0.625rem">сухо</span>
+              </div>
+              <div id="currentPrecipProbDisplay" class="metric-box__val text-cyan-300">0% • 0.0 мм</div>
+              <div id="currentSnowDepthDisplay" class="metric-box__sub">Покров: -- см</div>
+            </div>
+
+            <div class="metric-box">
+              <div class="metric-box__head">
+                <span>Влажность / Td</span>
+                <span id="currentDewPointDisplay" class="font-mono text-emerald-300">Td: --</span>
+              </div>
+              <div class="flex items-center gap-2 mt-1">
+                <span id="currentHumidityDisplay" class="metric-box__val" style="margin-top:0">--%</span>
+                <div class="progress-track">
+                  <div id="currentHumidityBar" class="progress-fill" style="width:0%"></div>
+                </div>
+              </div>
+              <div id="currentCloudDisplay" class="metric-box__sub">Облачность: --%</div>
+            </div>
+
+            <div class="metric-box">
+              <div class="metric-box__head">
+                <span id="currentPressureRefLabel">Давление (246м)</span>
+                <span id="currentUvTag" class="font-mono text-emerald-400">УФ: --</span>
+              </div>
+              <div id="currentPressureDisplay" class="metric-box__val text-emerald-400">-- мм</div>
+              <div id="currentDeltaPBadge" class="metric-box__sub">ΔP3ч: -- • ΔP24ч: --</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 4-Layer Soil Preview + AQI/Smog + Sunrise/Sunset -->
+        <div class="hero-substrip">
+          <div>
+            <div class="text-[10px] font-mono uppercase text-slate-400 mb-1">Профиль почвы (0 / 6 / 18 / 54 см)</div>
+            <div class="soil-mini-grid">
+              <div class="soil-chip">
+                <div class="soil-chip__depth">0 см</div>
+                <div id="currentSoil0" class="soil-chip__val">--</div>
+              </div>
+              <div class="soil-chip">
+                <div class="soil-chip__depth">6 см</div>
+                <div id="currentSoil6" class="soil-chip__val">--</div>
+              </div>
+              <div class="soil-chip">
+                <div class="soil-chip__depth">18 см</div>
+                <div id="currentSoil18" class="soil-chip__val">--</div>
+              </div>
+              <div class="soil-chip">
+                <div class="soil-chip__depth">54 см</div>
+                <div id="currentSoil54" class="soil-chip__val">--</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="astro-aqi-box">
+            <div class="flex items-center justify-between gap-2">
+              <span class="text-slate-400">Воздух / Смог:</span>
+              <span id="currentAqiBadge" class="font-bold text-emerald-300">AQI -- • PM2.5 --</span>
+            </div>
+            <div class="flex items-center justify-between gap-2">
+              <span class="text-slate-400">Астрономия:</span>
+              <span id="currentAstroText" class="text-amber-300 font-bold">--:-- / --:--</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Dynamic Control Milestone (+3h & Nearest 08:00/20:00 Shift Anchor) + Today Min/Max -->
+      <div class="glass-panel panel-pad flex flex-col justify-between gap-3">
+        <div class="flex flex-col gap-3">
+          <div class="panel-head">
+            <h2 class="panel-title">
+              <svg class="w-4 h-4 text-cyan-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+              </svg>
+              <span id="controlPointTitle">Контрольный репер</span>
+              <span id="controlTargetBadge" class="badge-mono">--:--</span>
+            </h2>
+            <span id="controlCondBadge" class="badge-mono">--</span>
+          </div>
+
+          <div class="sub-card p-3 flex items-center justify-between gap-3">
+            <div class="flex items-center gap-3 min-w-0">
+              <div id="controlIcon" class="hero-icon-box" style="width:3.25rem;height:3.25rem"></div>
+              <div class="min-w-0">
+                <div class="flex items-baseline gap-2 flex-wrap">
+                  <span id="controlTemp" class="text-2xl font-extrabold font-mono text-white">--°C</span>
+                  <span id="controlFeels" class="text-xs font-mono text-slate-400">Ощущ. --</span>
+                </div>
+                <div id="controlCondDesc" class="text-xs text-cyan-300 font-semibold truncate mt-0.5">--</div>
+              </div>
+            </div>
+            <div class="text-right font-mono text-xs flex-shrink-0">
+              <div class="text-slate-300">Осадки: <strong id="controlPrecip" class="text-cyan-300">--%</strong></div>
+              <div class="text-slate-300">Ветер: <strong id="controlWind" class="text-white">--</strong></div>
+              <div class="text-slate-400">Почва 0см: <strong id="controlSoil0" class="text-amber-300">--</strong></div>
+            </div>
+          </div>
+
+          <!-- +3h Dynamic Milestone -->
+          <div class="sub-card p-3 flex items-center justify-between gap-2">
+            <div>
+              <div class="text-[10px] font-mono uppercase text-slate-400">Ближайший тренд +3 часа</div>
+              <div id="controlNext3hLabel" class="text-xs font-mono font-bold text-sky-300 mt-0.5">Через 3ч (--:--)</div>
+            </div>
+            <div class="text-right font-mono">
+              <div id="controlNext3hTemp" class="text-lg font-extrabold text-amber-300">--°C</div>
+              <div id="controlNext3hDetails" class="text-[11px] text-slate-400">Уточнение курса</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Today Min / Max -->
+        <div class="flex flex-wrap items-center justify-between gap-2 pt-2" style="border-top:1px solid rgba(30,41,59,0.88)">
+          <span id="todayExtremesLabel" class="text-xs text-slate-400 font-semibold">Сегодня:</span>
+          <div class="flex items-center gap-2 font-mono text-xs">
+            <span class="text-cyan-300">Min: <strong id="todayMinBadge">--</strong></span>
+            <span style="display:inline-block;width:3rem;height:0.35rem;border-radius:9999px;background:linear-gradient(90deg,#22d3ee,#38bdf8,#fbbf24)"></span>
+            <span class="text-amber-300">Max: <strong id="todayMaxBadge">--</strong></span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- SECTION 1.5: Filters, Source Selector, 1940..+35d Archive/Ensemble Timeline & Period KPIs -->
+    <section id="sec-filters" class="section-anchor glass-panel glass-panel--accent" style="overflow:hidden">
+      <button id="drawerToggleTrigger" type="button" class="drawer-trigger" aria-expanded="false" aria-controls="controlsDrawerBody">
+        <div class="flex items-center gap-2.5 min-w-0 flex-1">
+          <div class="header-brand__icon" style="width:2.2rem;height:2.2rem">🎚️</div>
+          <div class="flex items-center gap-2 flex-wrap min-w-0">
+            <span class="text-sm sm:text-base font-bold text-white">Период, источник и фильтры</span>
+            <span id="drawerChipSource" class="badge-mono">⚡ Супер-Ансамбль</span>
+            <span id="drawerChipPeriod" class="badge-mono" style="background:rgba(30,41,59,0.9);border-color:rgba(71,85,105,0.8);color:#e2e8f0">10 дн.</span>
+            <span id="drawerChipWindow" class="badge-mono" style="background:rgba(245,158,11,0.12);border-color:rgba(245,158,11,0.3);color:#fcd34d">24ч</span>
+            <span id="drawerChipExtremes" class="badge-mono hidden sm-inline">--</span>
+          </div>
+        </div>
+        <span class="btn-action btn-action--primary" style="min-height:36px;padding:0 0.7rem">
+          <span id="drawerToggleBtnText">Настроить</span>
+          <svg id="drawerToggleChevron" class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" style="transition:transform 0.2s ease">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.2" d="M19 9l-7 7-7-7" />
+          </svg>
+        </span>
+      </button>
+
+      <div id="controlsDrawerBody" class="drawer-body">
+        <!-- Row A: Source Mode Selector -->
+        <div class="flex flex-col gap-2">
+          <div class="flex flex-wrap items-center justify-between gap-2 text-xs font-mono text-slate-400">
+            <span class="uppercase tracking-wider text-slate-300 font-bold">1. Источник метеоданных:</span>
+            <span id="activeSourceBadge" class="text-sky-300">Супер-Ансамбль</span>
+          </div>
+          <div class="source-grid" role="group" aria-label="Режим источника данных">
+            <button id="srcBtn-hybrid" data-source-mode="hybrid" type="button" class="source-btn source-btn-active">
+              <span class="font-bold">⚡ Супер-Ансамбль</span>
+              <span class="text-[10px] text-slate-400">WN3 + 5 моделей</span>
+            </button>
+            <button id="srcBtn-google_wn3" data-source-mode="google_wn3" type="button" class="source-btn">
+              <span class="font-bold">🛰️ WeatherNext 3</span>
+              <span id="wn3ModeSubTag" class="text-[10px] text-slate-400">10д / 240ч</span>
+            </button>
+            <button id="srcBtn-open_meteo" data-source-mode="open_meteo" type="button" class="source-btn">
+              <span class="font-bold">🌍 Open-Meteo (16д+35д)</span>
+              <span class="text-[10px] text-slate-400">Ансамбль + Почва</span>
+            </button>
+            <button id="srcBtn-offline_cache" data-source-mode="offline_cache" type="button" class="source-btn">
+              <span class="font-bold">💾 Офлайн-кэш</span>
+              <span class="text-[10px] text-slate-400">Локальная память</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- Row B: Horizon Presets -->
+        <div class="flex flex-col gap-2 pt-2" style="border-top:1px solid rgba(30,41,59,0.8)">
+          <div class="flex flex-wrap items-center justify-between gap-2 text-xs font-mono text-slate-400">
+            <span class="uppercase tracking-wider text-slate-300 font-bold">2. Горизонт прогноза и архива:</span>
+            <span id="activePresetBadge" class="text-sky-300 font-bold">10 дней</span>
+          </div>
+          <div class="touch-scroll-row" role="group" aria-label="Пресеты горизонта">
+            <button id="presetBtn-archive7_7" data-preset="archive7_7" type="button" class="preset-btn text-amber-300">Архив 7д + 7д</button>
+            <button id="presetBtn-3d" data-preset="3d" type="button" class="preset-btn">3 дня</button>
+            <button id="presetBtn-7d" data-preset="7d" type="button" class="preset-btn">7 дней</button>
+            <button id="presetBtn-10d" data-preset="10d" type="button" class="preset-btn preset-btn-active">10 дней (Точный)</button>
+            <button id="presetBtn-16d" data-preset="16d" type="button" class="preset-btn">16 дней (Ансамбль)</button>
+            <button id="presetBtn-35d" data-preset="35d" type="button" class="preset-btn text-purple-300">35 дней (Тренд P10–P90)</button>
+            <button id="presetBtn-weekend" data-preset="weekend" type="button" class="preset-btn">Выходные</button>
+          </div>
+        </div>
+
+        <!-- Row C: Arbitrary Date Range Pickers + Confidence Timeline + Time-of-Day Windows -->
+        <div class="filters-split-grid">
+          <!-- Arbitrary Dates (1940-01-01 to +35d) + Confidence Timeline Strip -->
+          <div class="sub-card p-3 flex flex-col gap-2.5">
+            <div class="flex flex-wrap items-center justify-between gap-2 text-xs">
+              <span class="font-bold uppercase tracking-wider text-slate-300">Произвольные даты (1940 – +35д)</span>
+              <span id="archiveLoadHint" class="text-[11px] font-mono text-slate-400">ERA5-Land + Прогноз</span>
+            </div>
+
+            <div class="grid grid-cols-2 gap-2">
+              <div>
+                <label for="inputStartDate" class="block text-[11px] font-mono text-slate-400 mb-1">С даты:</label>
+                <input id="inputStartDate" type="date" min="1940-01-01" class="date-input" />
+              </div>
+              <div>
+                <label for="inputEndDate" class="block text-[11px] font-mono text-slate-400 mb-1">По дату:</label>
+                <input id="inputEndDate" type="date" min="1940-01-01" class="date-input" />
+              </div>
+            </div>
+
+            <div class="flex flex-wrap items-center justify-between gap-2 text-[10px] font-mono text-slate-400">
+              <div class="flex flex-wrap items-center gap-2">
+                <span class="text-amber-300">■ Архив</span>
+                <span class="text-sky-300">■ Точный</span>
+                <span class="text-indigo-300">■ Ансамбль</span>
+                <span class="text-purple-300">■ Тренд</span>
+              </div>
+              <div id="pentadToggleWrap" class="hidden">
+                <button id="btnGroupByPentad" type="button" class="toggle-chip" title="Группировать >14 дней по 5-дневкам">
+                  <span id="pentadToggleLabel">По суткам / По 5-дневкам</span>
+                </button>
+              </div>
+            </div>
+
+            <div id="confidenceTimelineTrack" class="confidence-timeline" aria-label="Шкала уверенности по суткам"></div>
+          </div>
+
+          <!-- Time-of-Day Window Buttons -->
+          <div class="sub-card p-3 flex flex-col justify-between gap-2.5">
+            <div class="flex items-center justify-between text-xs">
+              <span class="font-bold uppercase tracking-wider text-slate-300">Окно времени суток</span>
+              <span id="activeTimeWindowBadge" class="text-[11px] font-mono text-sky-300">00:00–24:00</span>
+            </div>
+
+            <div class="window-grid" role="group" aria-label="Фильтр времени суток">
+              <button id="windowBtn-full" data-window="full" type="button" class="window-btn window-btn-active">
+                <span>24 часа</span>
+                <span class="text-[10px] text-slate-400">00–24ч</span>
+              </button>
+              <button id="windowBtn-day_shift" data-window="day_shift" type="button" class="window-btn">
+                <span>Дневная</span>
+                <span class="text-[10px] text-slate-400">08–20ч</span>
+              </button>
+              <button id="windowBtn-daylight" data-window="daylight" type="button" class="window-btn">
+                <span>☀️ Световой</span>
+                <span id="windowDaylightSpanHint" class="text-[10px] text-slate-400">Астр. Абана</span>
+              </button>
+              <button id="windowBtn-night" data-window="night" type="button" class="window-btn">
+                <span>🌙 Ночь</span>
+                <span class="text-[10px] text-slate-400">20–08ч</span>
+              </button>
+            </div>
+
+            <div class="flex items-center justify-between text-[11px] font-mono text-slate-400">
+              <span>Астрономия п. Абан (56.68°N)</span>
+              <span id="windowHoursCount" class="text-slate-300">24/24 ч</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Row D: Period KPI Summary Cards -->
+        <div class="kpi-grid">
+          <div class="kpi-card">
+            <div class="text-[10px] font-mono text-slate-400 uppercase">Период и зона</div>
+            <div id="periodSumDaysCount" class="text-base font-extrabold font-mono text-white mt-0.5">-- суток</div>
+            <div id="periodSumDateSpan" class="text-[11px] font-mono text-sky-300 truncate">--</div>
+            <div id="periodSumZones" class="text-[10px] font-mono text-slate-400 truncate mt-0.5">--</div>
+          </div>
+
+          <div class="kpi-card">
+            <div class="text-[10px] font-mono text-slate-400 uppercase">Min / Max (P10–P90)</div>
+            <div class="flex items-baseline gap-1.5 mt-0.5 font-mono">
+              <span id="periodSumAbsMax" class="text-base font-extrabold text-amber-300">--</span>
+              <span class="text-slate-500">/</span>
+              <span id="periodSumAbsMin" class="text-base font-extrabold text-cyan-300">--</span>
+            </div>
+            <div id="periodSumCorridor" class="text-[10px] font-mono text-purple-300 truncate">Коридор P10..P90: --</div>
+            <div id="periodSumAbsDates" class="text-[10px] font-mono text-slate-400 truncate">--</div>
+          </div>
+
+          <div class="kpi-card">
+            <div class="text-[10px] font-mono text-slate-400 uppercase">Средняя День / Ночь</div>
+            <div class="flex items-baseline gap-1.5 mt-0.5 font-mono">
+              <span id="periodSumAvgDay" class="text-base font-extrabold text-white">--</span>
+              <span class="text-slate-500">/</span>
+              <span id="periodSumAvgNight" class="text-sm font-bold text-indigo-300">--</span>
+            </div>
+            <div id="periodSumAnomaly" class="text-[10px] font-mono text-amber-300 truncate">К норме 1991–2020: --</div>
+            <div id="periodSumWindowAvg" class="text-[10px] font-mono text-sky-300 truncate">В окне: --</div>
+          </div>
+
+          <div class="kpi-card">
+            <div class="text-[10px] font-mono text-slate-400 uppercase">Осадки, снег и сухие</div>
+            <div class="flex items-baseline gap-1.5 mt-0.5 font-mono">
+              <span id="periodSumPrecipMm" class="text-base font-extrabold text-cyan-300">-- мм</span>
+              <span id="periodSumSnowCm" class="text-xs text-sky-200">❄ -- см</span>
+            </div>
+            <div id="periodSumDryDays" class="text-[10px] font-mono text-emerald-300 truncate mt-0.5">Сухих дней: --</div>
+          </div>
+
+          <div class="kpi-card kpi-card--wide-mobile">
+            <div class="text-[10px] font-mono text-slate-400 uppercase">Пиковый ветер</div>
+            <div id="periodSumMaxWind" class="text-base font-extrabold font-mono text-white mt-0.5">--</div>
+            <div id="periodSumWindMeta" class="text-[10px] font-mono text-amber-300 truncate mt-0.5">--</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- SECTION 2: Interactive Forecast Cards & Risk Filters -->
+    <section id="sec-days" class="section-anchor glass-panel panel-pad flex flex-col gap-3">
+      <div class="flex flex-wrap items-center justify-between gap-2.5">
+        <div>
+          <h2 id="stripSectionTitle" class="text-base font-bold text-white" style="margin:0">Прогноз по п. Абан</h2>
+          <p class="text-xs text-slate-400 mt-0.5" style="margin-bottom:0">Нажмите на карточку суток для почасового и полевого разбора</p>
+        </div>
+        <div class="flex items-center gap-2">
+          <button id="stripPentadToggleBtn" type="button" class="toggle-chip hidden">По 5-дневкам</button>
+          <span class="sm-hidden badge-mono">↔ Свайп</span>
+        </div>
+      </div>
+
+      <!-- Risk Filters -->
+      <div class="touch-scroll-row" role="group" aria-label="Фильтры рисков">
+        <button id="filterBtn-all" data-filter="all" type="button" class="filter-chip is-active">Все (0)</button>
+        <button id="filterBtn-frost" data-filter="frost" type="button" class="filter-chip">
+          <span>❄️</span><span id="filterLabel-frost">Заморозки (0)</span>
+        </button>
+        <button id="filterBtn-ice_blizzard" data-filter="ice_blizzard" type="button" class="filter-chip">
+          <span>🧊</span><span id="filterLabel-ice_blizzard">Гололедица/Метель (0)</span>
+        </button>
+        <button id="filterBtn-precip" data-filter="precip" type="button" class="filter-chip">
+          <span>🌧️</span><span id="filterLabel-precip">Осадки ≥15% (0)</span>
+        </button>
+        <button id="filterBtn-clear" data-filter="clear" type="button" class="filter-chip">
+          <span>☀️</span><span id="filterLabel-clear">Сухие окна (0)</span>
+        </button>
+      </div>
+
+      <!-- Forecast Strip Container -->
+      <div id="forecastStripContainer" class="forecast-strip touch-scroll-row"></div>
+    </section>
+
+    <!-- SECTION 3: Detailed Day & 24h Diurnal Inspector + Wind Compass + 4 Field Ops Cards -->
+    <section id="sec-hourly" class="section-anchor glass-panel glass-panel--accent panel-pad flex flex-col gap-4">
+      <div class="panel-head">
+        <div class="flex flex-wrap items-center gap-2">
+          <span id="inspectorDateBadge" class="badge-mono font-bold">--</span>
+          <span id="inspectorZoneBadge" class="zone-pill zone-pill--deterministic">--</span>
+          <h3 id="inspectorTitle" class="text-base font-bold text-white" style="margin:0">Инспектор суток</h3>
+          <span id="inspectorRiskBadges" class="flex flex-wrap gap-1.5"></span>
+        </div>
+        <div class="flex items-center gap-2 font-mono text-xs text-slate-300">
+          <button id="btnPrevDay" type="button" class="btn-action" aria-label="Предыдущие сутки">◀ <span class="sm-hidden">Пред.</span></button>
+          <span id="inspectorIndexCounter" class="px-2 font-bold">День 1 / 1</span>
+          <button id="btnNextDay" type="button" class="btn-action" aria-label="Следующие сутки"><span class="sm-hidden">След.</span> ▶</button>
+        </div>
+      </div>
+
+      <!-- 24h Diurnal Chart & Selected Hour Telemetry Bar -->
+      <div class="sub-card p-3 flex flex-col gap-3">
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <div class="flex items-center gap-2 flex-wrap">
+            <span class="text-sm font-bold text-white">🕒 Почасовой ход суток (00:00 – 23:00)</span>
+            <span id="inspectorWindowLabel" class="badge-mono">Окно: 24ч</span>
+          </div>
+          <span id="diurnalHonestyNotice" class="text-[11px] font-mono text-purple-300 hidden"></span>
+        </div>
+
+        <div class="hour-bar-grid">
+          <div>
+            <span id="selectedHourTitle" class="block text-[11px] text-slate-400">Час (--:00):</span>
+            <strong id="selectedHourTemp" class="text-sm text-amber-300">--</strong>
+            <div id="selectedHourWetBulb" class="text-[10px] text-cyan-300">Tw: -- • Td: --</div>
+          </div>
+          <div>
+            <span class="block text-[11px] text-slate-400">Средняя T° окна:</span>
+            <strong id="diurnalWindowAvgTemp" class="text-sm text-sky-300">--</strong>
+            <div id="diurnalWindowMinMax" class="text-[10px] text-slate-400">Min/Max: --</div>
+          </div>
+          <div>
+            <span class="block text-[11px] text-slate-400">Ветер в выбранный час:</span>
+            <strong id="diurnalWindowWind" class="text-sm text-white">--</strong>
+            <div id="diurnalWindowPressure" class="text-[10px] text-emerald-300">Давл.: --</div>
+          </div>
+          <div>
+            <span class="block text-[11px] text-slate-400">Осадки в этот час / окне:</span>
+            <strong id="diurnalWindowPrecip" class="text-sm text-cyan-300">--</strong>
+            <div id="diurnalWindowSoil" class="text-[10px] text-amber-300">Почва 0см: --</div>
+          </div>
+        </div>
+
+        <div class="chart-scroll-wrap grid-bg">
+          <div id="diurnalChartContainer"></div>
+        </div>
+
+        <div id="inspectorFrostAdvisory" class="p-3 rounded-xl flex items-center gap-2 text-xs text-cyan-200" style="background:rgba(8,51,68,0.45);border:1px solid rgba(34,211,238,0.3)">
+          <span>⚠️</span>
+          <span id="inspectorAdvisoryText">--</span>
+        </div>
+      </div>
+
+      <!-- Day vs Next-Night (20–08ч) + Vector Wind Compass -->
+      <div class="inspector-split">
+        <div class="day-night-grid">
+          <!-- Daytime Card -->
+          <div class="sub-card p-4 flex flex-col justify-between">
+            <div>
+              <div class="flex items-center justify-between text-xs font-mono uppercase tracking-wider font-bold text-amber-300">
+                <span>☀️ Дневной интервал (08–20ч)</span>
+                <span>Max T°</span>
+              </div>
+              <div class="mt-3 flex items-center gap-3">
+                <div id="inspectorDayIcon" class="hero-icon-box" style="width:3.5rem;height:3.5rem"></div>
+                <div>
+                  <div id="inspectorDayTemp" class="text-3xl font-extrabold font-mono text-white">--</div>
+                  <div id="inspectorDayTempSub" class="text-xs font-mono text-slate-400">--</div>
+                </div>
+              </div>
+              <p id="inspectorDayCond" class="text-sm font-bold text-slate-100 mt-2.5" style="margin-bottom:0.2rem">--</p>
+              <p id="inspectorAstroSummary" class="text-xs font-mono text-amber-300" style="margin:0">Восход/закат: --</p>
+            </div>
+            <div class="mt-3 pt-2 flex items-center justify-between text-xs font-mono" style="border-top:1px solid rgba(30,41,59,0.85)">
+              <span class="text-slate-400">Осадки днём:</span>
+              <span id="inspectorDayPrecip" class="font-bold text-cyan-300">--</span>
+            </div>
+          </div>
+
+          <!-- Next-Night Card (Explicitly 20-08h next morning) -->
+          <div class="sub-card p-4 flex flex-col justify-between" style="background:linear-gradient(180deg,rgba(15,23,42,0.92),rgba(6,9,17,0.96))">
+            <div>
+              <div class="flex items-center justify-between text-xs font-mono uppercase tracking-wider font-bold text-indigo-300">
+                <span>🌙 Предстоящая ночь (20–08ч)</span>
+                <span>Min T°</span>
+              </div>
+              <div class="mt-3 flex items-center gap-3">
+                <div id="inspectorNightIcon" class="hero-icon-box" style="width:3.5rem;height:3.5rem"></div>
+                <div>
+                  <div id="inspectorNightTemp" class="text-3xl font-extrabold font-mono text-cyan-200">--</div>
+                  <div id="inspectorNightTempSub" class="text-xs font-mono text-slate-400">--</div>
+                </div>
+              </div>
+              <p id="inspectorNightCond" class="text-sm font-bold text-slate-100 mt-2.5" style="margin-bottom:0.2rem">--</p>
+              <p id="inspectorNightNote" class="text-xs font-mono text-slate-400" style="margin:0">Ночной сдвиг до 08:00 след. утра</p>
+            </div>
+            <div class="mt-3 pt-2 flex items-center justify-between text-xs font-mono" style="border-top:1px solid rgba(30,41,59,0.85)">
+              <span class="text-slate-400">Осадки ночью:</span>
+              <span id="inspectorNightPrecip" class="font-bold text-cyan-300">--</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Vector Wind Compass -->
+        <div class="sub-card p-4 flex flex-col items-center justify-between gap-2">
+          <div class="w-full flex items-center justify-between text-xs font-mono text-slate-400">
+            <span>Вектор ветра</span>
+            <span id="inspectorWindDirCode" class="badge-mono">--</span>
+          </div>
+          <div style="width:8.25rem;height:8.25rem" class="flex items-center justify-center">
+            <svg viewBox="0 0 140 140" style="width:100%;height:100%">
+              <circle cx="70" cy="70" r="60" fill="rgba(15,23,42,0.85)" stroke="rgba(148,163,184,0.22)" stroke-width="1.5" />
+              <circle cx="70" cy="70" r="44" fill="none" stroke="rgba(148,163,184,0.14)" stroke-dasharray="3 3" stroke-width="1" />
+              <text x="70" y="21" text-anchor="middle" fill="#cbd5e1" font-size="11" font-family="monospace" font-weight="bold">С</text>
+              <text x="122" y="74" text-anchor="middle" fill="#cbd5e1" font-size="11" font-family="monospace" font-weight="bold">В</text>
+              <text x="70" y="126" text-anchor="middle" fill="#cbd5e1" font-size="11" font-family="monospace" font-weight="bold">Ю</text>
+              <text x="18" y="74" text-anchor="middle" fill="#cbd5e1" font-size="11" font-family="monospace" font-weight="bold">З</text>
+              <g id="compassArrowGroup" transform="rotate(0, 70, 70)" style="transition: transform 0.45s cubic-bezier(0.22, 1, 0.36, 1);">
+                <line x1="70" y1="70" x2="70" y2="26" stroke="#38bdf8" stroke-width="3.5" stroke-linecap="round" />
+                <polygon points="70,17 63,30 77,30" fill="#38bdf8" />
+                <circle cx="70" cy="70" r="5.5" fill="#0ea5e9" stroke="#0f172a" stroke-width="2" />
+              </g>
+            </svg>
+          </div>
+          <div class="text-center">
+            <div id="inspectorWindSpeed" class="text-lg font-extrabold font-mono text-white">-- м/с</div>
+            <div id="inspectorWindGusts" class="text-xs font-mono text-amber-300 font-semibold">Порывы до: --</div>
+            <div id="inspectorWindName" class="text-xs text-slate-400">--</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 4 Aban Field Operational Cards -->
+      <div id="fieldOpsGrid" class="field-ops-grid">
+        <div id="opsRoadCard" class="ops-card ops-card--low">
+          <div class="text-[11px] font-mono uppercase text-sky-300 font-bold">🛣️ Трасса Р-255 / Гололедица и Метель</div>
+          <div id="opsRoadLabel" class="text-sm font-extrabold text-white">--</div>
+          <div id="opsRoadDetail" class="text-xs text-slate-300">--</div>
+        </div>
+        <div id="opsDieselCard" class="ops-card">
+          <div class="text-[11px] font-mono uppercase text-amber-300 font-bold">⛽ Класс ДТ (порог фильтруемости)</div>
+          <div id="opsDieselGrade" class="text-sm font-extrabold text-white">--</div>
+          <div id="opsDieselDetail" class="text-xs text-slate-300">--</div>
+        </div>
+        <div id="opsGroundCard" class="ops-card">
+          <div class="text-[11px] font-mono uppercase text-emerald-300 font-bold">🚜 Почва 0–54 см и Проходимость</div>
+          <div id="opsGroundLabel" class="text-sm font-extrabold text-white">--</div>
+          <div id="opsGroundDetail" class="text-xs text-slate-300">--</div>
+        </div>
+        <div id="opsInversionCard" class="ops-card">
+          <div class="text-[11px] font-mono uppercase text-purple-300 font-bold">🌫️ Котловинная инверсия и ΔP</div>
+          <div id="opsInversionLabel" class="text-sm font-extrabold text-white">--</div>
+          <div id="opsInversionDetail" class="text-xs text-slate-300">--</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- SECTION 4: 4 Analytical Charts & Field Matrix -->
+    <section id="sec-charts" class="section-anchor glass-panel panel-pad flex flex-col gap-4">
+      <div class="flex flex-wrap items-center justify-between gap-3 pb-3" style="border-bottom:1px solid rgba(30,41,59,0.9)">
+        <div>
+          <div class="flex items-center gap-2 flex-wrap">
+            <h2 class="text-base font-bold text-white" style="margin:0">📈 Метеограммы, веер P10–P90 и полевая таблица</h2>
+            <span id="analyticsPeriodBadge" class="badge-mono">10 сут.</span>
+          </div>
+          <p class="text-xs text-slate-400 mt-0.5" style="margin-bottom:0">Нажмите на любой день графика для инспектора суток • Горизонтальный свайп для 16–35+ дней</p>
+        </div>
+
+        <div class="tab-bar" role="tablist">
+          <button id="tabBtn-temp" data-tab="temp" type="button" class="tab-btn is-active">1. Температура и Веер P10–P90</button>
+          <button id="tabBtn-precip" data-tab="precip" type="button" class="tab-btn">2. Осадки и Снежный покров</button>
+          <button id="tabBtn-wind" data-tab="wind" type="button" class="tab-btn">3. Ветер и Давление</button>
+          <button id="tabBtn-ops" data-tab="ops" type="button" class="tab-btn">4. Почва 0–54см и Полевая таблица</button>
+        </div>
+      </div>
+
+      <div class="sub-card p-2.5 flex items-center justify-between text-xs font-mono">
+        <span id="activeChartSummaryText" class="text-slate-200 truncate">Выберите узел графика для синхронизации с инспектором</span>
+        <span class="sm-hidden text-amber-300 flex-shrink-0">↔ Свайп</span>
+      </div>
+
+      <!-- Tab 1: Temperature + P10..P90 Fan + Model Lines + Climatology -->
+      <div id="tabContent-temp" class="flex flex-col gap-3">
+        <div class="flex flex-wrap items-center justify-between gap-2 text-xs font-mono">
+          <div class="flex flex-wrap items-center gap-2">
+            <button id="toggleModelLinesBtn" type="button" class="toggle-chip">📈 Линии моделей</button>
+            <button id="toggleClimatologyBtn" type="button" class="toggle-chip">📊 Климат. норма (1991–2020)</button>
+          </div>
+          <span id="tempChartDynamicSummary" class="text-slate-400">Экстремумы и веер ансамбля</span>
+        </div>
+        <div id="tempChartWrapper" class="chart-scroll-wrap grid-bg"></div>
+      </div>
+
+      <!-- Tab 2: Precip + Snow Depth -->
+      <div id="tabContent-precip" class="hidden flex flex-col gap-3">
+        <div class="flex flex-wrap items-center justify-between gap-2 text-xs font-mono">
+          <div class="flex flex-wrap items-center gap-3">
+            <span class="text-cyan-300">■ Снег</span>
+            <span class="text-indigo-300">■ Мокрый снег</span>
+            <span class="text-rose-400">■ Гололёд</span>
+            <span class="text-emerald-300">■ Дождь</span>
+            <span class="text-sky-300">▬ Снежный покров (см)</span>
+          </div>
+          <span id="precipChartDynamicSummary" class="text-slate-400">Осадки и снежный покров</span>
+        </div>
+        <div id="precipChartWrapper" class="chart-scroll-wrap grid-bg"></div>
+      </div>
+
+      <!-- Tab 3: Wind & Pressure -->
+      <div id="tabContent-wind" class="hidden flex flex-col gap-3">
+        <div class="flex flex-wrap items-center justify-between gap-2 text-xs font-mono">
+          <div class="flex flex-wrap items-center gap-3">
+            <span class="text-sky-300">▬ Ветер (м/с)</span>
+            <span class="text-amber-300">┄ Порывы</span>
+            <span class="text-emerald-300">▬ Давление</span>
+            <span class="text-rose-400">┄ Порог 10 м/с / |ΔP|≥6мм</span>
+          </div>
+          <span id="windChartDynamicSummary" class="text-amber-300">Ветровая и барическая нагрузка</span>
+        </div>
+        <div id="windChartWrapper" class="chart-scroll-wrap grid-bg"></div>
+      </div>
+
+      <!-- Tab 4: Soil 0-54cm & Field Matrix -->
+      <div id="tabContent-ops" class="hidden flex flex-col gap-3">
+        <div class="flex flex-wrap items-center justify-between gap-2 text-xs font-mono">
+          <div class="flex flex-wrap items-center gap-3">
+            <span class="text-amber-300">▬ Почва 0см / 6см / 18см / 54см</span>
+            <span class="text-emerald-300">┄ Точка росы</span>
+            <span class="text-rose-400">┄ 0°C</span>
+          </div>
+          <button id="tableViewModeToggle" type="button" class="toggle-chip hidden">Показать 5-дневки</button>
+        </div>
+        <div id="soilChartWrapper" class="chart-scroll-wrap grid-bg"></div>
+        <div id="opsSummaryCardsGrid" class="field-ops-grid"></div>
+        <div class="data-table-wrap">
+          <table class="data-table">
+            <thead id="operationalTableHead"></thead>
+            <tbody id="operationalTableBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- SECTION 5: Collapsible Lazy-Load Windy Radar -->
+    <section id="sec-radar" class="section-anchor glass-panel panel-pad flex flex-col gap-3">
+      <div class="flex items-center justify-between gap-2">
+        <div>
+          <h2 class="text-base font-bold text-white" style="margin:0">🛰️ Интерактивный радар и карта осадков (Windy • п. Абан)</h2>
+          <p class="text-xs text-slate-400 mt-0.5" style="margin-bottom:0">Ленивая загрузка: трафик и iframe создаются только по нажатию кнопки</p>
+        </div>
+        <button id="btnToggleRadarCollapse" type="button" class="btn-action font-mono" aria-expanded="true" aria-controls="radarCardBody">
+          <span id="radarCollapseText">Свернуть</span>
+        </button>
+      </div>
+
+      <div id="radarCardBody" class="flex flex-col gap-3">
+        <div id="radarPlaceholder" class="sub-card p-4 flex flex-col items-center justify-center text-center gap-3" style="min-height:170px">
+          <p class="text-xs text-slate-300 max-w-md" style="margin:0">
+            Карта Windy сфокусирована на п. Абан (56.68°N, 96.07°E, zoom 8) и не расходует мобильный интернет, пока вы не откроете радар вручную.
+          </p>
+          <button id="btnLoadWindyRadar" type="button" class="btn-action btn-action--solid">
+            🛰️ Загрузить радар осадков и ветра (Windy • Абан)
+          </button>
+        </div>
+
+        <div id="radarFrameContainer" class="hidden flex flex-col gap-2">
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <div class="flex flex-wrap items-center gap-1.5" role="group" aria-label="Слой радара Windy">
+              <button data-radar-overlay="rain" type="button" class="toggle-chip is-active">🌧️ Осадки</button>
+              <button data-radar-overlay="wind" type="button" class="toggle-chip">💨 Ветер</button>
+              <button data-radar-overlay="temp" type="button" class="toggle-chip">🌡️ Температура</button>
+              <button data-radar-overlay="snowAccu" type="button" class="toggle-chip">❄️ Снег</button>
+            </div>
+            <button id="btnUnloadRadar" type="button" class="btn-action text-xs font-mono">Выгрузить карту</button>
+          </div>
+          <div id="radarMountPoint" class="radar-frame-box"></div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- Mobile Bottom Thumb Navigation Bar (<768px) -->
+  <nav class="mobile-thumb-bar" aria-label="Навигация по разделам">
+    <div class="mobile-thumb-bar__grid">
+      <button id="mNav-now" data-nav-target="sec-now" type="button" class="mobile-nav-btn is-active">
+        <span style="font-size:1rem;line-height:1;margin-bottom:2px">🌡️</span>
+        <span>Сейчас</span>
+      </button>
+      <button id="mNav-days" data-nav-target="sec-days" type="button" class="mobile-nav-btn">
+        <span style="font-size:1rem;line-height:1;margin-bottom:2px">📅</span>
+        <span>Прогноз</span>
+      </button>
+      <button id="mNav-hourly" data-nav-target="sec-hourly" type="button" class="mobile-nav-btn">
+        <span style="font-size:1rem;line-height:1;margin-bottom:2px">🕒</span>
+        <span>24 часа</span>
+      </button>
+      <button id="mNav-charts" data-nav-target="sec-charts" type="button" class="mobile-nav-btn">
+        <span style="font-size:1rem;line-height:1;margin-bottom:2px">📈</span>
+        <span>Графики</span>
+      </button>
+      <button id="mNav-filters" data-nav-target="sec-filters" type="button" class="mobile-nav-btn">
+        <span style="font-size:1rem;line-height:1;margin-bottom:2px">🎚️</span>
+        <span>Фильтры</span>
+      </button>
+    </div>
+  </nav>
+
+  <script type="module" src="./js/app.js"></script>
+</body>
+</html>

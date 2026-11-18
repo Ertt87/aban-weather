@@ -1,0 +1,21 @@
+{
+  "name": "Абан Метео v4 — Супер-ансамбль и Климат",
+  "short_name": "Абан Метео",
+  "description": "Мобильное PWA метеотабло для п. Абан (Красноярский край, ВМО 29485): супер-ансамбль WeatherNext 3 + ECMWF + ICON + GFS, MOS-калибровка, архив ERA5 с 1940 г. и прогноз на 35 дней.",
+  "lang": "ru",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#060911",
+  "theme_color": "#060911",
+  "categories": ["weather", "utilities"],
+  "icons": [
+    {
+      "src": "./assets/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

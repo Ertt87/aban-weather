@@ -1,0 +1,57 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="Абан Метео v4">
+  <defs>
+    <linearGradient id="bgGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0b1324"/>
+      <stop offset="100%" stop-color="#060911"/>
+    </linearGradient>
+    <radialGradient id="sunGlow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0%" stop-color="#fde047"/>
+      <stop offset="65%" stop-color="#fbbf24"/>
+      <stop offset="100%" stop-color="#f59e0b"/>
+    </radialGradient>
+    <linearGradient id="cloudGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#e0f2fe"/>
+      <stop offset="55%" stop-color="#7dd3fc"/>
+      <stop offset="100%" stop-color="#38bdf8"/>
+    </linearGradient>
+    <linearGradient id="ringGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#38bdf8" stop-opacity="0.65"/>
+      <stop offset="100%" stop-color="#22d3ee" stop-opacity="0.15"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Base rounded dark slate tile -->
+  <rect width="512" height="512" rx="112" fill="url(#bgGrad)"/>
+  <rect x="14" y="14" width="484" height="484" rx="98" fill="none" stroke="url(#ringGrad)" stroke-width="4"/>
+
+  <!-- Subtle atmospheric coordinate grid accent -->
+  <circle cx="256" cy="256" r="188" fill="none" stroke="#1e293b" stroke-width="2" stroke-dasharray="6 10"/>
+
+  <!-- Siberian winter/autumn sun -->
+  <g>
+    <circle cx="192" cy="184" r="66" fill="url(#sunGlow)"/>
+    <g stroke="#fbbf24" stroke-width="10" stroke-linecap="round" opacity="0.88">
+      <line x1="192" y1="86" x2="192" y2="104"/>
+      <line x1="94" y1="184" x2="112" y2="184"/>
+      <line x1="122" y1="114" x2="135" y2="127"/>
+      <line x1="262" y1="114" x2="249" y2="127"/>
+      <line x1="122" y1="254" x2="135" y2="241"/>
+    </g>
+  </g>
+
+  <!-- Crisp cloud silhouette -->
+  <path d="M168 334h184c36 0 64-27 64-61 0-31-23-56-53-60-11-44-50-75-97-75-49 0-90 35-98 83-29 5-50 29-50 58 0 31 23 55 50 55z"
+        fill="url(#cloudGrad)" stroke="#bae6fd" stroke-width="4" stroke-linejoin="round"/>
+
+  <!-- Frost / ice crystal motif below cloud -->
+  <g transform="translate(256 398)" stroke="#22d3ee" stroke-width="7" stroke-linecap="round">
+    <line x1="0" y1="-28" x2="0" y2="28"/>
+    <line x1="-24" y1="-14" x2="24" y2="14"/>
+    <line x1="-24" y1="14" x2="24" y2="-14"/>
+    <circle cx="0" cy="0" r="6" fill="#e0f2fe" stroke="none"/>
+  </g>
+  <circle cx="176" cy="390" r="7" fill="#38bdf8" opacity="0.9"/>
+  <circle cx="336" cy="390" r="7" fill="#67e8f9" opacity="0.9"/>
+  <circle cx="212" cy="432" r="5" fill="#7dd3fc" opacity="0.75"/>
+  <circle cx="300" cy="432" r="5" fill="#7dd3fc" opacity="0.75"/>
+</svg>
