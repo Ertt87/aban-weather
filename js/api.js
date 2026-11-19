@@ -2,15 +2,86 @@ import { ABAN_COORDS } from './config.js';
 import {
   loadMosCache,
   saveMosCache,
+  loadCompanionCache,
+  saveCompanionCache,
   loadArchiveSlice,
   saveArchiveSlice,
 } from './storage.js';
 
 const REQUEST_TIMEOUT_MS = 12000;
+// The soil / snow companion query is heavy on the Open-Meteo side (~10 s is normal),
+// so it gets its own generous timeout; it no longer blocks the first paint (see onPartial).
+const COMPANION_TIMEOUT_MS = 25000;
+// Previous-runs and seasonal queries can take ~12 s on a cold upstream cache. They refine the
+// picture (MOS weights, days 33–35) but never gate the first paint, so they may wait longer.
+const SLOW_CHANNEL_TIMEOUT_MS = 20000;
 const MOS_TTL_MS = 60 * 60 * 1000;
+const COMPANION_TTL_MS = 60 * 60 * 1000;
+const COMPANION_STALE_MAX_MS = 12 * 60 * 60 * 1000;
+const PARTIAL_GRACE_MS = 1200;
 const RECENT_ARCHIVE_TTL_MS = 30 * 60 * 1000;
 const MIN_ARCHIVE_ISO = '1940-01-01';
 const OM_MODELS = ['ecmwf_ifs025', 'ecmwf_aifs025', 'icon_seamless', 'gfs_seamless'];
+
+// Open-Meteo retired the `ecmwf_aifs025` id: it still answers HTTP 200, but every series is null.
+// We keep the stable internal id and translate it to the live API id only on the wire.
+const OM_API_MODEL_ALIASES = Object.freeze({
+  ecmwf_aifs025: 'ecmwf_aifs025_single',
+});
+
+function toApiModelId(modelId) {
+  return OM_API_MODEL_ALIASES[modelId] || modelId;
+}
+
+/**
+ * Renames `<var>_<apiModelId>` response keys back to `<var>_<internalModelId>` (in place).
+ */
+export function normalizeOpenMeteoModelKeys(payload) {
+  if (!payload || typeof payload !== 'object') return payload;
+  for (const section of ['hourly', 'daily', 'hourly_units', 'daily_units']) {
+    const sec = payload[section];
+    if (!sec || typeof sec !== 'object') continue;
+    for (const [internalId, apiId] of Object.entries(OM_API_MODEL_ALIASES)) {
+      const suffix = `_${apiId}`;
+      for (const key of Object.keys(sec)) {
+        if (!key.endsWith(suffix)) continue;
+        sec[`${key.slice(0, -suffix.length)}_${internalId}`] = sec[key];
+        delete sec[key];
+      }
+    }
+  }
+  return payload;
+}
+
+function hasFiniteValue(arr) {
+  if (!Array.isArray(arr)) return false;
+  for (let i = 0; i < arr.length; i++) {
+    const v = arr[i];
+    if (v !== null && v !== undefined && Number.isFinite(Number(v))) return true;
+  }
+  return false;
+}
+
+/**
+ * Lists requested models whose temperature series came back empty (all null / absent),
+ * so a silently retired upstream model id shows up in the channel diagnostics.
+ */
+export function listEmptyModels(payload, modelIds = OM_MODELS) {
+  if (!payload || typeof payload !== 'object') return [];
+  const single = modelIds.length === 1;
+  return modelIds.filter((id) => {
+    const hourly = payload.hourly?.[`temperature_2m_${id}`] ?? (single ? payload.hourly?.temperature_2m : undefined);
+    const daily = payload.daily?.[`temperature_2m_max_${id}`] ?? (single ? payload.daily?.temperature_2m_max : undefined);
+    return !hasFiniteValue(hourly) && !hasFiniteValue(daily);
+  });
+}
+
+const MODEL_SHORT_LABELS = {
+  ecmwf_ifs025: 'IFS',
+  ecmwf_aifs025: 'AIFS',
+  icon_seamless: 'ICON',
+  gfs_seamless: 'GFS',
+};
 
 const CHANNEL_LABELS = {
   openMeteoMulti: 'Open-Meteo Multi (4 мод.)',
@@ -293,24 +364,27 @@ async function fetchOpenMeteoMulti() {
     wind_speed_unit: 'ms',
     past_days: '14',
     forecast_days: '16',
-    models: OM_MODELS.join(','),
+    models: OM_MODELS.map(toApiModelId).join(','),
     hourly: MULTI_HOURLY_VARS,
     daily: MULTI_DAILY_VARS,
   };
 
+  let data;
   try {
-    return await fetchJsonWithTimeout(`https://api.open-meteo.com/v1/forecast?${new URLSearchParams(baseObj).toString()}`);
+    data = normalizeOpenMeteoModelKeys(
+      await fetchJsonWithTimeout(`https://api.open-meteo.com/v1/forecast?${new URLSearchParams(baseObj).toString()}`)
+    );
   } catch (err) {
     if (err.status !== 400) throw err;
 
-    // Fallback: query the 3 core NWP models and fetch ecmwf_aifs025 separately with core fields
+    // Fallback: query the 3 core NWP models and fetch AIFS separately with core fields
     const coreParams = new URLSearchParams({
       ...baseObj,
       models: 'ecmwf_ifs025,icon_seamless,gfs_seamless',
     });
     const aifsParams = new URLSearchParams({
       ...baseObj,
-      models: 'ecmwf_aifs025',
+      models: toApiModelId('ecmwf_aifs025'),
       hourly: 'temperature_2m,relative_humidity_2m,dew_point_2m,precipitation,pressure_msl,surface_pressure,cloud_cover,wind_speed_10m,wind_direction_10m',
       daily: 'temperature_2m_max,temperature_2m_min,precipitation_sum,wind_speed_10m_max,wind_direction_10m_dominant',
     });
@@ -321,15 +395,30 @@ async function fetchOpenMeteoMulti() {
     ]);
 
     if (coreRes.status === 'rejected') throw coreRes.reason;
-    const merged = coreRes.value;
+    data = normalizeOpenMeteoModelKeys(coreRes.value);
     if (aifsRes.status === 'fulfilled') {
-      mergeSingleModelIntoMulti(merged, aifsRes.value, 'ecmwf_aifs025');
+      mergeSingleModelIntoMulti(data, normalizeOpenMeteoModelKeys(aifsRes.value), 'ecmwf_aifs025');
     }
-    return merged;
   }
+
+  const emptyModels = listEmptyModels(data);
+  if (emptyModels.length) {
+    const names = emptyModels.map((id) => MODEL_SHORT_LABELS[id] || id).join(', ');
+    return { data, fromCache: false, degraded: true, detail: `Нет данных от моделей: ${names}` };
+  }
+  return { data, fromCache: false, detail: `Все ${OM_MODELS.length} модели отдали данные` };
 }
 
-async function fetchOpenMeteoCompanion() {
+async function fetchOpenMeteoCompanion(forceRefresh = false) {
+  if (!forceRefresh) {
+    const fresh = loadCompanionCache(COMPANION_TTL_MS);
+    if (fresh?.payload) {
+      return { data: fresh.payload, fromCache: true, detail: 'Локальный кэш (TTL 1ч)' };
+    }
+  }
+
+  // Only the variables the ensemble actually consumes: soil profile, snow depth, precipitation
+  // probability, pressure fallback and UV. Extra fields make this (already slow) query slower.
   const params = new URLSearchParams({
     latitude: String(ABAN_COORDS.lat),
     longitude: String(ABAN_COORDS.lon),
@@ -340,21 +429,7 @@ async function fetchOpenMeteoCompanion() {
     past_days: '14',
     forecast_days: '16',
     models: 'best_match',
-    current: [
-      'temperature_2m',
-      'relative_humidity_2m',
-      'apparent_temperature',
-      'precipitation',
-      'rain',
-      'snowfall',
-      'weather_code',
-      'cloud_cover',
-      'pressure_msl',
-      'surface_pressure',
-      'wind_speed_10m',
-      'wind_direction_10m',
-      'wind_gusts_10m',
-    ].join(','),
+    current: 'temperature_2m,surface_pressure',
     hourly: [
       'precipitation_probability',
       'snow_depth',
@@ -362,36 +437,35 @@ async function fetchOpenMeteoCompanion() {
       'soil_temperature_6cm',
       'soil_temperature_18cm',
       'soil_temperature_54cm',
-      'soil_moisture_0_to_1cm',
-      'soil_moisture_3_to_9cm',
       'pressure_msl',
       'surface_pressure',
-      'temperature_2m',
-      'apparent_temperature',
-      'relative_humidity_2m',
-      'dew_point_2m',
-      'precipitation',
-      'weather_code',
-      'cloud_cover',
-      'wind_speed_10m',
-      'wind_direction_10m',
-      'wind_gusts_10m',
     ].join(','),
-    daily: [
-      'uv_index_max',
-      'precipitation_probability_max',
-      'shortwave_radiation_sum',
-      'weather_code',
-      'temperature_2m_max',
-      'temperature_2m_min',
-      'precipitation_sum',
-      'wind_speed_10m_max',
-      'wind_gusts_10m_max',
-      'wind_direction_10m_dominant',
-    ].join(','),
+    daily: ['uv_index_max', 'precipitation_probability_max', 'shortwave_radiation_sum'].join(','),
   });
 
-  return fetchJsonWithTimeout(`https://api.open-meteo.com/v1/forecast?${params.toString()}`);
+  try {
+    const data = await fetchJsonWithTimeout(
+      `https://api.open-meteo.com/v1/forecast?${params.toString()}`,
+      COMPANION_TIMEOUT_MS
+    );
+    // `current` is time-stamped: never persist it, or a cached slice would pin "today" to the past
+    saveCompanionCache({ ...data, current: undefined });
+    return { data, fromCache: false };
+  } catch (err) {
+    // Stale-if-error: soil temperature and snow depth drift slowly, so a few-hours-old slice
+    // is far closer to the truth than an air-temperature heuristic.
+    const stale = loadCompanionCache(COMPANION_STALE_MAX_MS);
+    if (stale?.payload) {
+      const ageMin = Math.max(1, Math.round((Date.now() - stale.savedAtMs) / 60000));
+      const ageLabel = ageMin >= 90 ? `${Math.round(ageMin / 60)} ч` : `${ageMin} мин`;
+      return {
+        data: stale.payload,
+        fromCache: true,
+        detail: `Кэш ${ageLabel} назад (сервер: ${err?.message || 'нет ответа'})`,
+      };
+    }
+    throw err;
+  }
 }
 
 async function fetchPreviousRunsMos(forceRefresh = false) {
@@ -407,22 +481,29 @@ async function fetchPreviousRunsMos(forceRefresh = false) {
     timezone: ABAN_COORDS.tz,
     past_days: '14',
     forecast_days: '1',
-    models: OM_MODELS.join(','),
+    models: OM_MODELS.map(toApiModelId).join(','),
     hourly: 'temperature_2m,temperature_2m_previous_day1,temperature_2m_previous_day2',
   };
 
   let data;
   try {
-    data = await fetchJsonWithTimeout(`https://previous-runs-api.open-meteo.com/v1/forecast?${new URLSearchParams(baseObj).toString()}`);
+    data = await fetchJsonWithTimeout(
+      `https://previous-runs-api.open-meteo.com/v1/forecast?${new URLSearchParams(baseObj).toString()}`,
+      SLOW_CHANNEL_TIMEOUT_MS
+    );
   } catch (err) {
     if (err.status !== 400) throw err;
     const fallbackParams = new URLSearchParams({
       ...baseObj,
       models: 'ecmwf_ifs025,icon_seamless,gfs_seamless',
     });
-    data = await fetchJsonWithTimeout(`https://previous-runs-api.open-meteo.com/v1/forecast?${fallbackParams.toString()}`);
+    data = await fetchJsonWithTimeout(
+      `https://previous-runs-api.open-meteo.com/v1/forecast?${fallbackParams.toString()}`,
+      SLOW_CHANNEL_TIMEOUT_MS
+    );
   }
 
+  normalizeOpenMeteoModelKeys(data);
   saveMosCache(data);
   return { data, fromCache: false };
 }
@@ -640,9 +721,12 @@ async function fetchEnsemble35() {
     models: 'gfs_seamless',
   });
 
-  const [ecmwfRes, gefsRes] = await Promise.allSettled([
+  // GEFS usually ends 1–2 days short of the 35-day horizon, so the seasonal ensemble is fetched
+  // in parallel and used ONLY for the dates the primary ensembles leave uncovered.
+  const [ecmwfRes, gefsRes, seasonalRes] = await Promise.allSettled([
     fetchJsonWithTimeout(`https://ensemble-api.open-meteo.com/v1/ensemble?${ecmwfParams.toString()}`),
     fetchJsonWithTimeout(`https://ensemble-api.open-meteo.com/v1/ensemble?${gefsParams.toString()}`),
+    fetchSeasonalEnsemble(commonParams),
   ]);
 
   const payloads = [];
@@ -654,43 +738,66 @@ async function fetchEnsemble35() {
   }
 
   let aggregated = aggregateEnsembleQuantiles(payloads);
-
-  // Fallback to Seasonal API if days 16..35 are missing
-  if (aggregated.dailyQuantiles.length < 30) {
-    const seasonalParams = new URLSearchParams({
-      ...commonParams,
-      forecast_days: '35',
-    });
-    try {
-      const seasonalDaily = await fetchJsonWithTimeout(
-        `https://seasonal-api.open-meteo.com/v1/seasonal?${seasonalParams.toString()}`
-      );
-      payloads.push({ source: 'ecmwf_seasonal', payload: seasonalDaily });
-      aggregated = aggregateEnsembleQuantiles(payloads);
-    } catch (err) {
-      if (err.status === 400) {
-        try {
-          const sixHourlyParams = new URLSearchParams({
-            latitude: String(ABAN_COORDS.lat),
-            longitude: String(ABAN_COORDS.lon),
-            elevation: String(ABAN_COORDS.elev),
-            timezone: ABAN_COORDS.tz,
-            wind_speed_unit: 'ms',
-            forecast_days: '35',
-            six_hourly: 'temperature_2m,precipitation,wind_speed_10m',
-          });
-          const seasonalSix = await fetchJsonWithTimeout(
-            `https://seasonal-api.open-meteo.com/v1/seasonal?${sixHourlyParams.toString()}`
-          );
-          payloads.push({ source: 'ecmwf_seasonal', payload: seasonalSix });
-          aggregated = aggregateEnsembleQuantiles(payloads);
-        } catch (_) {}
-      }
-    }
+  if (seasonalRes.status === 'fulfilled' && seasonalRes.value) {
+    aggregated = mergeQuantileFallback(
+      aggregated,
+      aggregateEnsembleQuantiles([{ source: 'ecmwf_seasonal', payload: seasonalRes.value }])
+    );
   }
 
   if (!aggregated.dailyQuantiles.length) return null;
   return aggregated;
+}
+
+async function fetchSeasonalEnsemble(commonParams) {
+  const seasonalParams = new URLSearchParams({
+    ...commonParams,
+    forecast_days: '35',
+  });
+  try {
+    return await fetchJsonWithTimeout(
+      `https://seasonal-api.open-meteo.com/v1/seasonal?${seasonalParams.toString()}`,
+      SLOW_CHANNEL_TIMEOUT_MS
+    );
+  } catch (err) {
+    if (err.status !== 400) throw err;
+    const sixHourlyParams = new URLSearchParams({
+      latitude: String(ABAN_COORDS.lat),
+      longitude: String(ABAN_COORDS.lon),
+      elevation: String(ABAN_COORDS.elev),
+      timezone: ABAN_COORDS.tz,
+      wind_speed_unit: 'ms',
+      forecast_days: '35',
+      six_hourly: 'temperature_2m,precipitation,wind_speed_10m',
+    });
+    return fetchJsonWithTimeout(
+      `https://seasonal-api.open-meteo.com/v1/seasonal?${sixHourlyParams.toString()}`,
+      SLOW_CHANNEL_TIMEOUT_MS
+    );
+  }
+}
+
+/**
+ * Appends fallback quantile days for dates the primary aggregate does not cover.
+ * Primary days are never altered, so coarser fallback members cannot dilute them.
+ */
+export function mergeQuantileFallback(primary, fallback) {
+  const base = primary && Array.isArray(primary.dailyQuantiles) ? primary : { sources: [], dailyQuantiles: [] };
+  const extra = fallback && Array.isArray(fallback.dailyQuantiles) ? fallback.dailyQuantiles : [];
+  const covered = new Set(base.dailyQuantiles.map((d) => d.isoDate));
+  const added = extra.filter((d) => d && d.isoDate && !covered.has(d.isoDate));
+  if (!added.length) return base;
+
+  const sources = [...(base.sources || [])];
+  for (const src of fallback.sources || []) {
+    if (!sources.includes(src)) sources.push(src);
+  }
+  return {
+    sources,
+    dailyQuantiles: [...base.dailyQuantiles, ...added].sort((a, b) =>
+      a.isoDate < b.isoDate ? -1 : a.isoDate > b.isoDate ? 1 : 0
+    ),
+  };
 }
 
 // ============================================================================
@@ -732,10 +839,10 @@ async function runTimedChannel(id, enabled, fn, disabledReason = 'Отключё
         channel: {
           id,
           label,
-          status: out.fromCache ? 'cached' : 'ok',
+          status: out.degraded ? 'partial' : out.fromCache ? 'cached' : 'ok',
           latencyMs,
           error: null,
-          detail: out.fromCache ? 'Локальный кэш (TTL 1ч)' : 'Обновлено',
+          detail: out.detail || (out.fromCache ? 'Локальный кэш (TTL 1ч)' : 'Обновлено'),
         },
       };
     }
@@ -758,11 +865,31 @@ async function runTimedChannel(id, enabled, fn, disabledReason = 'Отключё
   }
 }
 
+const CHANNEL_ORDER = [
+  'openMeteoMulti',
+  'openMeteoCompanion',
+  'previousRuns',
+  'ensemble35',
+  'airQuality',
+  'metNo',
+  'google',
+];
+
+/**
+ * Fetches every data channel in parallel.
+ *
+ * `onPartial(bundle)` (optional) fires at most once, as soon as the core forecast channel has
+ * answered and slower channels are still in flight: the caller can paint real data within ~1–2 s
+ * instead of waiting for the slowest channel. The returned promise still resolves with the
+ * complete bundle. In a partial bundle unfinished channels carry `status: 'pending'`.
+ */
 export async function fetchAllWeatherSources({
   apiKey = '',
   mode = 'hybrid',
   preferredOmModel = 'multi',
   forceRefresh = false,
+  onPartial = null,
+  partialGraceMs = PARTIAL_GRACE_MS,
 } = {}) {
   const t0 = performance.now();
   const cleanKey = typeof apiKey === 'string' ? apiKey.trim() : '';
@@ -770,83 +897,108 @@ export async function fetchAllWeatherSources({
   const shouldGoogle = hasGoogleKey && (mode === 'hybrid' || mode === 'google_wn3');
   const shouldOpenMeteo = mode !== 'google_wn3';
 
-  const [
-    googleRes,
-    multiRes,
-    compRes,
-    mosRes,
-    ensRes,
-    metRes,
-    aqRes,
-  ] = await Promise.all([
-    runTimedChannel(
+  const tasks = {
+    google: runTimedChannel(
       'google',
       shouldGoogle,
       () => fetchGoogleWeatherBundle(cleanKey),
       hasGoogleKey ? 'Отключён режимом' : 'Ключ API не задан'
     ),
-    runTimedChannel('openMeteoMulti', shouldOpenMeteo, () => fetchOpenMeteoMulti()),
-    runTimedChannel('openMeteoCompanion', shouldOpenMeteo, () => fetchOpenMeteoCompanion()),
-    runTimedChannel('previousRuns', shouldOpenMeteo, () => fetchPreviousRunsMos(forceRefresh)),
-    runTimedChannel('ensemble35', shouldOpenMeteo, () => fetchEnsemble35()),
-    runTimedChannel('metNo', shouldOpenMeteo && mode === 'hybrid', () => fetchMetNo()),
-    runTimedChannel('airQuality', true, () => fetchAirQuality()),
-  ]);
-
-  const results = {
-    google: googleRes.value,
-    openMeteoMulti: multiRes.value,
-    openMeteoCompanion: compRes.value,
-    previousRuns: mosRes.value,
-    ensemble35: ensRes.value,
-    metNo: metRes.value,
-    airQuality: aqRes.value,
+    openMeteoMulti: runTimedChannel('openMeteoMulti', shouldOpenMeteo, () => fetchOpenMeteoMulti()),
+    openMeteoCompanion: runTimedChannel('openMeteoCompanion', shouldOpenMeteo, () => fetchOpenMeteoCompanion(forceRefresh)),
+    previousRuns: runTimedChannel('previousRuns', shouldOpenMeteo, () => fetchPreviousRunsMos(forceRefresh)),
+    ensemble35: runTimedChannel('ensemble35', shouldOpenMeteo, () => fetchEnsemble35()),
+    metNo: runTimedChannel('metNo', shouldOpenMeteo && mode === 'hybrid', () => fetchMetNo()),
+    airQuality: runTimedChannel('airQuality', true, () => fetchAirQuality()),
   };
 
-  const channels = {
-    openMeteoMulti: multiRes.channel,
-    openMeteoCompanion: compRes.channel,
-    previousRuns: mosRes.channel,
-    ensemble35: ensRes.channel,
-    airQuality: aqRes.channel,
-    metNo: metRes.channel,
-    google: googleRes.channel,
+  // runTimedChannel never rejects, so these trackers are safe to await/race directly
+  const settled = {};
+  const tracked = CHANNEL_ORDER.map((id) =>
+    tasks[id].then((res) => {
+      settled[id] = res;
+      return res;
+    })
+  );
+
+  const assembleBundle = (isPartial) => {
+    const values = {};
+    const channels = {};
+    const errors = {};
+    let pendingCount = 0;
+    for (const id of CHANNEL_ORDER) {
+      const res = settled[id];
+      if (res) {
+        values[id] = res.value;
+        channels[id] = res.channel;
+        if (res.channel.status === 'error' && res.channel.error) errors[id] = res.channel.error;
+      } else {
+        pendingCount++;
+        values[id] = null;
+        channels[id] = {
+          id,
+          label: CHANNEL_LABELS[id] || id,
+          status: 'pending',
+          latencyMs: 0,
+          error: null,
+          detail: 'Загружается…',
+        };
+      }
+    }
+    return {
+      mode,
+      preferredOmModel,
+      isPartial,
+      pendingCount,
+      latencyMs: Math.round(performance.now() - t0),
+      fetchedAtIso: new Date().toISOString(),
+      google: values.google,
+      openMeteoMulti: values.openMeteoMulti,
+      openMeteoCompanion: values.openMeteoCompanion,
+      previousRuns: values.previousRuns,
+      ensemble35: values.ensemble35,
+      metNo: values.metNo,
+      airQuality: values.airQuality,
+      channels,
+      errors,
+    };
   };
 
-  const errors = {};
-  for (const [k, ch] of Object.entries(channels)) {
-    if (ch.status === 'error' && ch.error) {
-      errors[k] = ch.error;
+  const allDone = Promise.all(tracked).then(() => 'all');
+
+  if (typeof onPartial === 'function') {
+    const coreId = mode === 'google_wn3' ? 'google' : 'openMeteoMulti';
+    const coreThenGrace = tasks[coreId].then((res) =>
+      res.value
+        ? new Promise((resolve) => setTimeout(() => resolve('partial'), Math.max(0, partialGraceMs)))
+        : allDone
+    );
+    const first = await Promise.race([allDone, coreThenGrace]);
+    if (first === 'partial' && Object.keys(settled).length < CHANNEL_ORDER.length) {
+      try {
+        onPartial(assembleBundle(true));
+      } catch (_) {
+        // A rendering failure on the partial slice must not abort the full refresh
+      }
     }
   }
 
-  if (mode === 'google_wn3' && hasGoogleKey && !results.google) {
-    throw new Error(errors.google || 'Google Weather API недоступен');
+  await allDone;
+  const bundle = assembleBundle(false);
+
+  if (mode === 'google_wn3' && hasGoogleKey && !bundle.google) {
+    throw new Error(bundle.errors.google || 'Google Weather API недоступен');
   }
   if (
     shouldOpenMeteo &&
-    !results.openMeteoMulti &&
-    !results.openMeteoCompanion &&
-    !results.google
+    !bundle.openMeteoMulti &&
+    !bundle.openMeteoCompanion &&
+    !bundle.google
   ) {
-    throw new Error(errors.openMeteoMulti || errors.openMeteoCompanion || 'Нет связи с метеосерверами');
+    throw new Error(bundle.errors.openMeteoMulti || bundle.errors.openMeteoCompanion || 'Нет связи с метеосерверами');
   }
 
-  return {
-    mode,
-    preferredOmModel,
-    latencyMs: Math.round(performance.now() - t0),
-    fetchedAtIso: new Date().toISOString(),
-    google: results.google,
-    openMeteoMulti: results.openMeteoMulti,
-    openMeteoCompanion: results.openMeteoCompanion,
-    previousRuns: results.previousRuns,
-    ensemble35: results.ensemble35,
-    metNo: results.metNo,
-    airQuality: results.airQuality,
-    channels,
-    errors,
-  };
+  return bundle;
 }
 
 // ============================================================================

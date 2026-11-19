@@ -20,6 +20,7 @@ export const STORAGE_KEYS = {
     LEGACY_API_KEY: 'aban_google_wn3_api_key',
     PREFS: 'aban_ui_prefs_v4',
     MOS_CACHE: 'aban_mos_calibration_v4',
+    COMPANION_CACHE: 'aban_companion_soil_snow_v4',
     ARCHIVE_LRU: 'aban_archive_lru_v4'
 };
 
@@ -449,6 +450,8 @@ export function buildDynamicReferenceDataset(baseIsoDate = null) {
             nextNightIconType: nightIconType,
             probFrostBelowMinus20: minC <= -20 ? 85 : 0,
             probSnowOver5mm: snowMm >= 5 ? 70 : (snowMm >= 1.5 ? 18 : 2),
+            // The whole offline reference is climatology-derived: soil and snow are estimates
+            dataQuality: { soilEstimated: true, snowEstimated: true, ensembleBacked: false },
             modelBreakdown: {},
             hours
         });
@@ -510,6 +513,8 @@ export function buildDynamicReferenceDataset(baseIsoDate = null) {
             precipMm: slot.precipMm,
             precipPhase: slot.precipPhase,
             snowDepthCm: today.snowDepthCm,
+            snowEstimated: true,
+            soilEstimated: true,
             humidity: slot.humidity,
             dewPointC: today.dewPointC,
             cloudCoverPct: today.cloudCoverPct,

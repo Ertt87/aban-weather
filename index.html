@@ -8,6 +8,9 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <meta name="apple-mobile-web-app-title" content="Абан Метео v4" />
   <meta name="mobile-web-app-capable" content="yes" />
+  <!-- Defence in depth: no inline or third-party scripts, network only to the weather APIs, frames only for the lazy Windy radar -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self' https://weather.googleapis.com https://api.open-meteo.com https://previous-runs-api.open-meteo.com https://ensemble-api.open-meteo.com https://seasonal-api.open-meteo.com https://archive-api.open-meteo.com https://air-quality-api.open-meteo.com https://api.met.no; frame-src https://embed.windy.com; manifest-src 'self'; worker-src 'self'; object-src 'none'; base-uri 'self'; form-action 'none'" />
+  <meta name="referrer" content="strict-origin-when-cross-origin" />
   <meta name="description" content="Оперативное метеотабло п. Абан (Красноярский край, ВМО 29485): Супер-Ансамбль WeatherNext 3 + Open-Meteo, архив ERA5-Land с 1940 г., 35-дневный вероятностный прогноз и полевые метрики." />
   <link rel="manifest" href="./manifest.webmanifest" />
   <link rel="icon" type="image/svg+xml" href="./assets/icon.svg" />
@@ -144,19 +147,22 @@
       <div id="mosLeaderboardSection" class="sub-card p-4 flex flex-col gap-2.5">
         <div class="flex flex-wrap items-center justify-between gap-2">
           <span class="text-xs font-mono uppercase tracking-wider text-purple-300 font-bold">
-            🏆 5. Рейтинг точности моделей (MOS за 14 дней • Абан)
+            🏆 5. Рейтинг согласованности моделей (MOS за 14 дней • Абан)
           </span>
           <span id="mosBestBadge" class="badge-mono">Лидер: расчёт...</span>
         </div>
         <p id="mosSummaryLine" class="text-xs text-slate-400" style="margin:0">
-          Сравнение вчерашних прогнозов моделей с фактической температурой (день 08–20ч и ночь 20–08ч).
+          Сравнение прогнозов моделей на 1–2 суток вперёд с их же последующим анализом (день 08–20ч и ночь 20–08ч).
+        </p>
+        <p class="text-[11px] text-amber-300" style="margin:0">
+          ⚠️ Эталон здесь — собственный анализ каждой модели, а не измерения метеостанции. MAE показывает, насколько модель согласуется сама с собой от прогона к прогону; реальная ошибка относительно наблюдений обычно заметно больше.
         </p>
         <div class="data-table-wrap">
           <table class="data-table" style="min-width:520px">
             <thead>
               <tr>
                 <th>Модель</th>
-                <th>MAE (°C)</th>
+                <th>MAE к анализу (°C)</th>
                 <th>Bias день</th>
                 <th>Bias ночь</th>
                 <th>Вес MOS</th>
@@ -220,7 +226,7 @@
               <span id="liveStatusDot" class="status-dot"></span>
               <span id="liveStatusText">ЭТАЛОН</span>
             </span>
-            <button id="mosStatusPill" type="button" class="mos-pill" title="Открыть 14-дневный рейтинг точности моделей MOS">
+            <button id="mosStatusPill" type="button" class="mos-pill" title="MOS за 14 дней: средняя ошибка прогноза относительно анализа самой модели (не наблюдений станции). Нажмите, чтобы открыть рейтинг">
               <span id="mosStatusText">MOS: авто</span>
             </button>
           </div>
@@ -364,6 +370,7 @@
                 <div id="currentSoil54" class="soil-chip__val">--</div>
               </div>
             </div>
+            <div id="currentDataQualityNote" class="data-quality-note hidden" role="note"></div>
           </div>
 
           <div class="astro-aqi-box">

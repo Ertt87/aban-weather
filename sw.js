@@ -1,4 +1,4 @@
-const CACHE_NAME = 'aban-weather-v4-shell-v2';
+const CACHE_NAME = 'aban-weather-v4-shell-v3';
 
 const PRECACHE_ASSETS = [
   './',
@@ -27,8 +27,12 @@ const WEATHER_API_HOSTS = new Set([
 ]);
 
 self.addEventListener('install', (event) => {
+  // `cache: 'reload'` bypasses the HTTP cache: the ES modules import each other by name, so a
+  // precache that mixes fresh and stale files breaks the whole app ("module does not provide an export").
   event.waitUntil(
-    caches.open(CACHE_NAME).then((cache) => cache.addAll(PRECACHE_ASSETS))
+    caches
+      .open(CACHE_NAME)
+      .then((cache) => cache.addAll(PRECACHE_ASSETS.map((url) => new Request(url, { cache: 'reload' }))))
   );
   // Controlled update: wait for client SKIP_WAITING message when an active controller exists
 });
@@ -73,7 +77,8 @@ self.addEventListener('fetch', (event) => {
   }
 
   // Same-origin local shell & ES modules: Stale-While-Revalidate
-  const networkPromise = fetch(request)
+  // Revalidate against the server (not the HTTP cache) so all modules refresh as one consistent set
+  const networkPromise = fetch(request, { cache: 'no-cache' })
     .then(async (response) => {
       if (response && response.ok && response.type === 'basic') {
         const cache = await caches.open(CACHE_NAME);

@@ -314,6 +314,65 @@ code {
   border-color: rgba(129, 140, 248, 0.6);
 }
 
+/* Phones: a compact two-row sticky header (title + status / sync line + actions).
+   Without this the brand column collapsed next to the action buttons and the header
+   grew to ~210px — a quarter of a 812px screen that stayed pinned while scrolling. */
+@media (max-width: 639.98px) {
+  .app-header__inner {
+    flex-wrap: wrap;
+    row-gap: 0.3rem;
+    column-gap: 0.5rem;
+    padding: 0.4rem 0.75rem;
+  }
+
+  /* Flatten the brand wrappers so title row, sync line and actions lay out as siblings */
+  .header-brand,
+  .header-brand > .min-w-0 {
+    display: contents;
+  }
+
+  .header-brand__icon {
+    display: none;
+  }
+
+  .header-brand__title-row {
+    flex: 1 1 100%;
+    flex-wrap: nowrap;
+    min-width: 0;
+  }
+
+  .header-brand__title {
+    flex: 0 1 auto;
+    min-width: 0;
+  }
+
+  .header-brand__title-row .mos-pill {
+    flex-shrink: 0;
+    white-space: nowrap;
+  }
+
+  .header-brand__meta {
+    flex: 1 1 0;
+    min-width: 0;
+    flex-wrap: nowrap;
+    line-height: 1.25;
+  }
+
+  /* Static coordinates are redundant on a phone; keep only the live sync line */
+  .header-brand__meta > span:not(#syncTimestampText) {
+    display: none;
+  }
+
+  #syncTimestampText {
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    white-space: normal;
+    overflow: hidden;
+  }
+}
+
 /* Segmented controls & action buttons */
 .btn-action {
   display: inline-flex;
@@ -1614,5 +1673,26 @@ code {
   background: rgba(71, 85, 105, 0.25);
   border: 1px solid rgba(100, 116, 139, 0.45);
   color: #94a3b8;
+}
+
+.chan-pill--partial {
+  background: rgba(245, 158, 11, 0.16);
+  border: 1px solid rgba(245, 158, 11, 0.42);
+  color: #fcd34d;
+}
+
+.chan-pill--pending {
+  background: rgba(99, 102, 241, 0.16);
+  border: 1px solid rgba(129, 140, 248, 0.4);
+  color: #c7d2fe;
+}
+
+/* "≈ estimate" honesty note under the soil profile */
+.data-quality-note {
+  margin-top: 0.4rem;
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  line-height: 1.35;
+  color: #fcd34d;
 }
 

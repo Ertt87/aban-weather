@@ -73,10 +73,92 @@ function sanitizePrefs(raw) {
   if (!['full', 'day_shift', 'daylight', 'night'].includes(merged.timeWindow)) {
     merged.timeWindow = DEFAULT_PREFS.timeWindow;
   }
+  if (!['multi', 'ecmwf_ifs025', 'ecmwf_aifs025', 'icon_seamless', 'gfs_seamless'].includes(merged.preferredOmModel)) {
+    merged.preferredOmModel = DEFAULT_PREFS.preferredOmModel;
+  }
+  if (typeof merged.activePreset !== 'string' || !/^[a-z0-9_]{1,16}$/i.test(merged.activePreset)) {
+    merged.activePreset = DEFAULT_PREFS.activePreset;
+  }
   merged.showClimatology = Boolean(merged.showClimatology);
   merged.showModelLines = Boolean(merged.showModelLines);
   merged.groupByPentad = Boolean(merged.groupByPentad);
   return merged;
+}
+
+// ============================================================================
+// TRUST BOUNDARY: datasets read back from disk (imported JSON, localStorage) are untrusted
+// ============================================================================
+const SANITIZE_MAX_DEPTH = 8;
+const SANITIZE_MAX_STRING = 400;
+const UNSAFE_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
+function sanitizeString(str) {
+  // No legitimate dataset string carries markup; neutralise anything that could open a tag,
+  // break out of an attribute, or smuggle control characters.
+  let out = str.length > SANITIZE_MAX_STRING ? str.slice(0, SANITIZE_MAX_STRING) : str;
+  if (/[<>"'`\u0000-\u0008\u000B\u000C\u000E-\u001F]/.test(out)) {
+    out = out
+      .replace(/</g, '‹')
+      .replace(/>/g, '›')
+      .replace(/"/g, '″')
+      .replace(/'/g, '′')
+      .replace(/`/g, '′')
+      .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '');
+  }
+  return out;
+}
+
+function sanitizeValue(val, depth) {
+  if (val === null || val === undefined) return null;
+  const type = typeof val;
+  if (type === 'number') return Number.isFinite(val) ? val : null;
+  if (type === 'boolean') return val;
+  if (type === 'string') return sanitizeString(val);
+  if (type !== 'object' || depth >= SANITIZE_MAX_DEPTH) return null;
+  if (Array.isArray(val)) return val.map((item) => sanitizeValue(item, depth + 1));
+  const out = {};
+  for (const key of Object.keys(val)) {
+    if (UNSAFE_KEYS.has(key)) continue;
+    out[sanitizeString(String(key))] = sanitizeValue(val[key], depth + 1);
+  }
+  return out;
+}
+
+const DAY_NUMERIC_FIELDS = [
+  'maxC', 'minC', 'maxF', 'minF', 'confidencePct', 'offsetFromToday', 'humidity',
+  'precipMm', 'precipP75Mm', 'rainMm', 'snowMm', 'snowDepthCm', 'precipDay', 'precipNight',
+  'windMs', 'windMph', 'gustMs', 'gustMph', 'windDeg', 'cloudCoverPct', 'uv',
+  'soil0C', 'soil6C', 'soil18C', 'soil54C', 'dewPointC', 'deltaP24hMm',
+  'pressureStationMm', 'pressureStationHpa', 'pressureMslMm', 'pressureMslHpa',
+];
+
+/**
+ * Returns a deep, markup-free copy of an untrusted dataset, or null when it is not a usable
+ * forecast slice. Strings are neutralised, non-finite numbers dropped, and the fields the UI
+ * formats as numbers are coerced so that a crafted file cannot inject HTML or crash rendering.
+ */
+export function sanitizeDataset(raw) {
+  if (!raw || typeof raw !== 'object' || !Array.isArray(raw.days)) return null;
+  const clean = sanitizeValue(raw, 0);
+  if (!clean || !Array.isArray(clean.days)) return null;
+
+  clean.days = clean.days.filter((day) => {
+    if (!day || typeof day !== 'object' || Array.isArray(day)) return false;
+    if (typeof day.isoDate !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(day.isoDate)) return false;
+    for (const field of DAY_NUMERIC_FIELDS) {
+      if (!(field in day)) continue;
+      const n = day[field] === null || day[field] === '' ? NaN : Number(day[field]);
+      day[field] = Number.isFinite(n) ? n : null;
+    }
+    if (day.maxC === null || day.maxC === undefined || day.minC === null || day.minC === undefined) return false;
+    day.id = `day_${day.isoDate}`;
+    if (!Array.isArray(day.hours)) day.hours = [];
+    day.hours = day.hours.filter((h) => h && typeof h === 'object' && Number.isFinite(Number(h.hour)));
+    return true;
+  });
+  if (!clean.days.length) return null;
+  clean.days.sort((a, b) => (a.isoDate < b.isoDate ? -1 : a.isoDate > b.isoDate ? 1 : 0));
+  return clean;
 }
 
 export function loadPrefs() {
@@ -153,10 +235,11 @@ export function saveDatasetCache(dataset) {
     store.setItem(STORAGE_KEYS.CACHE_V4, json);
     return { ok: true, bytes, kb: +(bytes / 1024).toFixed(1), savedAtIso, savedAtLabel };
   } catch (_) {
-    // Evict LRU archive slices and MOS cache if storage quota is tight, then retry
+    // Evict LRU archive slices and MOS / companion caches if storage quota is tight, then retry
     try {
       store.removeItem(STORAGE_KEYS.ARCHIVE_LRU);
       store.removeItem(STORAGE_KEYS.MOS_CACHE);
+      store.removeItem(STORAGE_KEYS.COMPANION_CACHE);
       store.removeItem(LEGACY_CACHE_KEY);
       store.setItem(STORAGE_KEYS.CACHE_V4, json);
       return { ok: true, bytes, kb: +(bytes / 1024).toFixed(1), savedAtIso, savedAtLabel };
@@ -172,12 +255,15 @@ export function loadDatasetCache() {
     const raw = store.getItem(STORAGE_KEYS.CACHE_V4);
     if (!raw) return null;
     const parsed = JSON.parse(raw);
-    const ds = parsed?.dataset || parsed?.payload || (Array.isArray(parsed?.days) ? parsed : null);
-    if (!ds || !Array.isArray(ds.days) || !ds.days.length) return null;
+    // localStorage is shared by everything served from this origin: re-validate on the way in
+    const ds = sanitizeDataset(parsed?.dataset || parsed?.payload || (Array.isArray(parsed?.days) ? parsed : null));
+    if (!ds) return null;
+    const savedAtIso = typeof parsed?.savedAtIso === 'string' ? sanitizeString(parsed.savedAtIso) : null;
+    const savedAtLabel = typeof parsed?.savedAtLabel === 'string' ? sanitizeString(parsed.savedAtLabel) : null;
     return {
       ...ds,
-      cacheSavedAtIso: parsed?.savedAtIso || null,
-      cacheSavedAtLabel: parsed?.savedAtLabel || null,
+      cacheSavedAtIso: savedAtIso,
+      cacheSavedAtLabel: savedAtLabel,
     };
   } catch (_) {
     return null;
@@ -190,7 +276,10 @@ export function clearDatasetCache({ includeArchive = false, includeMos = false }
     store.removeItem(STORAGE_KEYS.CACHE_V4);
     store.removeItem(LEGACY_CACHE_KEY);
     if (includeArchive) store.removeItem(STORAGE_KEYS.ARCHIVE_LRU);
-    if (includeMos) store.removeItem(STORAGE_KEYS.MOS_CACHE);
+    if (includeMos) {
+      store.removeItem(STORAGE_KEYS.MOS_CACHE);
+      store.removeItem(STORAGE_KEYS.COMPANION_CACHE);
+    }
   } catch (_) {}
 }
 
@@ -199,10 +288,12 @@ export function getCacheStats() {
   let rawCache = null;
   let rawArchive = null;
   let rawMos = null;
+  let rawCompanion = null;
   try {
     rawCache = store.getItem(STORAGE_KEYS.CACHE_V4);
     rawArchive = store.getItem(STORAGE_KEYS.ARCHIVE_LRU);
     rawMos = store.getItem(STORAGE_KEYS.MOS_CACHE);
+    rawCompanion = store.getItem(STORAGE_KEYS.COMPANION_CACHE);
   } catch (_) {}
 
   let parsedCache = null;
@@ -220,16 +311,17 @@ export function getCacheStats() {
 
   const cacheBytes = byteLength(rawCache);
   const archiveBytes = byteLength(rawArchive);
-  const mosBytes = byteLength(rawMos);
+  const mosBytes = byteLength(rawMos) + byteLength(rawCompanion);
   const totalBytes = cacheBytes + archiveBytes + mosBytes;
+  const safeText = (v) => (typeof v === 'string' && v ? sanitizeString(v) : null);
 
   return {
     hasCache: Boolean(parsedCache?.dataset?.days?.length || parsedCache?.days?.length),
     bytes: cacheBytes,
     kb: +(cacheBytes / 1024).toFixed(1),
-    savedAtIso: parsedCache?.savedAtIso || null,
-    savedAtLabel: parsedCache?.savedAtLabel || null,
-    sourceLabel: parsedCache?.dataset?.sourceLabel || parsedCache?.sourceLabel || null,
+    savedAtIso: safeText(parsedCache?.savedAtIso),
+    savedAtLabel: safeText(parsedCache?.savedAtLabel),
+    sourceLabel: safeText(parsedCache?.dataset?.sourceLabel) || safeText(parsedCache?.sourceLabel),
     daysCount: parsedCache?.dataset?.days?.length || parsedCache?.days?.length || 0,
     archiveSlicesCount: archiveList.length,
     archiveBytes,
@@ -297,12 +389,14 @@ export async function importDatasetJsonFile(file) {
     throw new Error('Некорректный JSON-файл');
   }
 
-  const ds = parsed?.dataset || parsed?.payload || parsed;
-  if (!ds || typeof ds !== 'object' || !Array.isArray(ds.days) || !ds.days.length) {
+  const rawDs = parsed?.dataset || parsed?.payload || parsed;
+  if (!rawDs || typeof rawDs !== 'object' || !Array.isArray(rawDs.days) || !rawDs.days.length) {
     throw new Error('Неверный формат JSON-среза (отсутствует массив days)');
   }
-  const first = ds.days[0];
-  if (!first || (typeof first.maxC !== 'number' && typeof first.minC !== 'number')) {
+
+  // An imported file is untrusted input: keep only a validated, markup-free copy
+  const ds = sanitizeDataset(rawDs);
+  if (!ds) {
     throw new Error('Неверная структура записей в JSON-срезе');
   }
 
@@ -386,6 +480,42 @@ export function saveMosCache(payload) {
     );
   } catch (_) {}
   return payload;
+}
+
+/**
+ * Soil / snow companion slice. Kept so a slow or failing upstream can be served stale
+ * (stale-if-error) instead of falling back to air-temperature heuristics.
+ */
+export function saveCompanionCache(payload) {
+  if (!payload || typeof payload !== 'object') return null;
+  const store = getStore();
+  try {
+    store.setItem(
+      STORAGE_KEYS.COMPANION_CACHE,
+      JSON.stringify({
+        savedAtMs: Date.now(),
+        payload,
+      })
+    );
+  } catch (_) {}
+  return payload;
+}
+
+/** @returns {{ payload: object, savedAtMs: number } | null} */
+export function loadCompanionCache(maxAgeMs = 60 * 60 * 1000) {
+  const store = getStore();
+  try {
+    const raw = store.getItem(STORAGE_KEYS.COMPANION_CACHE);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed.savedAtMs !== 'number' || !parsed.payload || typeof parsed.payload !== 'object') {
+      return null;
+    }
+    if (Date.now() - parsed.savedAtMs > maxAgeMs) return null;
+    return { payload: parsed.payload, savedAtMs: parsed.savedAtMs };
+  } catch (_) {
+    return null;
+  }
 }
 
 export function loadMosCache(maxAgeMs = 60 * 60 * 1000) {

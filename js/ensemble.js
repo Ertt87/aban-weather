@@ -341,7 +341,10 @@ export function computeRollingMos(previousRunsPayload) {
     return {
         models: modelsOut,
         bestModelId,
-        summaryRu: `MOS 14д: лидер ${bestMeta?.shortName || bestModelId} (MAE ${bestStats.maeC.toFixed(1)}°C, день ${bestStats.dayBiasC >= 0 ? '+' : ''}${bestStats.dayBiasC.toFixed(1)}°, ночь ${bestStats.nightBiasC >= 0 ? '+' : ''}${bestStats.nightBiasC.toFixed(1)}°)`
+        // "MAE к анализу": the reference is each model's own latest analysis, NOT station observations,
+        // so this ranks run-to-run consistency and must not be read as absolute forecast accuracy.
+        referenceRu: 'собственный анализ модели',
+        summaryRu: `MOS 14д: лидер ${bestMeta?.shortName || bestModelId} (MAE к анализу ${bestStats.maeC.toFixed(1)}°C, день ${bestStats.dayBiasC >= 0 ? '+' : ''}${bestStats.dayBiasC.toFixed(1)}°, ночь ${bestStats.nightBiasC >= 0 ? '+' : ''}${bestStats.nightBiasC.toFixed(1)}°)`
     };
 }
 
@@ -624,7 +627,12 @@ function parseMetNo(metNo) {
         if (tempC === null) continue;
         const next1 = item.data?.next_1_hours?.details || {};
         const next6 = item.data?.next_6_hours?.details || {};
-        const precipMm = toNum(next1.precipitation_amount) ?? (toNum(next6.precipitation_amount) !== null ? toNum(next6.precipitation_amount) / 6 : null);
+        const p1 = toNum(next1.precipitation_amount);
+        const p6 = toNum(next6.precipitation_amount);
+        // Hourly RATE for the blended hour slot: beyond ~60 h MET.no is 6-hourly, so spread the block
+        const precipMm = p1 ?? (p6 !== null ? p6 / 6 : null);
+        // Contribution to the DAILY total: a 6-hourly step stands for its whole 6 h block
+        const precipBlockMm = p1 ?? p6;
 
         if (!hourlyByDate.has(parts.isoDate)) hourlyByDate.set(parts.isoDate, new Map());
         hourlyByDate.get(parts.isoDate).set(parts.hour, {
@@ -636,7 +644,8 @@ function parseMetNo(metNo) {
             windDeg: toNum(det.wind_from_direction),
             pressureMslHpa: toNum(det.air_pressure_at_sea_level),
             cloudCoverPct: toNum(det.cloud_area_fraction),
-            precipMm
+            precipMm,
+            precipBlockMm
         });
     }
 
@@ -646,7 +655,7 @@ function parseMetNo(metNo) {
         const temps = vals.map((v) => v.tempC);
         const winds = vals.map((v) => v.windMs).filter((v) => v !== null);
         const gusts = vals.map((v) => v.gustMs).filter((v) => v !== null);
-        const precips = vals.map((v) => v.precipMm).filter((v) => v !== null);
+        const precips = vals.map((v) => v.precipBlockMm).filter((v) => v !== null);
         const wAvg = blendWindVectors(vals.filter((v) => v.windMs !== null).map((v) => ({ speedMs: v.windMs, gustMs: v.gustMs, dirDeg: v.windDeg ?? 0, weight: 1 })));
         dailyByDate.set(isoDate, {
             maxC: +Math.max(...temps).toFixed(1),
@@ -1257,14 +1266,22 @@ function buildZoneDayRecord({
     };
 
     const compHourVals = compHours ? [...compHours.values()] : [];
-    const snowDepthCm =
-        toNum(rawArchiveDay?.snowDepthCm) ??
-        (compHourVals.length ? Math.max(0, ...compHourVals.map((c) => c.snowDepthCm ?? 0)) : null) ??
-        (zone === 'subseasonal' ? clim.climSnowDepthCm : 0);
+
+    // Snow depth: modelled value when the archive / companion channel delivered one, otherwise the
+    // climatological normal — explicitly flagged, never a silent "0 cm" in the middle of winter.
+    const compSnowVals = compHourVals.map((c) => c.snowDepthCm).filter((v) => v !== null && v !== undefined);
+    const modelledSnowCm =
+        toNum(rawArchiveDay?.snowDepthCm) ?? (compSnowVals.length ? Math.max(0, ...compSnowVals) : null);
+    const snowEstimated = modelledSnowCm === null;
+    const snowDepthCm = modelledSnowCm ?? clim.climSnowDepthCm;
+
+    // Soil profile: same honesty rule — without archive / companion data the values below are an
+    // air-temperature heuristic and every consumer (UI, field-ops cards) must be able to tell.
+    const modelledSoil0C = toNum(rawArchiveDay?.soil0C) ?? avgArr(compHourVals.map((c) => c.soil0C));
+    const soilEstimated = modelledSoil0C === null;
 
     const soil0C =
-        toNum(rawArchiveDay?.soil0C) ??
-        avgArr(compHourVals.map((c) => c.soil0C)) ??
+        modelledSoil0C ??
         +((maxC + minC) * 0.42).toFixed(1);
     const soil6C =
         toNum(rawArchiveDay?.soil6C) ??
@@ -1531,6 +1548,11 @@ function buildZoneDayRecord({
         nextNightIconType: wNight.icon,
         probFrostBelowMinus20,
         probSnowOver5mm,
+        dataQuality: {
+            soilEstimated,
+            snowEstimated,
+            ensembleBacked: Boolean(ensQ)
+        },
         modelBreakdown,
         hours
     };
@@ -1823,6 +1845,8 @@ export function buildUnifiedDataset(rawBundle = {}, options = {}) {
         precipMm: curPrecipMm,
         precipPhase: curPhaseObj.phase,
         snowDepthCm: todayDay?.snowDepthCm ?? 0,
+        snowEstimated: Boolean(todayDay?.dataQuality?.snowEstimated),
+        soilEstimated: Boolean(todayDay?.dataQuality?.soilEstimated),
         humidity: curHumidity,
         dewPointC: curDewPointC,
         cloudCoverPct: Math.round(toNum(gCur?.cloudCover) ?? todaySlot?.cloudCoverPct ?? todayDay?.cloudCoverPct ?? 40),
@@ -1902,6 +1926,7 @@ export function buildUnifiedDataset(rawBundle = {}, options = {}) {
         sourceLabel,
         syncedAt: abanNow.label,
         latencyMs,
+        isPartial: Boolean(rawBundle.isPartial),
         activeModels,
         channels: rawBundle.channels || {},
         errors: rawBundle.errors || {},
@@ -2142,6 +2167,10 @@ export function buildPentadSummary(days) {
             pressureStationMm: Math.round(avg((d) => d.pressureStationMm ?? 745)),
             pressureMslMm: Math.round(avg((d) => d.pressureMslMm ?? 765)),
             deltaP24hMm: Math.round(last.pressureStationMm - first.pressureStationMm),
+            dataQuality: {
+                soilEstimated: chunk.some((d) => d.dataQuality?.soilEstimated),
+                snowEstimated: chunk.some((d) => d.dataQuality?.snowEstimated)
+            },
             dayIds: chunk.map((d) => d.id)
         });
     }

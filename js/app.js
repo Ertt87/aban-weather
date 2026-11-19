@@ -50,7 +50,18 @@ const ZONE_BADGE_META = {
   deterministic: { short: 'Точн', label: 'Точный 10д', cls: 'zone-pill--deterministic' },
   extended_ensemble: { short: 'Анс', label: 'Ансамбль 11–16д', cls: 'zone-pill--extended_ensemble' },
   subseasonal: { short: 'Тренд', label: 'Тренд 17–35д', cls: 'zone-pill--subseasonal' },
+  // Far-range day that no ensemble covers: the numbers are the 1991–2020 normal, not a forecast
+  climatology: { short: 'Норма', label: 'Клим. норма (нет ансамбля)', cls: 'zone-pill--subseasonal' },
 };
+
+function isClimatologyOnlyDay(day) {
+  return day?.zone === 'subseasonal' && day?.dataQuality?.ensembleBacked === false;
+}
+
+function getZoneMeta(day, fallbackKey = 'deterministic') {
+  if (isClimatologyOnlyDay(day)) return ZONE_BADGE_META.climatology;
+  return ZONE_BADGE_META[day?.zone] || ZONE_BADGE_META[fallbackKey];
+}
 
 const SOURCE_MODE_LABELS = {
   hybrid: '⚡ Супер-Ансамбль',
@@ -69,6 +80,12 @@ const PRESET_LABELS = {
   weekend: 'Выходные',
   custom: 'Произвольный',
 };
+
+const AUTO_REFRESH_MS = 30 * 60 * 1000;
+const AUTO_REFRESH_RETRY_MS = 3 * 60 * 1000;
+const AUTO_REFRESH_TICK_MS = 5 * 60 * 1000;
+
+let refreshSeq = 0;
 
 const prefs = loadPrefs();
 
@@ -91,6 +108,8 @@ const state = {
   activeTab: 'temp',
   dirtyTabs: { temp: true, precip: true, wind: true, ops: true },
   waitingSw: null,
+  lastFetchMs: 0,
+  lastAttemptMs: 0,
   startIso: null,
   endIso: null,
   selectedDayId: null,
@@ -115,6 +134,29 @@ function escapeHtml(val) {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
+}
+
+/**
+ * Coerces a value headed for an HTML template to a finite number. Dataset fields can originate
+ * from an imported file or from localStorage, so nothing is interpolated into markup raw.
+ */
+function num(val, fallback = 0) {
+  const n = typeof val === 'number' ? val : Number(val);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+/** "≈" marks a value that is an estimate (climatology / air-temperature heuristic), not model data. */
+function approxMark(isEstimated) {
+  return isEstimated ? '≈' : '';
+}
+
+function formatSnowCm(cm, isEstimated = false, decimals = 1) {
+  return `${approxMark(isEstimated)}${num(cm).toFixed(decimals)}`;
+}
+
+function formatSoilCompact(c, isEstimated = false) {
+  const txt = formatTempCompact(c);
+  return txt === '—' ? txt : `${approxMark(isEstimated)}${txt}`;
 }
 
 function getAbanNowParts() {
@@ -471,32 +513,42 @@ async function refreshWeatherData(showNotice = true) {
     return;
   }
 
+  // Only the newest refresh may touch the UI: a source/mode switch mid-flight starts a new one
+  const seq = ++refreshSeq;
+  state.lastAttemptMs = Date.now();
   setLoadingState(true);
-  try {
-    const rawBundle = await fetchAllWeatherSources({
-      apiKey: state.apiKey,
-      mode: state.sourceMode,
-      preferredOmModel: state.preferredOmModel,
-      forceRefresh: showNotice,
-    });
+
+  // Applied twice at most: once for the fast partial slice (core forecast in ~1–2 s),
+  // then for the complete bundle when the slow channels (soil / snow, 35-day ensemble) land.
+  const applyBundle = (rawBundle) => {
+    if (seq !== refreshSeq) return null;
 
     const prevDays = getAllDays().filter((d) => d.isArchive);
-    let unified = buildUnifiedDataset(rawBundle, {
+    const baseUnified = buildUnifiedDataset(rawBundle, {
       mosCache: state.dataset?.mos?.bestModelId ? state.dataset.mos : null,
     });
+    if (!baseUnified.days.length) {
+      if (rawBundle.isPartial) return null;
+      throw new Error('метеосерверы вернули пустой прогноз');
+    }
 
     // Preserve any lazily loaded custom historical archive slices (older than 14d past_days)
-    const earliestNewIso = unified.days[0]?.isoDate;
+    const earliestNewIso = baseUnified.days[0]?.isoDate;
     const customOlderArchive = earliestNewIso
       ? prevDays.filter((d) => d.isoDate < earliestNewIso)
       : [];
-    if (customOlderArchive.length) {
-      unified = mergeArchiveDaysIntoDataset(unified, customOlderArchive);
-    }
+    const unified = customOlderArchive.length
+      ? mergeArchiveDaysIntoDataset(baseUnified, customOlderArchive)
+      : baseUnified;
 
     state.dataset = unified;
     state.fromCache = false;
-    saveDatasetCache(unified);
+    if (!rawBundle.isPartial) {
+      // Persist the forecast slice only: custom archive ranges already live in the 5-slot LRU,
+      // and multi-year ranges would blow the localStorage quota.
+      saveDatasetCache(baseUnified);
+      state.lastFetchMs = Date.now();
+    }
 
     if (state.activePreset !== 'custom') {
       applyPeriodPreset(state.activePreset, { silent: true });
@@ -504,13 +556,27 @@ async function refreshWeatherData(showNotice = true) {
       ensureSelectionConsistency();
     }
     updateAllViews();
+    return unified;
+  };
 
-    if (showNotice) {
+  try {
+    const rawBundle = await fetchAllWeatherSources({
+      apiKey: state.apiKey,
+      mode: state.sourceMode,
+      preferredOmModel: state.preferredOmModel,
+      forceRefresh: showNotice,
+      onPartial: applyBundle,
+    });
+
+    const unified = applyBundle(rawBundle);
+    if (unified && showNotice) {
       showToast(`Обновлено: ${unified.sourceLabel} (${unified.latencyMs} мс)`);
     }
   } catch (err) {
-    const cached = loadDatasetCache();
-    if (cached && !state.dataset?.days?.length) {
+    if (seq !== refreshSeq) return;
+    const hasLiveData = Boolean(state.dataset?.days?.length) && state.dataset.sourceType !== 'reference_wn3';
+    const cached = hasLiveData ? null : loadDatasetCache();
+    if (cached) {
       state.dataset = cached;
       state.fromCache = true;
       ensureSelectionConsistency();
@@ -520,8 +586,22 @@ async function refreshWeatherData(showNotice = true) {
       showToast(`Ошибка сети (${err?.message || 'таймаут'}) — активен кэш`);
     }
   } finally {
-    setLoadingState(false);
+    if (seq === refreshSeq) setLoadingState(false);
   }
+}
+
+/**
+ * Keeps an open dashboard (or a PWA resumed from the background) from silently showing
+ * hours-old numbers: refresh when the tab becomes visible / the network returns / on a timer.
+ */
+function maybeAutoRefresh() {
+  if (state.sourceMode === 'offline_cache' || state.isLoading) return;
+  if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
+  const now = Date.now();
+  if (now - state.lastFetchMs < AUTO_REFRESH_MS) return;
+  if (now - state.lastAttemptMs < AUTO_REFRESH_RETRY_MS) return;
+  refreshWeatherData(false);
 }
 
 function setDataSourceMode(mode) {
@@ -573,18 +653,22 @@ function renderHeader() {
   if (mosTextEl) {
     if (mosBestId && ds.mos?.models?.[mosBestId]) {
       const mShort = MODEL_META[mosBestId]?.shortName || mosBestId;
-      mosTextEl.textContent = `MOS: ${mShort} ±${ds.mos.models[mosBestId].maeC.toFixed(1)}°`;
+      // No "±": this MAE is measured against the model's own analysis, not station observations
+      mosTextEl.textContent = `MOS: ${mShort} • MAE ${num(ds.mos.models[mosBestId].maeC).toFixed(1)}°`;
     } else {
       mosTextEl.textContent = 'MOS: веса моделей';
     }
   }
 
-  const errCount = Object.keys(ds.errors || {}).length;
+  const channelList = Object.values(ds.channels || {});
+  const problemCount = channelList.filter((ch) => ch?.status === 'error' || ch?.status === 'partial').length;
+  const pendingCount = channelList.filter((ch) => ch?.status === 'pending').length;
   const syncEl = $('syncTimestampText');
   if (syncEl) {
-    const lat = ds.latencyMs ? ` • ${ds.latencyMs} мс` : '';
-    const errTag = errCount > 0 ? ` • ⚠️ ${errCount} канал.` : '';
-    syncEl.textContent = `Синхр.: ${ds.syncedAt || '—'}${lat}${errTag}`;
+    const lat = ds.latencyMs ? ` • ${num(ds.latencyMs)} мс` : '';
+    const pendTag = pendingCount > 0 ? ` • ⏳ ещё ${pendingCount} канал.` : '';
+    const errTag = problemCount > 0 ? ` • ⚠️ ${problemCount} канал.` : '';
+    syncEl.textContent = `Синхр.: ${ds.syncedAt || '—'}${lat}${pendTag}${errTag}`;
   }
 
   const pressBtnText = $('pressureToggleText');
@@ -634,7 +718,9 @@ function renderCurrentConditions() {
   const phaseRu = PRECIP_PHASE_LABELS[cur.precipPhase] || cur.precipPhase || 'Сухо';
   $('currentPrecipPhaseTag').textContent = phaseRu;
   $('currentPrecipProbDisplay').textContent = `${cur.precipProb ?? 0}% • ${Number(cur.precipMm ?? 0).toFixed(1)} мм`;
-  $('currentSnowDepthDisplay').textContent = `Покров: ${Number(cur.snowDepthCm ?? 0).toFixed(1)} см`;
+  $('currentSnowDepthDisplay').textContent = cur.snowEstimated
+    ? `Покров: ${formatSnowCm(cur.snowDepthCm, true)} см (норма)`
+    : `Покров: ${formatSnowCm(cur.snowDepthCm)} см`;
 
   $('currentHumidityDisplay').textContent = `${cur.humidity ?? 0}%`;
   $('currentHumidityBar').style.width = `${Math.min(100, Math.max(0, Number(cur.humidity ?? 0)))}%`;
@@ -656,10 +742,33 @@ function renderCurrentConditions() {
       : 'metric-box__sub text-slate-400';
 
   // 4-layer soil preview
-  $('currentSoil0').textContent = formatTempCompact(cur.soil0C);
-  $('currentSoil6').textContent = formatTempCompact(cur.soil6C);
-  $('currentSoil18').textContent = formatTempCompact(cur.soil18C);
-  $('currentSoil54').textContent = formatTempCompact(cur.soil54C);
+  const soilEst = Boolean(cur.soilEstimated);
+  $('currentSoil0').textContent = formatSoilCompact(cur.soil0C, soilEst);
+  $('currentSoil6').textContent = formatSoilCompact(cur.soil6C, soilEst);
+  $('currentSoil18').textContent = formatSoilCompact(cur.soil18C, soilEst);
+  $('currentSoil54').textContent = formatSoilCompact(cur.soil54C, soilEst);
+
+  // Honesty note: say out loud when soil / snow are estimates rather than model output
+  const qualityEl = $('currentDataQualityNote');
+  if (qualityEl) {
+    const companionStatus = ds.channels?.openMeteoCompanion?.status;
+    const parts = [];
+    if (soilEst) parts.push('почва — оценка по воздуху');
+    if (cur.snowEstimated) parts.push('снег — клим. норма');
+    if (parts.length) {
+      const reason =
+        companionStatus === 'pending'
+          ? 'канал почвы/снега ещё загружается'
+          : companionStatus === 'error'
+          ? 'канал почвы/снега недоступен'
+          : 'нет данных модели';
+      qualityEl.textContent = `≈ ${parts.join(', ')} (${reason})`;
+      qualityEl.classList.remove('hidden');
+    } else {
+      qualityEl.textContent = '';
+      qualityEl.classList.add('hidden');
+    }
+  }
 
   // Air quality badge
   const aqiEl = $('currentAqiBadge');
@@ -689,7 +798,7 @@ function renderCurrentConditions() {
   $('controlCondDesc').textContent = cp.condRu || '—';
   $('controlPrecip').textContent = `${cp.precipProb ?? 0}%`;
   $('controlWind').textContent = `${formatWind(cp.windMs, cp.windMph)} ${cp.windDirShort || ''}`;
-  $('controlSoil0').textContent = formatTempCompact(cp.soil0C);
+  $('controlSoil0').textContent = formatSoilCompact(cp.soil0C, soilEst);
 
   $('controlNext3hLabel').textContent = cp.next3hLabel || 'Через 3 ч';
   $('controlNext3hTemp').textContent = formatTemp(cp.next3hTempC, null, state.unit === 'dual');
@@ -766,7 +875,7 @@ function renderFiltersAndKpis() {
         const isEdge = d.isoDate === state.startIso || d.isoDate === state.endIso;
         const isSelected = d.id === state.selectedDayId;
         const dayPart = d.dateStr ? d.dateStr.split(' ')[0] : d.isoDate.slice(8);
-        return `<button type="button" data-timeline-iso="${escapeHtml(d.isoDate)}" class="timeline-node timeline-node--${escapeHtml(d.zone || 'deterministic')} ${inRange ? 'in-range' : ''} ${isEdge ? 'is-edge' : ''} ${isSelected ? 'is-selected' : ''}" title="${escapeHtml(d.fullDateLabel || d.isoDate)} • ${d.confidencePct ?? 80}%">
+        return `<button type="button" data-timeline-iso="${escapeHtml(d.isoDate)}" class="timeline-node timeline-node--${escapeHtml(d.zone || 'deterministic')} ${inRange ? 'in-range' : ''} ${isEdge ? 'is-edge' : ''} ${isSelected ? 'is-selected' : ''}" title="${escapeHtml(d.fullDateLabel || d.isoDate)} • ${num(d.confidencePct, 80)}%">
           <div class="font-bold">${escapeHtml(dayPart)}</div>
           <div style="font-size:9px;opacity:0.85">${escapeHtml(d.dayShort || '')}</div>
         </button>`;
@@ -801,6 +910,7 @@ function renderFiltersAndKpis() {
   let anomCount = 0;
   let sumPrecipMm = 0;
   let maxSnowCm = 0;
+  let maxSnowEstimated = false;
   let dryDays = 0;
 
   let minP10 = Infinity;
@@ -823,8 +933,11 @@ function renderFiltersAndKpis() {
       anomCount++;
     }
 
-    sumPrecipMm += Number(d.precipMm ?? 0);
-    if ((d.snowDepthCm ?? 0) > maxSnowCm) maxSnowCm = Number(d.snowDepthCm);
+    sumPrecipMm += num(d.precipMm);
+    if (num(d.snowDepthCm) > maxSnowCm) {
+      maxSnowCm = num(d.snowDepthCm);
+      maxSnowEstimated = Boolean(d.dataQuality?.snowEstimated);
+    }
     if ((d.precipDay ?? 0) < 15 && (d.precipNight ?? 0) < 15 && (d.precipMm ?? 0) < 0.5) {
       dryDays++;
     }
@@ -870,7 +983,7 @@ function renderFiltersAndKpis() {
   $('periodSumWindowAvg').textContent = `Окно (${winCfg.shortLabel}): ${formatTemp(avgWinC)}`;
 
   $('periodSumPrecipMm').textContent = `Σ ${sumPrecipMm.toFixed(1)} мм`;
-  $('periodSumSnowCm').textContent = `❄ до ${maxSnowCm.toFixed(1)} см`;
+  $('periodSumSnowCm').textContent = `❄ до ${formatSnowCm(maxSnowCm, maxSnowEstimated)} см${maxSnowEstimated ? ' (норма)' : ''}`;
   $('periodSumDryDays').textContent = `Сухих дней: ${dryDays} из ${count}`;
 
   $('periodSumMaxWind').textContent = `${formatWind(maxWindObj.windMs, maxWindObj.windMph)} (пор. ${formatWind(maxWindObj.gustMs, maxWindObj.gustMph)})`;
@@ -934,8 +1047,8 @@ function renderForecastStrip() {
 
         return `<button type="button" data-day-id="${escapeHtml(p.id)}" class="glass-card day-card ${isSel ? 'day-card-active' : ''}">
           <div class="flex items-center justify-between gap-1">
-            <span class="zone-pill ${zMeta.cls}">${escapeHtml(zMeta.short)} ${p.confidencePct}%</span>
-            <span class="text-[10px] font-mono text-slate-400">${p.dayCount} дн.</span>
+            <span class="zone-pill ${zMeta.cls}">${escapeHtml(zMeta.short)} ${num(p.confidencePct)}%</span>
+            <span class="text-[10px] font-mono text-slate-400">${num(p.dayCount)} дн.</span>
           </div>
           <div class="mt-1">
             <div class="text-xs font-extrabold ${isSel ? 'text-sky-300' : 'text-white'}">${escapeHtml(p.label)}</div>
@@ -949,7 +1062,7 @@ function renderForecastStrip() {
             </div>
             ${showSpread ? `<div class="text-[10px] font-mono text-purple-300">P25–75: ${formatTempCompact(p.minP25C)}..${formatTempCompact(p.maxP75C)}</div>` : ''}
             <div class="flex items-center justify-between text-[10px] font-mono pt-1" style="border-top:1px solid rgba(30,41,59,0.85)">
-              <span class="text-cyan-300">${p.precipMm.toFixed(1)}мм • ❄${p.snowDepthCm}см</span>
+              <span class="text-cyan-300">${num(p.precipMm).toFixed(1)}мм • ❄${formatSnowCm(p.snowDepthCm, p.dataQuality?.snowEstimated)}см</span>
               <span class="text-slate-300 font-bold">${escapeHtml(p.windDirShort || '—')}</span>
             </div>
           </div>
@@ -963,15 +1076,15 @@ function renderForecastStrip() {
     .map((day, idx) => {
       const isSelected = day.id === state.selectedDayId;
       const isMatch = matchesRiskFilter(day, state.filter, days.slice(0, idx));
-      const zMeta = ZONE_BADGE_META[day.zone] || ZONE_BADGE_META.deterministic;
+      const zMeta = getZoneMeta(day);
       const showSpread = day.zone === 'extended_ensemble' || day.zone === 'subseasonal' || day.offsetFromToday >= 10;
-      const maxPrecip = Math.max(day.precipDay ?? 0, day.precipNight ?? 0);
+      const maxPrecip = Math.max(num(day.precipDay), num(day.precipNight));
       const iconName = state.timeWindow === 'night' ? day.nightIconType : day.iconType;
 
       return `<button type="button" data-day-id="${escapeHtml(day.id)}" class="glass-card day-card ${isSelected ? 'day-card-active' : ''} ${!isMatch ? 'day-card-dimmed' : ''}">
         <div class="flex items-center justify-between gap-1">
-          <span class="zone-pill ${zMeta.cls}">${escapeHtml(zMeta.short)} ${day.confidencePct ?? 85}%</span>
-          ${day.snowDepthCm > 0 ? `<span class="text-[10px] font-mono text-cyan-300">❄${day.snowDepthCm.toFixed(0)}см</span>` : ''}
+          <span class="zone-pill ${zMeta.cls}">${escapeHtml(zMeta.short)} ${num(day.confidencePct, 85)}%</span>
+          ${num(day.snowDepthCm) > 0 ? `<span class="text-[10px] font-mono text-cyan-300">❄${formatSnowCm(day.snowDepthCm, day.dataQuality?.snowEstimated, 0)}см</span>` : ''}
         </div>
         <div class="mt-1">
           <div class="text-xs font-extrabold ${isSelected ? 'text-sky-300' : 'text-white'}">${escapeHtml(day.dayShort)}, ${escapeHtml(day.dateStr)}</div>
@@ -985,7 +1098,7 @@ function renderForecastStrip() {
           </div>
           ${showSpread ? `<div class="text-[10px] font-mono text-purple-300 truncate">P25–75: ${formatTempCompact(day.minP25C)}..${formatTempCompact(day.maxP75C)}</div>` : ''}
           <div class="flex items-center justify-between text-[10px] font-mono pt-1" style="border-top:1px solid rgba(30,41,59,0.85)">
-            <span class="text-cyan-300">${maxPrecip}% • ${Number(day.precipMm ?? 0).toFixed(1)}мм</span>
+            <span class="text-cyan-300">${maxPrecip}% • ${num(day.precipMm).toFixed(1)}мм</span>
             <span class="text-slate-300 font-bold">${escapeHtml(day.windDirShort || '—')}</span>
           </div>
         </div>
@@ -1016,7 +1129,7 @@ function updateSelectedHourBar(day) {
     $('diurnalWindowWind').textContent = `${formatWind(selPt.windMs, selPt.windMph)} (пор. ${formatWind(selPt.gustMs)}) ${selPt.windDirShort || ''}`;
     $('diurnalWindowPressure').textContent = `Давл.: ${pPair.mm} мм (${pPair.label})`;
     $('diurnalWindowPrecip').textContent = `${selPt.precipProb ?? 0}% • ${Number(selPt.precipMm ?? 0).toFixed(1)} мм (${phaseRu})`;
-    $('diurnalWindowSoil').textContent = `Почва 0см: ${formatTempCompact(selPt.soil0C)}`;
+    $('diurnalWindowSoil').textContent = `Почва 0см: ${formatSoilCompact(selPt.soil0C, day.dataQuality?.soilEstimated)}`;
   } else {
     $('selectedHourTitle').textContent = 'Диапазон суток:';
     $('selectedHourTemp').textContent = `${formatTemp(day.minC, day.minF)} .. ${formatTemp(day.maxC, day.maxF)}`;
@@ -1024,7 +1137,7 @@ function updateSelectedHourBar(day) {
     $('diurnalWindowWind').textContent = `${formatWind(day.windMs, day.windMph)} ${day.windDirShort || ''}`;
     $('diurnalWindowPressure').textContent = `Давл.: ${getPressurePair(day).mm} мм`;
     $('diurnalWindowPrecip').textContent = `${day.precipDay ?? 0}% • ${Number(day.precipMm ?? 0).toFixed(1)} мм`;
-    $('diurnalWindowSoil').textContent = `Почва 0см: ${formatTempCompact(day.soil0C)}`;
+    $('diurnalWindowSoil').textContent = `Почва 0см: ${formatSoilCompact(day.soil0C, day.dataQuality?.soilEstimated)}`;
   }
 }
 
@@ -1065,10 +1178,10 @@ function renderDayInspector() {
   const ops = computeFieldOpsMetrics(day, prevDays);
 
   $('inspectorDateBadge').textContent = `${day.dayShort}, ${day.dateStr} (${day.label || day.isoDate})`;
-  const zMeta = ZONE_BADGE_META[day.zone] || ZONE_BADGE_META.deterministic;
+  const zMeta = getZoneMeta(day);
   const zBadge = $('inspectorZoneBadge');
   zBadge.className = `zone-pill ${zMeta.cls}`;
-  zBadge.textContent = `${zMeta.label} • ${day.confidencePct ?? 85}%`;
+  zBadge.textContent = `${zMeta.label} • ${num(day.confidencePct, 85)}%`;
 
   $('inspectorTitle').textContent = `${day.dayCond || '—'} днём • ${day.nightCond || '—'} ночью`;
   $('inspectorIndexCounter').textContent = `День ${dayIndex + 1} / ${days.length}`;
@@ -1085,7 +1198,10 @@ function renderDayInspector() {
     badges.push(`<span class="badge-mono text-rose-300">🛣️ ${escapeHtml(ops.roadRisk.labelRu)}</span>`);
   }
   if (day.inversion?.active) {
-    badges.push(`<span class="badge-mono text-purple-300">🌫️ Инверсия −${day.inversion.deltaC.toFixed(1)}°</span>`);
+    badges.push(`<span class="badge-mono text-purple-300">🌫️ Инверсия −${num(day.inversion.deltaC).toFixed(1)}°</span>`);
+  }
+  if (day.dataQuality?.soilEstimated && !day.isArchive && day.zone !== 'subseasonal') {
+    badges.push('<span class="badge-mono text-amber-300">≈ Почва: оценка</span>');
   }
   if (Math.abs(day.deltaP24hMm ?? 0) >= 6) {
     badges.push(`<span class="badge-mono text-rose-300">📉 Скачок ΔP ${formatSignedInt(day.deltaP24hMm)}</span>`);
@@ -1095,7 +1211,10 @@ function renderDayInspector() {
   // Diurnal Chart & Honesty Notice
   const honestyEl = $('diurnalHonestyNotice');
   if (honestyEl) {
-    if (day.zone === 'subseasonal') {
+    if (isClimatologyOnlyDay(day)) {
+      honestyEl.textContent = 'Ансамбли не покрывают эту дату: показана климатическая норма 1991–2020, это не прогноз';
+      honestyEl.classList.remove('hidden');
+    } else if (day.zone === 'subseasonal') {
       honestyEl.textContent = '17–35д: сглаженный суточный ход из квантилей P10–P90';
       honestyEl.classList.remove('hidden');
     } else {
@@ -1150,12 +1269,14 @@ function renderDayInspector() {
   $('opsDieselGrade').textContent = `${ops.diesel.grade} (ПТФ ${ops.diesel.cutoffC}°C)`;
   $('opsDieselDetail').textContent = ops.diesel.noteRu;
 
-  $('opsGroundLabel').textContent = ops.ground.labelRu;
-  $('opsGroundDetail').textContent = `${ops.ground.detailRu} [0/6/18/54см: ${formatTempCompact(day.soil0C)} / ${formatTempCompact(day.soil6C)} / ${formatTempCompact(day.soil18C)} / ${formatTempCompact(day.soil54C)}]`;
+  // Ground card: an air-temperature heuristic must not pose as a measured freeze depth
+  const soilEst = Boolean(day.dataQuality?.soilEstimated);
+  $('opsGroundLabel').textContent = soilEst ? `≈ ${ops.ground.labelRu} — оценка` : ops.ground.labelRu;
+  $('opsGroundDetail').textContent = `${soilEst ? 'Нет данных модели почвы: ориентировочный расчёт по температуре воздуха. ' : ''}${ops.ground.detailRu} [0/6/18/54см: ${formatSoilCompact(day.soil0C, soilEst)} / ${formatSoilCompact(day.soil6C, soilEst)} / ${formatSoilCompact(day.soil18C, soilEst)} / ${formatSoilCompact(day.soil54C, soilEst)}]`;
 
   const pPair = getPressurePair(day);
   $('opsInversionLabel').textContent = day.inversion?.active
-    ? `Активна (−${day.inversion.deltaC.toFixed(1)}°C • низины ${formatTempCompact(day.inversion.valleyMinC)})`
+    ? `Активна (−${num(day.inversion.deltaC).toFixed(1)}°C • низины ${formatTempCompact(day.inversion.valleyMinC)})`
     : `Инверсия слабая • ${pPair.mm} мм`;
   $('opsInversionDetail').textContent = `${day.inversion?.noteRu || '—'} • Давл. ${pPair.mm} мм (Δ24ч: ${formatSignedInt(day.deltaP24hMm)})`;
 }
@@ -1200,23 +1321,26 @@ function renderAnalyticsTab(tabKey) {
     const soilFreezeDays = days.filter((d) => (d.soil0C ?? 0) <= 0.2);
     const dryDays = days.filter((d) => (d.precipDay ?? 0) < 15 && (d.precipNight ?? 0) < 15 && (d.precipMm ?? 0) < 0.5);
     const iceDays = days.filter((d, i) => matchesRiskFilter(d, 'ice_blizzard', days.slice(0, i)));
+    const soilAnyEstimated = days.some((d) => d.dataQuality?.soilEstimated);
+    // Every dataset string is escaped before it reaches innerHTML (dataset may come from a file)
+    const listDates = (list) => list.slice(0, 4).map((d) => escapeHtml(d.dateStr)).join(', ');
 
     $('opsSummaryCardsGrid').innerHTML = `
       <div class="ops-card">
         <div class="text-[11px] font-mono text-cyan-400 font-bold">❄️ ЗАМОРОЗКИ (${frostDays.length}/${days.length})</div>
-        <div class="text-xs font-bold text-white">${frostDays.length ? frostDays.slice(0, 4).map((d) => d.dateStr).join(', ') : 'Без заморозков'}</div>
+        <div class="text-xs font-bold text-white">${frostDays.length ? listDates(frostDays) : 'Без заморозков'}</div>
       </div>
       <div class="ops-card">
         <div class="text-[11px] font-mono text-rose-400 font-bold">🛣️ ГОЛОЛЁД / МЕТЕЛЬ (${iceDays.length})</div>
-        <div class="text-xs font-bold text-white">${iceDays.length ? iceDays.slice(0, 4).map((d) => d.dateStr).join(', ') : 'Трасса чистая'}</div>
+        <div class="text-xs font-bold text-white">${iceDays.length ? listDates(iceDays) : 'Трасса чистая'}</div>
       </div>
       <div class="ops-card">
-        <div class="text-[11px] font-mono text-amber-400 font-bold">🌱 ПОЧВА ≤0°C (${soilFreezeDays.length})</div>
-        <div class="text-xs font-bold text-white">${soilFreezeDays.length ? soilFreezeDays.slice(0, 4).map((d) => d.dateStr).join(', ') : 'Почва талая'}</div>
+        <div class="text-[11px] font-mono text-amber-400 font-bold">🌱 ПОЧВА ≤0°C (${soilFreezeDays.length})${soilAnyEstimated ? ' • ≈ оценка' : ''}</div>
+        <div class="text-xs font-bold text-white">${soilFreezeDays.length ? listDates(soilFreezeDays) : 'Почва талая'}</div>
       </div>
       <div class="ops-card">
         <div class="text-[11px] font-mono text-emerald-400 font-bold">☀️ СУХИЕ ОКНА (${dryDays.length})</div>
-        <div class="text-xs font-bold text-white">${dryDays.length ? dryDays.slice(0, 4).map((d) => d.dateStr).join(', ') : 'Влажный период'}</div>
+        <div class="text-xs font-bold text-white">${dryDays.length ? listDates(dryDays) : 'Влажный период'}</div>
       </div>
     `;
 
@@ -1237,14 +1361,15 @@ function renderAnalyticsTab(tabKey) {
         .map((p) => {
           const isSel = Array.isArray(p.dayIds) ? p.dayIds.includes(state.selectedDayId) : p.id === state.selectedDayId;
           const pPair = getPressurePair(p);
-          const anom = Number(p.climAnomalyC ?? 0);
+          const anom = num(p.climAnomalyC);
+          const pSoilEst = Boolean(p.dataQuality?.soilEstimated);
           return `<tr data-day-id="${escapeHtml(p.id)}" class="${isSel ? 'is-selected' : ''}">
-            <td class="font-bold text-white">${escapeHtml(p.label)} (${p.dayCount}д)</td>
-            <td><span class="zone-pill ${ZONE_BADGE_META[p.zone]?.cls || ''}">${escapeHtml(ZONE_BADGE_META[p.zone]?.short || p.zone)} ${p.confidencePct}%</span></td>
+            <td class="font-bold text-white">${escapeHtml(p.label)} (${num(p.dayCount)}д)</td>
+            <td><span class="zone-pill ${ZONE_BADGE_META[p.zone]?.cls || ''}">${escapeHtml(ZONE_BADGE_META[p.zone]?.short || p.zone)} ${num(p.confidencePct)}%</span></td>
             <td><span class="text-amber-300 font-bold">${formatTemp(p.maxC)}</span> / <span class="text-cyan-300">${formatTemp(p.minC)}</span> <span class="text-slate-400">(${formatTempCompact(p.absMinC)}..${formatTempCompact(p.absMaxC)})</span></td>
-            <td class="text-cyan-300">${p.precipMm.toFixed(1)} мм • ❄${p.snowDepthCm}см</td>
+            <td class="text-cyan-300">${num(p.precipMm).toFixed(1)} мм • ❄${formatSnowCm(p.snowDepthCm, p.dataQuality?.snowEstimated)}см</td>
             <td class="text-slate-200">${formatWind(p.windMs)} (пор. ${formatWind(p.gustMs)}) ${escapeHtml(p.windDirShort || '')}</td>
-            <td class="text-amber-300">${formatTempCompact(p.soil0C)} / ${formatTempCompact(p.soil54C)} • ${pPair.mm} мм</td>
+            <td class="text-amber-300">${formatSoilCompact(p.soil0C, pSoilEst)} / ${formatSoilCompact(p.soil54C, pSoilEst)} • ${num(pPair.mm)} мм</td>
             <td class="${anom >= 0 ? 'text-amber-300' : 'text-cyan-300'}">${anom > 0 ? '+' : ''}${anom.toFixed(1)}°C</td>
           </tr>`;
         })
@@ -1265,7 +1390,7 @@ function renderAnalyticsTab(tabKey) {
           const winStats = computeDayWindowStats(d, state.timeWindow);
           const ops = computeFieldOpsMetrics(d, days.slice(Math.max(0, idx - 3), idx));
           const pPair = getPressurePair(d);
-          const zMeta = ZONE_BADGE_META[d.zone] || ZONE_BADGE_META.deterministic;
+          const zMeta = getZoneMeta(d);
           const riskCls =
             ops.roadRisk.level === 'severe'
               ? 'text-rose-400 font-bold'
@@ -1278,7 +1403,7 @@ function renderAnalyticsTab(tabKey) {
           return `<tr data-day-id="${escapeHtml(d.id)}" class="${d.id === state.selectedDayId ? 'is-selected' : ''}">
             <td class="font-bold text-white">${escapeHtml(d.dayShort)}, ${escapeHtml(d.dateStr)}</td>
             <td class="font-sans text-slate-300">
-              <span class="zone-pill ${zMeta.cls}">${escapeHtml(zMeta.short)} ${d.confidencePct ?? 85}%</span>
+              <span class="zone-pill ${zMeta.cls}">${escapeHtml(zMeta.short)} ${num(d.confidencePct, 85)}%</span>
               <span style="margin-left:4px">${escapeHtml(d.dayCond || '—')}</span>
             </td>
             <td>
@@ -1286,9 +1411,9 @@ function renderAnalyticsTab(tabKey) {
               <span class="text-cyan-300">${formatTemp(d.minC, d.minF)}</span>
               <span class="text-sky-400">(${formatTempCompact(winStats.avgC, winStats.avgF)})</span>
             </td>
-            <td class="text-cyan-300">${Number(d.precipMm ?? 0).toFixed(1)} мм (${d.precipDay ?? 0}%) • ❄${Number(d.snowDepthCm ?? 0).toFixed(0)}см</td>
+            <td class="text-cyan-300">${num(d.precipMm).toFixed(1)} мм (${num(d.precipDay)}%) • ❄${formatSnowCm(d.snowDepthCm, d.dataQuality?.snowEstimated, 0)}см</td>
             <td class="text-slate-200">${formatWind(d.windMs, d.windMph)} (пор. ${formatWind(d.gustMs, d.gustMph)}) ${escapeHtml(d.windDirShort || '')}</td>
-            <td class="text-amber-300">${formatTempCompact(d.soil0C)} / ${formatTempCompact(d.soil54C)} • ${pPair.mm} мм</td>
+            <td class="text-amber-300">${formatSoilCompact(d.soil0C, d.dataQuality?.soilEstimated)} / ${formatSoilCompact(d.soil54C, d.dataQuality?.soilEstimated)} • ${num(pPair.mm)} мм</td>
             <td class="${riskCls}">${escapeHtml(ops.roadRisk.labelRu)}</td>
           </tr>`;
         })
@@ -1336,36 +1461,46 @@ function renderApiChannelsPanel() {
 
   let okCount = 0;
   let errCount = 0;
+  let pendingCount = 0;
   let activeCount = 0;
   for (const ch of list) {
-    if (ch.status === 'disabled') continue;
+    if (!ch || ch.status === 'disabled') continue;
     activeCount++;
     if (ch.status === 'ok' || ch.status === 'cached') okCount++;
-    else if (ch.status === 'error') errCount++;
+    else if (ch.status === 'error' || ch.status === 'partial') errCount++;
+    else if (ch.status === 'pending') pendingCount++;
   }
 
   if (badge) {
-    badge.textContent = errCount > 0 ? `${okCount}/${activeCount} OK • ${errCount} ош.` : `${okCount}/${activeCount} OK`;
+    const tags = [`${okCount}/${activeCount} OK`];
+    if (pendingCount > 0) tags.push(`⏳ ${pendingCount}`);
+    if (errCount > 0) tags.push(`${errCount} с проблемой`);
+    badge.textContent = tags.join(' • ');
     badge.className = errCount > 0 ? 'badge-mono text-amber-300' : 'badge-mono text-emerald-300';
   }
 
   const statusMeta = {
     ok: { label: '✅ OK', cls: 'chan-pill--ok' },
     cached: { label: '💾 Кэш', cls: 'chan-pill--cached' },
+    partial: { label: '⚠️ Частично', cls: 'chan-pill--partial' },
+    pending: { label: '⏳ Загрузка', cls: 'chan-pill--pending' },
     error: { label: '⚠️ Ошибка', cls: 'chan-pill--error' },
     disabled: { label: '⏸ Выкл', cls: 'chan-pill--disabled' },
   };
 
   body.innerHTML = list
+    .filter(Boolean)
     .map((ch) => {
       const m = statusMeta[ch.status] || statusMeta.disabled;
-      const latText = ch.latencyMs > 0 ? `${ch.latencyMs} мс` : '—';
+      const latText = num(ch.latencyMs) > 0 ? `${Math.round(num(ch.latencyMs))} мс` : '—';
       const detail = ch.error || ch.detail || '—';
+      const detailCls =
+        ch.status === 'error' ? 'text-rose-300' : ch.status === 'partial' ? 'text-amber-300' : 'text-slate-400';
       return `<tr>
         <td class="font-sans font-bold text-white">${escapeHtml(ch.label || ch.id)}</td>
         <td><span class="chan-pill ${m.cls}">${m.label}</span></td>
         <td class="text-slate-300">${latText}</td>
-        <td class="${ch.status === 'error' ? 'text-rose-300' : 'text-slate-400'}">${escapeHtml(detail)}</td>
+        <td class="${detailCls}">${escapeHtml(detail)}</td>
       </tr>`;
     })
     .join('');
@@ -1422,18 +1557,18 @@ function renderSettingsModal() {
         .map(([modelId, m]) => {
           const meta = MODEL_META[modelId] || { name: modelId, shortName: modelId, color: '#38bdf8' };
           const isBest = modelId === mos?.bestModelId;
-          const fmtBias = (v) => `${v > 0 ? '+' : ''}${Number(v ?? 0).toFixed(2)}°C`;
+          const fmtBias = (v) => `${num(v) > 0 ? '+' : ''}${num(v).toFixed(2)}°C`;
           return `<tr class="${isBest ? 'is-selected' : ''}">
             <td class="font-sans font-bold text-white">
               <span style="display:inline-block;width:8px;height:8px;border-radius:999px;background:${escapeHtml(meta.color)};margin-right:6px"></span>
               ${escapeHtml(meta.name)}
               ${isBest ? '<span class="badge-mono text-emerald-300" style="margin-left:6px">🏆 Лидер</span>' : ''}
             </td>
-            <td class="font-bold text-sky-300">${Number(m.maeC ?? 0).toFixed(2)}°C</td>
+            <td class="font-bold text-sky-300">${num(m.maeC).toFixed(2)}°C</td>
             <td class="text-amber-300">${fmtBias(m.dayBiasC)}</td>
             <td class="text-cyan-300">${fmtBias(m.nightBiasC)}</td>
-            <td class="text-emerald-300">×${Number(m.weightMultiplier ?? 1).toFixed(2)}</td>
-            <td class="text-slate-400">${m.samples ?? 0} ч</td>
+            <td class="text-emerald-300">×${num(m.weightMultiplier, 1).toFixed(2)}</td>
+            <td class="text-slate-400">${Math.round(num(m.samples))} ч</td>
           </tr>`;
         })
         .join('');
@@ -1448,13 +1583,27 @@ function renderSettingsModal() {
     : 'Кэш прогноза пуст. Нажмите «В память» после загрузки онлайн-данных.';
 }
 
+let settingsModalOpener = null;
+
+function isSettingsModalOpen() {
+  return Boolean($('settingsModal')?.classList.contains('is-open'));
+}
+
 function openSettingsModal() {
   renderSettingsModal();
+  if (!isSettingsModalOpen() && typeof document !== 'undefined') {
+    settingsModalOpener = document.activeElement;
+  }
   $('settingsModal')?.classList.add('is-open');
+  $('btnCloseSettings')?.focus?.();
 }
 
 function closeSettingsModal() {
+  if (!isSettingsModalOpen()) return;
   $('settingsModal')?.classList.remove('is-open');
+  // Hand keyboard focus back to whatever opened the dialog
+  settingsModalOpener?.focus?.();
+  settingsModalOpener = null;
 }
 
 // ============================================================================
@@ -1519,7 +1668,7 @@ function buildTelegramSummaryText() {
     ds.mos?.summaryRu ? `🎯 ${ds.mos.summaryRu}` : null,
     `🌡️ Сейчас: *${formatSignedC(cur.tempC)}* (ощущ. ${formatSignedC(cur.feelsC)}, Tw ${formatSignedC(cur.wetBulbC)}), ${cur.condRu}`,
     `💨 Ветер: ${cur.windMs.toFixed(1)} м/с (пор. ${cur.gustMs.toFixed(1)}) ${cur.windDirShort} | 🧭 Давл. (${pPair.label}): ${pPair.mm} мм (Δ24ч ${formatSignedInt(cur.deltaP24hMm)})`,
-    `🌱 Почва 0/6/18/54см: ${formatSignedC(cur.soil0C)} / ${formatSignedC(cur.soil6C)} / ${formatSignedC(cur.soil18C)} / ${formatSignedC(cur.soil54C)} | ❄️ Снег: ${cur.snowDepthCm} см`,
+    `🌱 Почва 0/6/18/54см${cur.soilEstimated ? ' (≈ оценка)' : ''}: ${formatSignedC(cur.soil0C)} / ${formatSignedC(cur.soil6C)} / ${formatSignedC(cur.soil18C)} / ${formatSignedC(cur.soil54C)} | ❄️ Снег: ${formatSnowCm(cur.snowDepthCm, cur.snowEstimated)} см${cur.snowEstimated ? ' (норма)' : ''}`,
     `📅 Период (${firstDay.dateStr}–${lastDay.dateStr}, ${periodDays.length} сут., ${winCfg.shortLabel}):`,
     ...periodDays.slice(0, 10).map((d) =>
       `• ${d.dayShort} ${d.dateStr}: ${formatSignedC(d.maxC)} / ${formatSignedC(d.minC)} | ${Number(d.precipMm ?? 0).toFixed(1)}мм | ${d.windMs.toFixed(1)} м/с ${d.windDirShort}`
@@ -1676,6 +1825,17 @@ function bindEventListeners() {
   $('settingsModal')?.addEventListener('click', (e) => {
     if (e.target?.id === 'settingsModal') closeSettingsModal();
   });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && isSettingsModalOpen()) {
+      e.preventDefault();
+      closeSettingsModal();
+    }
+  });
+
+  // Auto-refresh: tab shown again, network back, or the 30-minute freshness window elapsed
+  document.addEventListener('visibilitychange', maybeAutoRefresh);
+  window.addEventListener('online', maybeAutoRefresh);
+  setInterval(maybeAutoRefresh, AUTO_REFRESH_TICK_MS);
 
   // Units (Header + Modal)
   [
@@ -1696,10 +1856,15 @@ function bindEventListeners() {
       state.preferredOmModel = btn.dataset.omModel || 'multi';
       savePrefs({ preferredOmModel: state.preferredOmModel });
       renderSettingsModal();
-      if (state.sourceMode === 'open_meteo' || state.sourceMode === 'hybrid') {
+      if (state.sourceMode === 'open_meteo') {
         refreshWeatherData(true);
       } else {
-        showToast(`Выбрана модель Open-Meteo: ${state.preferredOmModel}`);
+        // The single-model preference only re-weights the blend in the «Open-Meteo» source mode
+        showToast(
+          state.preferredOmModel === 'multi'
+            ? 'Выбран супер-ансамбль: все модели с весами MOS'
+            : `Модель ${state.preferredOmModel} будет применена в режиме «Open-Meteo»`
+        );
       }
     });
   });
@@ -1911,8 +2076,16 @@ function showPwaUpdateBanner(worker) {
 function registerServiceWorker() {
   if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) return;
   let reloading = false;
+  // On the very first visit the fresh worker calls clients.claim(), which also fires
+  // `controllerchange`. Reloading then would restart the page (and its data fetch) for nothing,
+  // so only a change from one controller to another counts as an update.
+  let hasController = Boolean(navigator.serviceWorker.controller);
   try {
     navigator.serviceWorker.addEventListener?.('controllerchange', () => {
+      if (!hasController) {
+        hasController = true;
+        return;
+      }
       if (reloading) return;
       reloading = true;
       if (typeof window !== 'undefined' && window.location?.reload) {
