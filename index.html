@@ -835,24 +835,24 @@
           <p class="text-xs text-slate-400 mt-0.5" style="margin-bottom:0">Нажмите на любой день графика для инспектора суток • Горизонтальный свайп для 16–35+ дней</p>
         </div>
 
-        <div class="tab-bar" role="tablist">
-          <button id="tabBtn-temp" data-tab="temp" type="button" class="tab-btn is-active">1. Температура и Веер P10–P90</button>
-          <button id="tabBtn-precip" data-tab="precip" type="button" class="tab-btn">2. Осадки и Снежный покров</button>
-          <button id="tabBtn-wind" data-tab="wind" type="button" class="tab-btn">3. Ветер и Давление</button>
-          <button id="tabBtn-ops" data-tab="ops" type="button" class="tab-btn">4. Почва 0–54см и Полевая таблица</button>
+        <div class="tab-bar" role="tablist" aria-label="Разделы метеограмм">
+          <button id="tabBtn-temp" data-tab="temp" type="button" class="tab-btn is-active" role="tab" aria-selected="true" aria-controls="tabContent-temp">1. Температура и Веер P10–P90</button>
+          <button id="tabBtn-precip" data-tab="precip" type="button" class="tab-btn" role="tab" aria-selected="false" aria-controls="tabContent-precip" tabindex="-1">2. Осадки и Снежный покров</button>
+          <button id="tabBtn-wind" data-tab="wind" type="button" class="tab-btn" role="tab" aria-selected="false" aria-controls="tabContent-wind" tabindex="-1">3. Ветер и Давление</button>
+          <button id="tabBtn-ops" data-tab="ops" type="button" class="tab-btn" role="tab" aria-selected="false" aria-controls="tabContent-ops" tabindex="-1">4. Почва 0–54см и Полевая таблица</button>
         </div>
       </div>
 
       <div class="sub-card p-2.5 flex items-center justify-between text-xs font-mono">
-        <span id="activeChartSummaryText" class="text-slate-200 truncate">Выберите узел графика для синхронизации с инспектором</span>
+        <span id="activeChartSummaryText" class="text-slate-200 truncate" aria-live="polite">Выберите узел графика для синхронизации с инспектором</span>
         <span class="sm-hidden text-amber-300 flex-shrink-0">↔ Свайп</span>
       </div>
 
       <!-- Tab 1: Temperature + P10..P90 Fan + Model Lines + Climatology -->
-      <div id="tabContent-temp" class="flex flex-col gap-3">
+      <div id="tabContent-temp" class="flex flex-col gap-3" role="tabpanel" aria-labelledby="tabBtn-temp">
         <div class="flex flex-wrap items-center justify-between gap-2 text-xs font-mono">
           <div class="flex flex-wrap items-center gap-2">
-            <button id="toggleModelLinesBtn" type="button" class="toggle-chip">📈 Линии моделей</button>
+            <button id="toggleModelLinesBtn" type="button" class="toggle-chip" title="Линии показывают дневной максимум каждой модели">📈 Линии моделей (Max)</button>
             <button id="toggleClimatologyBtn" type="button" class="toggle-chip">📊 Климат. норма (1991–2020)</button>
           </div>
           <span id="tempChartDynamicSummary" class="text-slate-400">Экстремумы и веер ансамбля</span>
@@ -861,7 +861,7 @@
       </div>
 
       <!-- Tab 2: Precip + Snow Depth -->
-      <div id="tabContent-precip" class="hidden flex flex-col gap-3">
+      <div id="tabContent-precip" class="hidden flex flex-col gap-3" role="tabpanel" aria-labelledby="tabBtn-precip">
         <div class="flex flex-wrap items-center justify-between gap-2 text-xs font-mono">
           <div class="flex flex-wrap items-center gap-3">
             <span class="text-cyan-300">■ Снег</span>
@@ -869,6 +869,7 @@
             <span class="text-rose-400">■ Гололёд</span>
             <span class="text-emerald-300">■ Дождь</span>
             <span class="text-sky-300">▬ Снежный покров (см)</span>
+            <span class="text-slate-300">┬ P75 осадков</span>
           </div>
           <span id="precipChartDynamicSummary" class="text-slate-400">Осадки и снежный покров</span>
         </div>
@@ -876,7 +877,7 @@
       </div>
 
       <!-- Tab 3: Wind & Pressure -->
-      <div id="tabContent-wind" class="hidden flex flex-col gap-3">
+      <div id="tabContent-wind" class="hidden flex flex-col gap-3" role="tabpanel" aria-labelledby="tabBtn-wind">
         <div class="flex flex-wrap items-center justify-between gap-2 text-xs font-mono">
           <div class="flex flex-wrap items-center gap-3">
             <span class="text-sky-300">▬ Ветер (м/с)</span>
@@ -890,7 +891,7 @@
       </div>
 
       <!-- Tab 4: Soil 0-54cm & Field Matrix -->
-      <div id="tabContent-ops" class="hidden flex flex-col gap-3">
+      <div id="tabContent-ops" class="hidden flex flex-col gap-3" role="tabpanel" aria-labelledby="tabBtn-ops">
         <div class="flex flex-wrap items-center justify-between gap-2 text-xs font-mono">
           <div class="flex flex-wrap items-center gap-3">
             <span class="text-amber-300">▬ Почва 0см / 6см / 18см / 54см</span>
@@ -902,7 +903,7 @@
         <div id="soilChartWrapper" class="chart-scroll-wrap grid-bg"></div>
         <div id="opsSummaryCardsGrid" class="field-ops-grid"></div>
         <div class="data-table-wrap">
-          <table class="data-table">
+          <table class="data-table data-table--sticky-first">
             <thead id="operationalTableHead"></thead>
             <tbody id="operationalTableBody"></tbody>
           </table>

@@ -1333,6 +1333,25 @@ code {
   background: rgba(12, 74, 110, 0.35);
 }
 
+.data-table tbody tr:focus-visible {
+  outline: 2px solid var(--sky);
+  outline-offset: -2px;
+}
+
+/* Field table: keep the date column in view while the rest scrolls sideways (phones) */
+.data-table--sticky-first th:first-child,
+.data-table--sticky-first td:first-child {
+  position: sticky;
+  left: 0;
+  z-index: 1;
+  background: #0b1222;
+  box-shadow: 1px 0 0 rgba(30, 41, 59, 0.95);
+}
+
+.data-table--sticky-first tbody tr.is-selected td:first-child {
+  background: #0c2a44;
+}
+
 /* ============================================================================
    Section 5: Lazy Windy Radar
    ============================================================================ */

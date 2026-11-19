@@ -1,4 +1,4 @@
-const CACHE_NAME = 'aban-weather-v4-shell-v3';
+const CACHE_NAME = 'aban-weather-v4-shell-v4';
 
 const PRECACHE_ASSETS = [
   './',

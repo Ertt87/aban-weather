@@ -27,10 +27,10 @@ const PHASE_COLORS = {
 };
 
 const ZONE_META = {
-    archive: { label: 'Архив', color: '#94a3b8', bg: 'rgba(148, 163, 184, 0.05)' },
-    deterministic: { label: 'Точный 10д', color: '#38bdf8', bg: 'rgba(56, 189, 248, 0.045)' },
-    extended_ensemble: { label: 'Ансамбль 11–16д', color: '#22d3ee', bg: 'rgba(34, 211, 238, 0.055)' },
-    subseasonal: { label: 'Тренд 17–35д', color: '#a78bfa', bg: 'rgba(167, 139, 250, 0.06)' }
+    archive: { label: 'Архив', short: 'Арх.', color: '#94a3b8', bg: 'rgba(148, 163, 184, 0.05)' },
+    deterministic: { label: 'Точный 10д', short: 'Точн.', color: '#38bdf8', bg: 'rgba(56, 189, 248, 0.045)' },
+    extended_ensemble: { label: 'Ансамбль 11–16д', short: 'Анс.', color: '#22d3ee', bg: 'rgba(34, 211, 238, 0.055)' },
+    subseasonal: { label: 'Тренд 17–35д', short: 'Тренд', color: '#a78bfa', bg: 'rgba(167, 139, 250, 0.06)' }
 };
 
 const FALLBACK_MODEL_COLORS = ['#fb923c', '#a78bfa', '#34d399', '#f472b6', '#60a5fa', '#facc15'];
@@ -194,6 +194,100 @@ function computeScaleBounds(values, pad = 2, fallbackMin = -5, fallbackMax = 5) 
     return { min: min - pad, max: max + pad };
 }
 
+/** A pentad (5-day) summary item carries the ids of the days it aggregates. */
+function isPentadItem(item) {
+    return Array.isArray(item?.dayIds) || Array.isArray(item?.memberIds);
+}
+
+/** Selected when the item is the chosen day itself or a pentad that contains it. */
+function isItemSelected(item, selectedDayId) {
+    if (!item || !selectedDayId) return false;
+    if (item.id === selectedDayId) return true;
+    const members = item.dayIds || item.memberIds;
+    return Array.isArray(members) && members.includes(selectedDayId);
+}
+
+/** Round axis ticks (1 / 2 / 5 × 10ⁿ steps) inside [min, max]. */
+function buildAxisTicks(min, max, targetCount = 5) {
+    const span = max - min;
+    if (!Number.isFinite(span) || span <= 0) return [];
+    const target = Math.max(1, targetCount);
+    const pow = Math.pow(10, Math.floor(Math.log10(span / target)));
+    // Of the round steps around the ideal one, take the step whose tick count lands closest to target
+    let step = pow;
+    let bestMiss = Infinity;
+    for (const mult of [1, 2, 5, 10]) {
+        const miss = Math.abs(span / (mult * pow) - target);
+        if (miss < bestMiss) {
+            bestMiss = miss;
+            step = mult * pow;
+        }
+    }
+    const ticks = [];
+    for (let v = Math.ceil(min / step) * step; v <= max + 1e-9 && ticks.length < 24; v += step) {
+        ticks.push(+v.toFixed(6));
+    }
+    return ticks;
+}
+
+function fmtAxisTemp(v, isImp) {
+    const r = Math.round(v);
+    if (isImp) return `${r}°`;
+    return `${r > 0 ? '+' : ''}${r}°`;
+}
+
+/**
+ * Splits a series into a modelled and an estimated run. They are drawn as separate paths
+ * (solid vs dashed) and never joined, so the switch from model data to an estimate does not
+ * read as a real change in the weather.
+ */
+function splitByEstimate(points, isEstimatedAt) {
+    const modelled = points.map((p, i) => (p && !isEstimatedAt(i) ? p : null));
+    const estimated = points.map((p, i) => (p && isEstimatedAt(i) ? p : null));
+    return {
+        modelled,
+        estimated,
+        modelledPath: buildSegmentedPath(modelled),
+        estimatedPath: buildSegmentedPath(estimated)
+    };
+}
+
+/** Filled area between a (gapped) series and a horizontal baseline. */
+function buildBaselineAreaPath(points, baselineY) {
+    const runs = [];
+    let cur = [];
+    for (const pt of points) {
+        if (pt && Number.isFinite(pt.x) && Number.isFinite(pt.y)) {
+            cur.push(pt);
+        } else {
+            if (cur.length >= 2) runs.push(cur);
+            cur = [];
+        }
+    }
+    if (cur.length >= 2) runs.push(cur);
+    return runs
+        .map((run) => {
+            const top = run.map((p, idx) => `${idx === 0 ? 'M' : 'L'} ${p.x.toFixed(1)} ${p.y.toFixed(1)}`).join(' ');
+            return `${top} L ${run[run.length - 1].x.toFixed(1)} ${baselineY.toFixed(1)} L ${run[0].x.toFixed(1)} ${baselineY.toFixed(1)} Z`;
+        })
+        .join(' ');
+}
+
+/** Runs of consecutive indexes for which `predicate(i)` holds: [{ start, end }]. */
+function findRuns(count, predicate) {
+    const runs = [];
+    let start = -1;
+    for (let i = 0; i <= count; i++) {
+        const hit = i < count && predicate(i);
+        if (hit && start === -1) start = i;
+        if (!hit && start !== -1) {
+            runs.push({ start, end: i - 1 });
+            start = -1;
+        }
+    }
+    return runs;
+}
+
 function renderEmptySvg(containerEl, message = 'Нет данных за выбранный период') {
     if (!containerEl) return '';
     const html = `
@@ -246,6 +340,12 @@ function bindDayClickDelegation(containerEl, onSelectDay) {
             if (dayId) {
                 e.preventDefault();
                 cur.onSelectDay(dayId);
+                // Selecting re-renders the chart, which destroys the focused node: put keyboard
+                // focus back on the same day so Tab / Enter navigation can continue from there.
+                const again = [...(containerEl.querySelectorAll?.('[data-day-id]') || [])].find(
+                    (el) => el.getAttribute('data-day-id') === dayId
+                );
+                again?.focus?.({ preventScroll: true });
             }
         });
     }
@@ -837,71 +937,6 @@ export function renderDiurnalChart(containerEl, day, uiState = {}, onSelectHour 
 // ============================================================================
 // 3. TEMPERATURE & 35-DAY ENSEMBLE FAN CHART (P10-P90, P25-P75, CLIM, MODELS)
 // ============================================================================
-function groupDaysIntoPentads(days) {
-    const pentads = [];
-    let i = 0;
-    while (i < days.length) {
-        const zone = resolveDayZone(days[i]);
-        const chunk = [days[i]];
-        i++;
-        while (chunk.length < 5 && i < days.length && resolveDayZone(days[i]) === zone) {
-            chunk.push(days[i]);
-            i++;
-        }
-
-        const avgField = (fn) => {
-            const vals = chunk.map(fn).filter(v => Number.isFinite(v));
-            return vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
-        };
-
-        const first = chunk[0];
-        const last = chunk[chunk.length - 1];
-        const firstDayNum = String(first.dateStr || first.isoDate || '').split(' ')[0];
-        const lastLabel = String(last.dateStr || last.isoDate || '');
-        const label = chunk.length === 1 ? lastLabel : `${firstDayNum}–${lastLabel}`;
-
-        const modelIds = new Set();
-        for (const d of chunk) {
-            if (d?.modelBreakdown && typeof d.modelBreakdown === 'object') {
-                Object.keys(d.modelBreakdown).forEach(k => modelIds.add(k));
-            }
-        }
-        const modelBreakdown = {};
-        for (const mId of modelIds) {
-            const mMax = avgField(d => toNum(d?.modelBreakdown?.[mId]?.maxC));
-            const mMin = avgField(d => toNum(d?.modelBreakdown?.[mId]?.minC));
-            if (mMax !== null || mMin !== null) {
-                modelBreakdown[mId] = { maxC: mMax, minC: mMin };
-            }
-        }
-
-        const rep = chunk[Math.floor(chunk.length / 2)];
-        pentads.push({
-            id: rep.id,
-            memberIds: chunk.map(d => d.id),
-            zone,
-            dayShort: `${chunk.length}д`,
-            dateStr: label,
-            maxC: avgField(d => toNum(d.maxC)),
-            maxF: avgField(d => toNum(d.maxF)),
-            minC: avgField(d => toNum(d.minC)),
-            minF: avgField(d => toNum(d.minF)),
-            maxP10C: avgField(d => toNum(d.maxP10C)),
-            maxP25C: avgField(d => toNum(d.maxP25C)),
-            maxP75C: avgField(d => toNum(d.maxP75C)),
-            maxP90C: avgField(d => toNum(d.maxP90C)),
-            minP10C: avgField(d => toNum(d.minP10C)),
-            minP25C: avgField(d => toNum(d.minP25C)),
-            minP75C: avgField(d => toNum(d.minP75C)),
-            minP90C: avgField(d => toNum(d.minP90C)),
-            climMaxC: avgField(d => toNum(d.climMaxC)),
-            climMinC: avgField(d => toNum(d.climMinC)),
-            modelBreakdown
-        });
-    }
-    return pentads;
-}
-
 function buildZoneSpans(items, xCoords, w, padL, padR) {
     if (!items.length) return [];
     const spans = [];
@@ -931,8 +966,10 @@ export function renderTempEnsembleChart(containerEl, days, uiState = {}, onSelec
 
     const unit = uiState?.unit || 'metric';
     const isImp = unit === 'imperial';
-    const isPentad = Boolean(uiState?.groupByPentad && days.length > 16);
-    const items = isPentad ? groupDaysIntoPentads(days) : days;
+    // Pentad grouping is done once by the caller (ensemble.buildPentadSummary) so every tab and the
+    // field table share the same 5-day boundaries; the chart only detects that it was handed pentads.
+    const items = days;
+    const isPentad = items.some(isPentadItem);
     const count = items.length;
 
     const showClim = Boolean(uiState?.showClimatology);
@@ -960,16 +997,22 @@ export function renderTempEnsembleChart(containerEl, days, uiState = {}, onSelec
         }
     }
 
+    const hasFanZone = items.some((d) => {
+        const z = resolveDayZone(d);
+        return z === 'extended_ensemble' || z === 'subseasonal';
+    });
+
     const step = count <= 12 ? 82 : (count <= 24 ? 64 : 48);
-    const w = Math.max(740, count * step + 90);
-    const padT = (showClim || (showModels && modelIds.length)) ? 58 : 44;
+    const w = Math.max(740, count * step + 106);
+    const padT = (showClim || hasFanZone || (showModels && modelIds.length)) ? 58 : 44;
     const h = 295 + (padT - 44);
     const padL = 56;
-    const padR = 44;
+    const padR = 60;
     const padB = 50;
 
-    // Collect all Y values so uncertainty fan & model lines never clip
-    const allVals = [isImp ? 20 : -6, isImp ? 45 : 7];
+    // Collect all Y values so uncertainty fan & model lines never clip.
+    // The scale follows the data (no forced -6..+7 °C window that squashed deep-winter periods).
+    const allVals = [];
     for (const d of items) {
         const zone = resolveDayZone(d);
         const isFanZone = zone === 'extended_ensemble' || zone === 'subseasonal';
@@ -1000,6 +1043,7 @@ export function renderTempEnsembleChart(containerEl, days, uiState = {}, onSelec
 
     const bounds = computeScaleBounds(allVals, isImp ? 4 : 2.5);
     const getY = val => h - padB - ((val - bounds.min) / (bounds.max - bounds.min || 1)) * (h - padT - padB);
+    const yTicks = buildAxisTicks(bounds.min, bounds.max, 5);
 
     const xCoords = items.map((_, i) => getXCoordinate(i, count, w, padL, padR));
     const zoneSpans = buildZoneSpans(items, xCoords, w, padL, padR);
@@ -1122,8 +1166,12 @@ export function renderTempEnsembleChart(containerEl, days, uiState = {}, onSelec
         legendChips.push({ color: '#fb923c', label: 'Норма Max (1991–2020)', dashed: true });
         legendChips.push({ color: '#60a5fa', label: 'Норма Min', dashed: true });
     }
+    if (hasFanZone) {
+        legendChips.push({ color: '#fbbf24', label: 'Веер P10–P90', band: 0.18 });
+        legendChips.push({ color: '#fbbf24', label: 'P25–P75', band: 0.4 });
+    }
     for (const m of modelLines) {
-        legendChips.push({ color: m.color, label: m.label, dashed: false });
+        legendChips.push({ color: m.color, label: `${m.label} max`, dashed: false });
     }
 
     let legendX = padL;
@@ -1132,8 +1180,11 @@ export function renderTempEnsembleChart(containerEl, days, uiState = {}, onSelec
             const x0 = legendX;
             const approxW = ch.label.length * 6.5 + 34;
             legendX += approxW;
+            const swatch = ch.band
+                ? `<rect x="${x0}" y="8" width="16" height="12" rx="2" fill="${escapeHtml(ch.color)}" fill-opacity="${ch.band}"/>`
+                : `<line x1="${x0}" y1="14" x2="${x0 + 16}" y2="14" stroke="${escapeHtml(ch.color)}" stroke-width="2" ${ch.dashed ? 'stroke-dasharray="4 3"' : ''} stroke-linecap="round"/>`;
             return `
-                <line x1="${x0}" y1="14" x2="${x0 + 16}" y2="14" stroke="${escapeHtml(ch.color)}" stroke-width="2" ${ch.dashed ? 'stroke-dasharray="4 3"' : ''} stroke-linecap="round"/>
+                ${swatch}
                 <text x="${x0 + 21}" y="18" fill="#cbd5e1">${escapeHtml(ch.label)}</text>
             `;
         }).join('')}
@@ -1159,8 +1210,28 @@ export function renderTempEnsembleChart(containerEl, days, uiState = {}, onSelec
             ${zoneSpans.map(sp => `
                 <rect x="${sp.leftEdge.toFixed(1)}" y="${padT - 18}" width="${Math.max(0, sp.rightEdge - sp.leftEdge).toFixed(1)}" height="${(h - padT - padB + 26).toFixed(1)}" fill="${sp.meta.bg}"/>
                 ${sp.hasSeparatorLeft ? `<line x1="${sp.leftEdge.toFixed(1)}" y1="${padT - 20}" x2="${sp.leftEdge.toFixed(1)}" y2="${(h - padB + 8).toFixed(1)}" stroke="${sp.meta.color}" stroke-opacity="0.5" stroke-width="1.5" stroke-dasharray="5 4"/>` : ''}
-                <text x="${(sp.leftEdge + 8).toFixed(1)}" y="${(padT - 6).toFixed(1)}" fill="${sp.meta.color}" font-size="10.5" font-family="JetBrains Mono, monospace" font-weight="700">${escapeHtml(sp.meta.label)}${isPentad ? ' (5д)' : ''}</text>
+                ${(() => {
+                    // A zone that spans a single node is narrower than its full title: fall back to
+                    // the short name (or nothing) instead of running into the next zone's header.
+                    const room = sp.rightEdge - sp.leftEdge - 12;
+                    const full = `${sp.meta.label}${isPentad ? ' (5д)' : ''}`;
+                    const fits = (text) => text.length * 6.5 <= room;
+                    const text = fits(full) ? full : fits(sp.meta.short) ? sp.meta.short : '';
+                    return text
+                        ? `<text data-zone-label="${escapeHtml(sp.zone)}" x="${(sp.leftEdge + 8).toFixed(1)}" y="${(padT - 6).toFixed(1)}" fill="${sp.meta.color}" font-size="10.5" font-family="JetBrains Mono, monospace" font-weight="700">${escapeHtml(text)}</text>`
+                        : '';
+                })()}
             `).join('')}
+
+            <!-- Y axis: gridlines with tick labels on both edges (the chart scrolls horizontally) -->
+            ${yTicks.map(v => {
+                const y = getY(v);
+                const isZeroTick = showZero && Math.abs(v - zeroVal) < 1e-6;
+                return `
+                <line x1="${padL - 10}" y1="${y.toFixed(1)}" x2="${w - padR + 10}" y2="${y.toFixed(1)}" stroke="${CHART_PALETTE.gridLine}" stroke-width="1"/>
+                ${isZeroTick ? '' : `<text data-axis-tick="y" x="${padL - 14}" y="${(y + 4).toFixed(1)}" text-anchor="end" fill="#94a3b8" font-size="11" font-family="JetBrains Mono, monospace">${fmtAxisTemp(v, isImp)}</text>`}
+                <text data-axis-tick="y" x="${w - padR + 24}" y="${(y + 4).toFixed(1)}" text-anchor="start" fill="#64748b" font-size="10.5" font-family="JetBrains Mono, monospace">${fmtAxisTemp(v, isImp)}</text>`;
+            }).join('')}
 
             <!-- 0°C Threshold -->
             ${showZero ? `
@@ -1198,7 +1269,7 @@ export function renderTempEnsembleChart(containerEl, days, uiState = {}, onSelec
                 const x = xCoords[i];
                 const pMax = maxPts[i];
                 const pMin = minPts[i];
-                const isSel = d.id === uiState?.selectedDayId || (Array.isArray(d.memberIds) && d.memberIds.includes(uiState?.selectedDayId));
+                const isSel = isItemSelected(d, uiState?.selectedDayId);
                 const showValLabels = isSel || i === absMaxIdx || i === absMinIdx || count <= 14 || i % 2 === 0;
                 const showDateLabel = isSel || count <= 18 || i % 2 === 0 || i === count - 1;
                 const zone = resolveDayZone(d);
@@ -1230,6 +1301,17 @@ export function renderTempEnsembleChart(containerEl, days, uiState = {}, onSelec
                     ` : ''}
                     ${count === 1 && q90Min !== null && q10Min !== null ? `
                         <rect x="${(x - 10).toFixed(1)}" y="${Math.min(q90Min, q10Min).toFixed(1)}" width="20" height="${Math.max(4, Math.abs(q10Min - q90Min)).toFixed(1)}" rx="4" fill="#22d3ee" fill-opacity="0.20"/>
+                    ` : ''}
+
+                    ${isSel && count > 1 && q90Max !== null && q10Max !== null ? `
+                        <line data-fan-whisker="max" x1="${x.toFixed(1)}" y1="${q90Max.toFixed(1)}" x2="${x.toFixed(1)}" y2="${q10Max.toFixed(1)}" stroke="#fde68a" stroke-opacity="0.7" stroke-width="1.4"/>
+                        <line x1="${(x - 9).toFixed(1)}" y1="${q90Max.toFixed(1)}" x2="${(x + 9).toFixed(1)}" y2="${q90Max.toFixed(1)}" stroke="#fde68a" stroke-width="2" stroke-linecap="round"/>
+                        <line x1="${(x - 9).toFixed(1)}" y1="${q10Max.toFixed(1)}" x2="${(x + 9).toFixed(1)}" y2="${q10Max.toFixed(1)}" stroke="#fde68a" stroke-width="2" stroke-linecap="round"/>
+                    ` : ''}
+                    ${isSel && count > 1 && q90Min !== null && q10Min !== null ? `
+                        <line data-fan-whisker="min" x1="${x.toFixed(1)}" y1="${q90Min.toFixed(1)}" x2="${x.toFixed(1)}" y2="${q10Min.toFixed(1)}" stroke="#a5f3fc" stroke-opacity="0.7" stroke-width="1.4"/>
+                        <line x1="${(x - 9).toFixed(1)}" y1="${q90Min.toFixed(1)}" x2="${(x + 9).toFixed(1)}" y2="${q90Min.toFixed(1)}" stroke="#a5f3fc" stroke-width="2" stroke-linecap="round"/>
+                        <line x1="${(x - 9).toFixed(1)}" y1="${q10Min.toFixed(1)}" x2="${(x + 9).toFixed(1)}" y2="${q10Min.toFixed(1)}" stroke="#a5f3fc" stroke-width="2" stroke-linecap="round"/>
                     ` : ''}
 
                     ${pMax && pMin ? `<line x1="${x.toFixed(1)}" y1="${pMax.y.toFixed(1)}" x2="${x.toFixed(1)}" y2="${pMin.y.toFixed(1)}" stroke="rgba(148,163,184,0.32)" stroke-width="1.8" stroke-dasharray="2 2"/>` : ''}
@@ -1295,21 +1377,25 @@ export function renderPrecipSnowChart(containerEl, days, uiState = {}, onSelectD
     const xCoords = days.map((_, i) => getXCoordinate(i, count, w, padL, padR));
     const zoneSpans = buildZoneSpans(days, xCoords, w, padL, padR);
 
+    // Humidity derived from a formula (no hourly / archive / Google data) is not plotted at all
     const humPts = days.map((d, i) => {
-        const hum = toNum(d.humidity);
+        const hum = d?.dataQuality?.humidityEstimated ? null : toNum(d.humidity);
         return hum !== null ? { x: xCoords[i], y: getHumY(hum), val: Math.round(hum) } : null;
     });
     const humPath = buildSegmentedPath(humPts);
 
+    // Snow depth: modelled run solid, climatological estimate dashed — and never joined
+    const isSnowEstimated = (i) => Boolean(days[i]?.dataQuality?.snowEstimated);
     const snowPts = days.map((d, i) => {
         const cm = toNum(d.snowDepthCm);
         return cm !== null ? { x: xCoords[i], y: getSnowY(cm), val: cm } : null;
     });
-    const snowLinePath = buildSegmentedPath(snowPts);
-    const validSnowPts = snowPts.filter(Boolean);
-    const snowAreaPath = validSnowPts.length >= 2
-        ? `${buildSegmentedPath(validSnowPts)} L ${validSnowPts[validSnowPts.length - 1].x.toFixed(1)} ${snowBottom.toFixed(1)} L ${validSnowPts[0].x.toFixed(1)} ${snowBottom.toFixed(1)} Z`
-        : '';
+    const snowSplit = splitByEstimate(snowPts, isSnowEstimated);
+    const snowLinePath = snowSplit.modelledPath;
+    const snowEstLinePath = snowSplit.estimatedPath;
+    const snowAreaPath = buildBaselineAreaPath(snowSplit.modelled, snowBottom);
+    const snowEstAreaPath = buildBaselineAreaPath(snowSplit.estimated, snowBottom);
+    const hasSnowEstimate = snowSplit.estimated.some(Boolean);
 
     const barW = count <= 14 ? 22 : (count <= 24 ? 16 : 12);
     const hitW = Math.max(24, step * 0.88);
@@ -1335,7 +1421,9 @@ export function renderPrecipSnowChart(containerEl, days, uiState = {}, onSelectD
                 <rect x="${padL + 162}" y="10" width="9" height="9" rx="2" fill="#fb7185"/><text x="${padL + 176}" y="18" fill="#cbd5e1">Гололёд</text>
                 <rect x="${padL + 242}" y="10" width="9" height="9" rx="2" fill="#34d399"/><text x="${padL + 256}" y="18" fill="#cbd5e1">Дождь</text>
                 <line x1="${padL + 306}" y1="14.5" x2="${padL + 322}" y2="14.5" stroke="#a78bfa" stroke-width="2.2"/><text x="${padL + 327}" y="18" fill="#cbd5e1">Влажн.%</text>
-                <line x1="${padL + 392}" y1="14.5" x2="${padL + 408}" y2="14.5" stroke="#38bdf8" stroke-width="2.4"/><text x="${padL + 413}" y="18" fill="#cbd5e1">Покров см (P75 усы)</text>
+                <line x1="${padL + 392}" y1="14.5" x2="${padL + 408}" y2="14.5" stroke="#38bdf8" stroke-width="2.4"/><text x="${padL + 413}" y="18" fill="#cbd5e1">Покров, см</text>
+                <line x1="${padL + 494}" y1="9" x2="${padL + 494}" y2="20" stroke="#e2e8f0" stroke-width="1.6"/><line x1="${padL + 489}" y1="9" x2="${padL + 499}" y2="9" stroke="#e2e8f0" stroke-width="1.8" stroke-linecap="round"/><text x="${padL + 505}" y="18" fill="#cbd5e1">P75 осадков</text>
+                ${hasSnowEstimate ? `<line x1="${padL + 590}" y1="14.5" x2="${padL + 606}" y2="14.5" stroke="#38bdf8" stroke-opacity="0.7" stroke-width="2" stroke-dasharray="4 3"/><text x="${padL + 611}" y="18" fill="#fcd34d">≈ норма</text>` : ''}
             </g>
 
             <!-- Zone separators -->
@@ -1346,7 +1434,7 @@ export function renderPrecipSnowChart(containerEl, days, uiState = {}, onSelectD
             <!-- Horizontal gridlines & Left/Right axes -->
             ${precipTicks.map(t => `
                 <line x1="${padL - 8}" y1="${t.y.toFixed(1)}" x2="${w - padR + 8}" y2="${t.y.toFixed(1)}" stroke="${CHART_PALETTE.gridLine}" stroke-width="1"/>
-                <text x="${padL - 12}" y="${(t.y + 4).toFixed(1)}" text-anchor="end" fill="#94a3b8" font-size="11" font-family="JetBrains Mono, monospace">${t.val}м</text>
+                <text data-axis-tick="precip" x="${padL - 12}" y="${(t.y + 4).toFixed(1)}" text-anchor="end" fill="#94a3b8" font-size="11" font-family="JetBrains Mono, monospace">${t.val}мм</text>
             `).join('')}
 
             ${[50, 100].map(pct => `
@@ -1359,7 +1447,9 @@ export function renderPrecipSnowChart(containerEl, days, uiState = {}, onSelectD
             <text x="${padL - 12}" y="${(snowBottom - 2).toFixed(1)}" text-anchor="end" fill="#64748b" font-size="10" font-family="JetBrains Mono, monospace">0 см</text>
 
             ${snowAreaPath ? `<path d="${snowAreaPath}" fill="url(#aban-precip-snow-grad)"/>` : ''}
+            ${snowEstAreaPath ? `<path d="${snowEstAreaPath}" fill="url(#aban-precip-snow-grad)" fill-opacity="0.35"/>` : ''}
             ${snowLinePath ? `<path d="${snowLinePath}" fill="none" stroke="#38bdf8" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>` : ''}
+            ${snowEstLinePath ? `<path data-estimate="snow" d="${snowEstLinePath}" fill="none" stroke="#38bdf8" stroke-opacity="0.7" stroke-width="2" stroke-dasharray="5 4" stroke-linecap="round" stroke-linejoin="round"/>` : ''}
 
             <!-- Humidity Curve -->
             ${humPath ? `<path d="${humPath}" fill="none" stroke="#a78bfa" stroke-opacity="0.88" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>` : ''}
@@ -1380,7 +1470,8 @@ export function renderPrecipSnowChart(containerEl, days, uiState = {}, onSelectD
 
                 const hp = humPts[i];
                 const sp = snowPts[i];
-                const isSel = d.id === uiState?.selectedDayId;
+                const snowEst = isSnowEstimated(i);
+                const isSel = isItemSelected(d, uiState?.selectedDayId);
                 const showLabel = isSel || count <= 14 || i % 2 === 0;
                 const dateShortText = count > 20 ? String(d.dateStr || d.isoDate || '') : `${d.dayShort || ''}, ${d.dateStr || ''}`.replace(/^,\s*/, '');
 
@@ -1402,14 +1493,14 @@ export function renderPrecipSnowChart(containerEl, days, uiState = {}, onSelectD
                     <!-- Humidity Node -->
                     ${hp ? `
                         <circle cx="${hp.x.toFixed(1)}" cy="${hp.y.toFixed(1)}" r="${isSel ? 5 : 3.5}" fill="#0f172a" stroke="#a78bfa" stroke-width="2"/>
-                        ${isSel ? `<text x="${hp.x.toFixed(1)}" y="${(hp.y - 8).toFixed(1)}" text-anchor="middle" fill="#e9d5ff" font-size="10.5" font-family="JetBrains Mono, monospace" font-weight="700">${hp.val}%</text>` : ''}
+                        ${isSel ? `<text x="${(hp.x + 9).toFixed(1)}" y="${(hp.y + 4).toFixed(1)}" text-anchor="start" fill="#e9d5ff" font-size="10.5" font-family="JetBrains Mono, monospace" font-weight="700">${hp.val}%</text>` : ''}
                     ` : ''}
 
                     <!-- Snow Depth Node -->
                     ${sp ? `
                         ${count === 1 && sp.val > 0 ? `<rect x="${(sp.x - 14).toFixed(1)}" y="${sp.y.toFixed(1)}" width="28" height="${Math.max(3, snowBottom - sp.y).toFixed(1)}" rx="3" fill="rgba(56,189,248,0.28)"/>` : ''}
-                        <circle cx="${sp.x.toFixed(1)}" cy="${sp.y.toFixed(1)}" r="${isSel ? 4.5 : 3}" fill="#0f172a" stroke="#38bdf8" stroke-width="2"/>
-                        ${(sp.val > 0 && (isSel || count <= 14 || i % 3 === 0)) ? `<text x="${sp.x.toFixed(1)}" y="${(sp.y - 6).toFixed(1)}" text-anchor="middle" fill="#bae6fd" font-size="10" font-family="JetBrains Mono, monospace" font-weight="700">${Math.round(sp.val)}см</text>` : ''}
+                        <circle cx="${sp.x.toFixed(1)}" cy="${sp.y.toFixed(1)}" r="${isSel ? 4.5 : 3}" fill="#0f172a" stroke="#38bdf8" stroke-opacity="${snowEst ? '0.7' : '1'}" stroke-width="2" ${snowEst ? 'stroke-dasharray="2 2"' : ''}/>
+                        ${(sp.val > 0 && (isSel || count <= 14 || i % 3 === 0)) ? `<text x="${sp.x.toFixed(1)}" y="${(sp.y - 6).toFixed(1)}" text-anchor="middle" fill="${snowEst ? '#fcd34d' : '#bae6fd'}" font-size="10" font-family="JetBrains Mono, monospace" font-weight="700">${snowEst ? '≈' : ''}${Math.round(sp.val)}см</text>` : ''}
                     ` : ''}
 
                     ${showLabel ? `<text x="${x.toFixed(1)}" y="${(h - 14).toFixed(1)}" text-anchor="middle" fill="${isSel ? '#38bdf8' : '#e2e8f0'}" font-size="${count > 20 ? '11' : '12.5'}" font-family="Inter, system-ui, sans-serif" font-weight="700">${escapeHtml(dateShortText)}</text>` : ''}
@@ -1437,13 +1528,15 @@ export function renderWindPressureChart(containerEl, days, uiState = {}, onSelec
 
     const step = count <= 12 ? 82 : (count <= 24 ? 64 : 48);
     const w = Math.max(740, count * step + 96);
-    const h = 315;
+    // The pressure track sits lower than before so a jump marker and the value label both fit
+    const h = 331;
     const padL = 62;
     const padR = 46;
     const padT = 38;
     const windBottom = 172;
-    const pressTop = 194;
-    const pressBottom = 268;
+    const pressTop = 210;
+    const pressBottom = 284;
+    const isPentad = days.some(isPentadItem);
 
     const warnThreshold = isImp ? msToMph(10) : 10.0;
     const windVals = [warnThreshold];
@@ -1492,6 +1585,10 @@ export function renderWindPressureChart(containerEl, days, uiState = {}, onSelec
     const warnY = getWindY(warnThreshold);
     const hitW = Math.max(24, step * 0.88);
     const pressLabelMode = pressureMode === 'msl' ? 'Давление (ур. моря)' : 'Давление (ст. 246м)';
+    const windTicks = buildAxisTicks(0, maxWindScale, 4).filter((v) => v > 0 && Math.abs(v - warnThreshold) > 1e-6);
+
+    // Stretches with no pressure at all (trend days 17–35, daily-only archive): say so explicitly
+    const pressureGaps = findRuns(count, (i) => !pressPts[i]).filter((run) => run.end - run.start >= 2);
 
     const html = `
         <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${w} ${h}" class="chart-svg-mobile" style="min-width:${w}px;height:${h}px" role="img" aria-label="Ветер, порывы и барическое давление">
@@ -1500,13 +1597,19 @@ export function renderWindPressureChart(containerEl, days, uiState = {}, onSelec
                 <line x1="${padL}" y1="15" x2="${padL + 16}" y2="15" stroke="#38bdf8" stroke-width="3"/><text x="${padL + 21}" y="19" fill="#cbd5e1">Ветер</text>
                 <line x1="${padL + 68}" y1="15" x2="${padL + 84}" y2="15" stroke="#fbbf24" stroke-width="2.2" stroke-dasharray="4 3"/><text x="${padL + 89}" y="19" fill="#cbd5e1">Порывы</text>
                 <line x1="${padL + 146}" y1="15" x2="${padL + 162}" y2="15" stroke="#34d399" stroke-width="2.4"/><text x="${padL + 167}" y="19" fill="#cbd5e1">${escapeHtml(pressLabelMode)}, мм</text>
-                <circle cx="${padL + 345}" cy="15" r="4" fill="none" stroke="#fb7185" stroke-width="2"/><text x="${padL + 354}" y="19" fill="#fda4af">|ΔP24| ≥ 6 мм</text>
+                <circle cx="${padL + 345}" cy="15" r="4" fill="none" stroke="#fb7185" stroke-width="2"/><text x="${padL + 354}" y="19" fill="#fda4af">${isPentad ? 'макс. суточный |ΔP| ≥ 6 мм' : '|ΔP24| ≥ 6 мм'}</text>
             </g>
 
             <!-- Zone separators -->
             ${zoneSpans.map(sp => sp.hasSeparatorLeft ? `
                 <line x1="${sp.leftEdge.toFixed(1)}" y1="${padT - 8}" x2="${sp.leftEdge.toFixed(1)}" y2="${pressBottom + 6}" stroke="${sp.meta.color}" stroke-opacity="0.45" stroke-width="1.4" stroke-dasharray="4 4"/>
             ` : '').join('')}
+
+            <!-- Wind speed axis -->
+            ${windTicks.map(v => `
+                <line x1="${padL - 8}" y1="${getWindY(v).toFixed(1)}" x2="${w - padR + 8}" y2="${getWindY(v).toFixed(1)}" stroke="${CHART_PALETTE.gridLine}" stroke-width="1"/>
+                <text data-axis-tick="wind" x="${padL - 12}" y="${(getWindY(v) + 4).toFixed(1)}" text-anchor="end" fill="#94a3b8" font-size="10.5" font-family="JetBrains Mono, monospace">${Math.round(v)}</text>
+            `).join('')}
 
             <!-- Wind 10 m/s threshold -->
             <line x1="${padL - 8}" y1="${warnY.toFixed(1)}" x2="${w - padR + 8}" y2="${warnY.toFixed(1)}" stroke="#fb7185" stroke-width="1.6" stroke-dasharray="5 4"/>
@@ -1516,6 +1619,12 @@ export function renderWindPressureChart(containerEl, days, uiState = {}, onSelec
             <rect x="${padL - 8}" y="${pressTop - 6}" width="${(w - padL - padR + 16).toFixed(1)}" height="${(pressBottom - pressTop + 12).toFixed(1)}" rx="6" fill="rgba(15, 23, 42, 0.55)" stroke="rgba(52, 211, 153, 0.16)"/>
             <text x="${padL - 12}" y="${(pressTop + 10).toFixed(1)}" text-anchor="end" fill="#34d399" font-size="10.5" font-family="JetBrains Mono, monospace" font-weight="700">${Math.round(pressBounds.max)}</text>
             <text x="${padL - 12}" y="${(pressBottom - 2).toFixed(1)}" text-anchor="end" fill="#64748b" font-size="10.5" font-family="JetBrains Mono, monospace">${Math.round(pressBounds.min)}</text>
+
+            ${pressureGaps.map(run => {
+                const x0 = xCoords[run.start];
+                const x1 = xCoords[run.end];
+                return `<text data-no-pressure="true" x="${((x0 + x1) / 2).toFixed(1)}" y="${((pressTop + pressBottom) / 2 + 4).toFixed(1)}" text-anchor="middle" fill="#64748b" font-size="11" font-family="JetBrains Mono, monospace">давление: нет данных на этом горизонте</text>`;
+            }).join('')}
 
             <!-- Curves -->
             ${gustPath ? `<path d="${gustPath}" fill="none" stroke="#fbbf24" stroke-width="2.2" stroke-dasharray="5 3" stroke-linecap="round"/>` : ''}
@@ -1528,12 +1637,13 @@ export function renderWindPressureChart(containerEl, days, uiState = {}, onSelec
                 const wp = windPts[i];
                 const gp = gustPts[i];
                 const pp = pressPts[i];
-                const isSel = d.id === uiState?.selectedDayId;
+                const isSel = isItemSelected(d, uiState?.selectedDayId);
                 const showLabel = isSel || count <= 14 || i % 2 === 0;
 
-                // Determine rapid baric jump |deltaP24hMm| >= 6 mmHg
+                // Rapid baric jump |ΔP24| >= 6 mmHg. For a pentad the item already carries its sharpest
+                // daily change; a difference between neighbouring 5-day means is not a 24-hour jump.
                 let deltaP = toNum(d.deltaP24hMm);
-                if (deltaP === null && i > 0 && pp && pressPts[i - 1]) {
+                if (deltaP === null && !isPentadItem(d) && i > 0 && pp && pressPts[i - 1]) {
                     deltaP = pp.val - pressPts[i - 1].val;
                 }
                 const isBaricJump = deltaP !== null && Math.abs(deltaP) >= 6;
@@ -1562,8 +1672,8 @@ export function renderWindPressureChart(containerEl, days, uiState = {}, onSelec
                     ${pp ? `
                         ${isBaricJump ? `<circle cx="${pp.x.toFixed(1)}" cy="${pp.y.toFixed(1)}" r="8" fill="rgba(251,113,133,0.22)" stroke="#fb7185" stroke-width="2"/>` : ''}
                         <circle cx="${pp.x.toFixed(1)}" cy="${pp.y.toFixed(1)}" r="${isBaricJump || isSel ? 5 : 3.8}" fill="#0f172a" stroke="${isBaricJump ? '#fb7185' : '#34d399'}" stroke-width="2.2"/>
-                        ${isBaricJump ? `<text x="${pp.x.toFixed(1)}" y="${(pp.y - 11).toFixed(1)}" text-anchor="middle" fill="#fda4af" font-size="10" font-family="JetBrains Mono, monospace" font-weight="700">Δ${deltaP > 0 ? '+' : ''}${Math.round(deltaP)}</text>`
-                        : (showLabel ? `<text x="${pp.x.toFixed(1)}" y="${(pp.y - 8).toFixed(1)}" text-anchor="middle" fill="#a7f3d0" font-size="10.5" font-family="JetBrains Mono, monospace" font-weight="700">${pp.val}</text>` : '')}
+                        ${isBaricJump || showLabel ? `<text data-pressure-value="true" x="${pp.x.toFixed(1)}" y="${(pp.y - 9).toFixed(1)}" text-anchor="middle" fill="${isBaricJump ? '#fecdd3' : '#a7f3d0'}" font-size="10.5" font-family="JetBrains Mono, monospace" font-weight="700">${pp.val}</text>` : ''}
+                        ${isBaricJump ? `<text data-pressure-jump="true" x="${pp.x.toFixed(1)}" y="${(pp.y - 21).toFixed(1)}" text-anchor="middle" fill="#fda4af" font-size="10" font-family="JetBrains Mono, monospace" font-weight="700">Δ${deltaP > 0 ? '+' : ''}${Math.round(deltaP)}</text>` : ''}
                     ` : ''}
 
                     ${showLabel ? `
@@ -1599,7 +1709,8 @@ export function renderSoilProfileChart(containerEl, days, uiState = {}, onSelect
     const padT = 44;
     const padB = 46;
 
-    const allVals = [isImp ? 22 : -6, isImp ? 42 : 5];
+    // Keep the 0 °C frost line in view (it is the point of this chart), but let the data set the range
+    const allVals = [isImp ? 32 : 0];
     for (const d of days) {
         [d.soil0C ?? d.soilTempC, d.soil6C, d.soil18C, d.soil54C, d.dewPointC].forEach(c => {
             const v = tempVal(c, null, unit);
@@ -1620,17 +1731,27 @@ export function renderSoilProfileChart(containerEl, days, uiState = {}, onSelect
         { key: 'dewPointC', label: 'Точка росы', color: '#34d399', width: 2.1, dashed: true }
     ];
 
+    // Soil layers are an air-temperature heuristic where the model gave no soil data; the dew point
+    // is formula-based where humidity is. Those stretches are drawn dashed and never joined to data.
+    const isSoilEstimated = (i) => Boolean(days[i]?.dataQuality?.soilEstimated);
+    const isDewEstimated = (i) => Boolean(days[i]?.dataQuality?.humidityEstimated);
+    const yTicks = buildAxisTicks(bounds.min, bounds.max, 5);
+
     const seriesPts = {};
     const seriesPaths = {};
+    const seriesEstPaths = {};
     for (const s of seriesMeta) {
         const pts = days.map((d, i) => {
             const rawC = d[s.key] ?? (s.fallbackKey ? d[s.fallbackKey] : null);
             const v = tempVal(rawC, null, unit);
             return v !== null ? { x: xCoords[i], y: getY(v), c: toNum(rawC) } : null;
         });
+        const split = splitByEstimate(pts, s.key === 'dewPointC' ? isDewEstimated : isSoilEstimated);
         seriesPts[s.key] = pts;
-        seriesPaths[s.key] = buildSegmentedPath(pts);
+        seriesPaths[s.key] = split.modelledPath;
+        seriesEstPaths[s.key] = split.estimatedPath;
     }
+    const hasSoilEstimate = days.some((_, i) => isSoilEstimated(i) || isDewEstimated(i));
 
     const zeroVal = isImp ? 32 : 0;
     const zeroY = getY(zeroVal);
@@ -1646,6 +1767,7 @@ export function renderSoilProfileChart(containerEl, days, uiState = {}, onSelect
                 <line x1="${padL + 120}" y1="15" x2="${padL + 135}" y2="15" stroke="#38bdf8" stroke-width="2.4"/><text x="${padL + 140}" y="19" fill="#bae6fd">18 см</text>
                 <line x1="${padL + 186}" y1="15" x2="${padL + 201}" y2="15" stroke="#a78bfa" stroke-width="2.4"/><text x="${padL + 206}" y="19" fill="#ddd6fe">54 см</text>
                 <line x1="${padL + 252}" y1="15" x2="${padL + 267}" y2="15" stroke="#34d399" stroke-width="2.2" stroke-dasharray="4 3"/><text x="${padL + 272}" y="19" fill="#a7f3d0">Точка росы</text>
+                ${hasSoilEstimate ? `<line x1="${padL + 352}" y1="15" x2="${padL + 367}" y2="15" stroke="#94a3b8" stroke-width="1.6" stroke-dasharray="2 4"/><text x="${padL + 372}" y="19" fill="#fcd34d">≈ оценка (нет данных модели)</text>` : ''}
             </g>
 
             <!-- Zone separators -->
@@ -1653,23 +1775,37 @@ export function renderSoilProfileChart(containerEl, days, uiState = {}, onSelect
                 <line x1="${sp.leftEdge.toFixed(1)}" y1="${padT - 8}" x2="${sp.leftEdge.toFixed(1)}" y2="${(h - padB + 6).toFixed(1)}" stroke="${sp.meta.color}" stroke-opacity="0.45" stroke-width="1.4" stroke-dasharray="4 4"/>
             ` : '').join('')}
 
+            <!-- Y axis -->
+            ${yTicks.map(v => {
+                const y = getY(v);
+                if (showZero && Math.abs(v - zeroVal) < 1e-6) return '';
+                return `
+                <line x1="${padL - 10}" y1="${y.toFixed(1)}" x2="${w - padR + 10}" y2="${y.toFixed(1)}" stroke="${CHART_PALETTE.gridLine}" stroke-width="1"/>
+                <text data-axis-tick="y" x="${padL - 14}" y="${(y + 4).toFixed(1)}" text-anchor="end" fill="#94a3b8" font-size="11" font-family="JetBrains Mono, monospace">${fmtAxisTemp(v, isImp)}</text>`;
+            }).join('')}
+
             <!-- 0°C Frost Line -->
             ${showZero ? `
                 <line x1="${padL - 10}" y1="${zeroY.toFixed(1)}" x2="${w - padR + 10}" y2="${zeroY.toFixed(1)}" stroke="#fb7185" stroke-width="1.8" stroke-dasharray="5 4"/>
                 <text x="${padL - 14}" y="${(zeroY + 4).toFixed(1)}" text-anchor="end" fill="#fb7185" font-size="12" font-family="JetBrains Mono, monospace" font-weight="700">${isImp ? '32°F' : '0°C'}</text>
             ` : ''}
 
-            <!-- Series Polylines -->
+            <!-- Series Polylines: modelled (as designed) and estimated (thin, sparse dashes) -->
             ${seriesMeta.map(s => seriesPaths[s.key] ? `
                 <path d="${seriesPaths[s.key]}" fill="none" stroke="${s.color}" stroke-width="${s.width}" ${s.dashed ? 'stroke-dasharray="5 4"' : ''} stroke-linecap="round" stroke-linejoin="round"/>
+            ` : '').join('')}
+            ${seriesMeta.map(s => seriesEstPaths[s.key] ? `
+                <path data-estimate="${s.key}" d="${seriesEstPaths[s.key]}" fill="none" stroke="${s.color}" stroke-opacity="0.6" stroke-width="1.6" stroke-dasharray="2 4" stroke-linecap="round" stroke-linejoin="round"/>
             ` : '').join('')}
 
             <!-- Day Nodes & Labels -->
             ${days.map((d, i) => {
                 const x = xCoords[i];
-                const isSel = d.id === uiState?.selectedDayId;
+                const isSel = isItemSelected(d, uiState?.selectedDayId);
                 const showLabel = isSel || count <= 14 || i % 2 === 0;
                 const dateShortText = count > 20 ? String(d.dateStr || d.isoDate || '') : `${d.dayShort || ''}, ${d.dateStr || ''}`.replace(/^,\s*/, '');
+                const soilMark = isSoilEstimated(i) ? '≈' : '';
+                const dewMark = isDewEstimated(i) ? '≈' : '';
                 const p0 = seriesPts.soil0C[i];
                 const p6 = seriesPts.soil6C[i];
                 const p18 = seriesPts.soil18C[i];
@@ -1686,11 +1822,11 @@ export function renderSoilProfileChart(containerEl, days, uiState = {}, onSelect
                     ${p6 ? `<circle cx="${p6.x.toFixed(1)}" cy="${p6.y.toFixed(1)}" r="${isSel ? 4.5 : 3}" fill="#0f172a" stroke="#fb923c" stroke-width="1.8"/>` : ''}
                     ${pDew ? `
                         <circle cx="${pDew.x.toFixed(1)}" cy="${pDew.y.toFixed(1)}" r="${isSel ? 5 : 3.6}" fill="#0f172a" stroke="#34d399" stroke-width="2"/>
-                        ${showLabel ? `<text x="${pDew.x.toFixed(1)}" y="${(pDew.y + 15).toFixed(1)}" text-anchor="middle" fill="#6ee7b7" font-size="10.5" font-family="JetBrains Mono, monospace" font-weight="700">${escapeHtml(fmtTempCompact(pDew.c, null, unit))}</text>` : ''}
+                        ${showLabel ? `<text x="${pDew.x.toFixed(1)}" y="${(pDew.y + 15).toFixed(1)}" text-anchor="middle" fill="#6ee7b7" font-size="10.5" font-family="JetBrains Mono, monospace" font-weight="700">${dewMark}${escapeHtml(fmtTempCompact(pDew.c, null, unit))}</text>` : ''}
                     ` : ''}
                     ${p0 ? `
                         <circle cx="${p0.x.toFixed(1)}" cy="${p0.y.toFixed(1)}" r="${isSel ? 6 : 4.6}" fill="#0f172a" stroke="#fbbf24" stroke-width="2.4"/>
-                        ${showLabel ? `<text x="${p0.x.toFixed(1)}" y="${(p0.y - 9).toFixed(1)}" text-anchor="middle" fill="#fde68a" font-size="11.5" font-family="JetBrains Mono, monospace" font-weight="700">${escapeHtml(fmtTempCompact(p0.c, null, unit))}</text>` : ''}
+                        ${showLabel ? `<text x="${p0.x.toFixed(1)}" y="${(p0.y - 9).toFixed(1)}" text-anchor="middle" fill="#fde68a" font-size="11.5" font-family="JetBrains Mono, monospace" font-weight="700">${soilMark}${escapeHtml(fmtTempCompact(p0.c, null, unit))}</text>` : ''}
                     ` : ''}
 
                     ${showLabel ? `<text x="${x.toFixed(1)}" y="${(h - 12).toFixed(1)}" text-anchor="middle" fill="${isSel ? '#38bdf8' : '#e2e8f0'}" font-size="${count > 20 ? '11' : '12.5'}" font-family="Inter, system-ui, sans-serif" font-weight="700">${escapeHtml(dateShortText)}</text>` : ''}

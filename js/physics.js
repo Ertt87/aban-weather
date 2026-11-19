@@ -14,11 +14,18 @@ const COMPASS_DIRS = [
     { s: 'СЗ', f: 'Северо-Западный' }
 ];
 
+/** Compass label for "direction unknown" (e.g. ensemble-only days that carry wind speed only). */
+export const NO_DIRECTION = Object.freeze({ s: '—', f: null });
+
 function clamp(val, min, max) {
     return Math.max(min, Math.min(max, val));
 }
 
-function toFiniteNumber(val) {
+/**
+ * Strict numeric coercion: null / undefined / '' / non-finite => null.
+ * (Plain `Number(null)` is 0, which silently turns "no value" into a real-looking zero.)
+ */
+export function toFiniteNumber(val) {
     if (val === null || val === undefined || val === '') return null;
     const n = Number(val);
     return Number.isFinite(n) ? n : null;
@@ -147,15 +154,14 @@ export function blendWindVectors(samples) {
         (s) => s && toFiniteNumber(s.speedMs) !== null
     );
     if (!valid.length) {
-        const comp = degToCompass(0);
         return {
             windMs: 0,
             windMph: 0,
             gustMs: 0,
             gustMph: 0,
-            windDeg: 0,
-            windDirShort: comp.s,
-            windDirFull: comp.f
+            windDeg: null,
+            windDirShort: NO_DIRECTION.s,
+            windDirFull: NO_DIRECTION.f
         };
     }
 
@@ -165,43 +171,48 @@ export function blendWindVectors(samples) {
     let sumSpeed = 0;
     let sumGust = 0;
     let maxGust = 0;
-    let fallbackDeg = 0;
-    let maxWeight = -1;
+    let fallbackDeg = null;
+    let maxDirWeight = -1;
 
     for (const s of valid) {
         const w = Math.max(0.001, toFiniteNumber(s.weight) ?? 1);
         const speed = Math.max(0, toFiniteNumber(s.speedMs) ?? 0);
         const gust = Math.max(speed, toFiniteNumber(s.gustMs) ?? speed * 1.6);
-        const dir = ((toFiniteNumber(s.dirDeg) ?? 0) % 360 + 360) % 360;
-        const rad = (dir * Math.PI) / 180;
 
-        // Meteorological wind vector: blowing FROM dirDeg
-        const vecMag = Math.max(0.1, speed);
-        sumU += w * (-vecMag * Math.sin(rad));
-        sumV += w * (-vecMag * Math.cos(rad));
+        // A sample without a direction still counts toward speed, but never toward the bearing:
+        // inventing one (it used to default to north / 250°) fabricates a wind rose.
+        const rawDir = toFiniteNumber(s.dirDeg);
+        if (rawDir !== null) {
+            const dir = ((rawDir % 360) + 360) % 360;
+            const rad = (dir * Math.PI) / 180;
+            // Meteorological wind vector: blowing FROM dirDeg
+            const vecMag = Math.max(0.1, speed);
+            sumU += w * (-vecMag * Math.sin(rad));
+            sumV += w * (-vecMag * Math.cos(rad));
+            if (w > maxDirWeight) {
+                maxDirWeight = w;
+                fallbackDeg = dir;
+            }
+        }
 
         sumSpeed += w * speed;
         sumGust += w * gust;
         if (gust > maxGust) maxGust = gust;
-        if (w > maxWeight) {
-            maxWeight = w;
-            fallbackDeg = dir;
-        }
         weightSum += w;
     }
 
-    const vecLen = Math.hypot(sumU, sumV);
-    let windDeg;
-    if (vecLen > 1e-6) {
-        windDeg = Math.round(((Math.atan2(-sumU, -sumV) * 180) / Math.PI + 360) % 360) % 360;
-    } else {
-        windDeg = Math.round(fallbackDeg) % 360;
+    let windDeg = null;
+    if (fallbackDeg !== null) {
+        const vecLen = Math.hypot(sumU, sumV);
+        windDeg = vecLen > 1e-6
+            ? Math.round(((Math.atan2(-sumU, -sumV) * 180) / Math.PI + 360) % 360) % 360
+            : Math.round(fallbackDeg) % 360;
     }
 
     const windMs = +(sumSpeed / weightSum).toFixed(1);
     const weightedGust = sumGust / weightSum;
     const gustMs = +Math.max(windMs, 0.75 * weightedGust + 0.25 * maxGust).toFixed(1);
-    const comp = degToCompass(windDeg);
+    const comp = windDeg !== null ? degToCompass(windDeg) : NO_DIRECTION;
 
     return {
         windMs,

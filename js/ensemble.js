@@ -12,7 +12,8 @@ import {
     computeApparentTempC,
     convertPressure,
     computeAstronomy,
-    detectBasinInversion
+    detectBasinInversion,
+    NO_DIRECTION
 } from './physics.js';
 
 const RU_WEEKDAYS = ['Вс', 'Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб'];
@@ -100,6 +101,39 @@ function formatAbanTimestamp(isoOrNow) {
         hour: local.getUTCHours(),
         label: `${dd} ${mon}, ${hh}:${mm} (UTC+7)`
     };
+}
+
+const NO_PRESSURE = Object.freeze({ stationHpa: null, stationMm: null, mslHpa: null, mslMm: null });
+
+/**
+ * Station / sea-level pressure pair, or all-null when no source supplied either value.
+ * convertPressure() alone would fall back to a standard 1013 hPa atmosphere, which then shows up
+ * as a perfectly flat "forecast" line and as a fake baric jump where real data ends.
+ */
+function resolvePressure(surfaceHpa, mslHpa, tempC) {
+    const s = toNum(surfaceHpa);
+    const m = toNum(mslHpa);
+    if (s === null && m === null) return NO_PRESSURE;
+    return convertPressure({ surfaceHpa: s, mslHpa: m, tempC, elevM: ABAN_COORDS.elev });
+}
+
+/** Wind record for sources that provide speed only (ensemble quantiles): no bearing is invented. */
+function windSpeedOnly(windMs, gustMs) {
+    return {
+        windMs,
+        windMph: msToMph(windMs),
+        gustMs,
+        gustMph: msToMph(gustMs),
+        windDeg: null,
+        windDirShort: NO_DIRECTION.s,
+        windDirFull: NO_DIRECTION.f
+    };
+}
+
+function diffOrNull(a, b) {
+    const x = toNum(a);
+    const y = toNum(b);
+    return x !== null && y !== null ? x - y : null;
 }
 
 function wmoCodeToWeather(code, tempC = 0, isNight = false) {
@@ -748,7 +782,7 @@ function parseEnsemble35(ensemble35) {
 // SYNTHETIC DIURNAL FALLBACK (ONLY FOR SPARSE SUBSEASONAL / ERA5 DAYS)
 // ============================================================================
 function buildSyntheticHours({ maxC, minC, humidity, precipMm, precipProb, windMs, gustMs, windDeg, pressureStationMm, pressureMslMm, cloudCoverPct, soil0C, astronomy, dayIcon, nightIcon }) {
-    const comp = degToCompass(windDeg);
+    const comp = toNum(windDeg) !== null ? degToCompass(windDeg) : NO_DIRECTION;
     const sr = astronomy?.sunriseHour ?? 7;
     const ss = astronomy?.sunsetHour ?? 18;
     const minHour = clamp(Math.round(sr - 0.5), 2, 9);
@@ -932,7 +966,7 @@ function buildZoneDayRecord({
                     windSamples.push({
                         speedMs: hr.windMs,
                         gustMs: hr.gustMs ?? hr.windMs * 1.6,
-                        dirDeg: hr.windDeg ?? 250,
+                        dirDeg: hr.windDeg ?? null,
                         weight: ms.weight
                     });
                 }
@@ -953,7 +987,7 @@ function buildZoneDayRecord({
                     windSamples.push({
                         speedMs: toNum(aHr.windMs),
                         gustMs: toNum(aHr.gustMs) ?? toNum(aHr.windMs) * 1.6,
-                        dirDeg: toNum(aHr.windDeg) ?? 250,
+                        dirDeg: toNum(aHr.windDeg),
                         weight: 1.0
                     });
                 }
@@ -979,12 +1013,7 @@ function buildZoneDayRecord({
             const cloudCoverPct = Math.round(clamp(weightedMean(cloudEntries) ?? 50, 0, 100));
             const wind = blendWindVectors(windSamples);
             const soil0C = +(weightedMean(soilEntries) ?? (tempC * 0.45)).toFixed(1);
-            const pObj = convertPressure({
-                surfaceHpa: weightedMean(pSurfEntries),
-                mslHpa: weightedMean(pMslEntries),
-                tempC,
-                elevM: ABAN_COORDS.elev
-            });
+            const pObj = resolvePressure(weightedMean(pSurfEntries), weightedMean(pMslEntries), tempC);
 
             const wetBulbC = computeWetBulbC(tempC, humidity);
             const feelsC = computeApparentTempC(tempC, wind.windMs, humidity);
@@ -1088,7 +1117,7 @@ function buildZoneDayRecord({
             windDaySamples.push({
                 speedMs: d.windMs,
                 gustMs: d.gustMs ?? d.windMs * 1.65,
-                dirDeg: d.windDeg ?? 250,
+                dirDeg: d.windDeg ?? null,
                 weight: ms.weight
             });
         }
@@ -1102,7 +1131,7 @@ function buildZoneDayRecord({
             windDaySamples.push({
                 speedMs: toNum(rawArchiveDay.windMs),
                 gustMs: toNum(rawArchiveDay.gustMs) ?? toNum(rawArchiveDay.windMs) * 1.6,
-                dirDeg: toNum(rawArchiveDay.windDeg) ?? 250,
+                dirDeg: toNum(rawArchiveDay.windDeg),
                 weight: 1.0
             });
         }
@@ -1167,16 +1196,8 @@ function buildZoneDayRecord({
         precipP75Mm = +(Math.max(precipMm, toNum(ensQ?.precipP75Mm) ?? precipMm * 1.6)).toFixed(1);
         const wSpeed = +(toNum(ensQ?.windP50Ms) ?? 3.8).toFixed(1);
         const wGust = +(Math.max(wSpeed * 1.5, toNum(ensQ?.windP90Ms) ?? wSpeed * 1.8)).toFixed(1);
-        const comp = degToCompass(250);
-        windObj = {
-            windMs: wSpeed,
-            windMph: msToMph(wSpeed),
-            gustMs: wGust,
-            gustMph: msToMph(wGust),
-            windDeg: 250,
-            windDirShort: comp.s,
-            windDirFull: comp.f
-        };
+        // Ensemble quantiles carry speed only — there is no bearing at this range
+        windObj = windSpeedOnly(wSpeed, wGust);
     } else if (zone === 'extended_ensemble') {
         const t = clamp((offsetFromToday - 10) / 5, 0, 1);
         const wDet = 0.65 - 0.25 * t; // 0.65 -> 0.40 deterministic 16d weight
@@ -1210,8 +1231,7 @@ function buildZoneDayRecord({
         windObj = windDaySamples.length ? blendWindVectors(windDaySamples) : (() => {
             const ws = +(toNum(ensQ?.windP50Ms) ?? 4.0).toFixed(1);
             const wg = +(Math.max(ws * 1.6, toNum(ensQ?.windP90Ms) ?? ws * 1.9)).toFixed(1);
-            const c = degToCompass(250);
-            return { windMs: ws, windMph: msToMph(ws), gustMs: wg, gustMph: msToMph(wg), windDeg: 250, windDirShort: c.s, windDirFull: c.f };
+            return windSpeedOnly(ws, wg);
         })();
     } else {
         // Archive or Deterministic (0..9)
@@ -1252,10 +1272,10 @@ function buildZoneDayRecord({
         if (windDaySamples.length) {
             windObj = blendWindVectors(windDaySamples);
         } else if (sortedRealHours.length) {
-            windObj = blendWindVectors(sortedRealHours.map((h) => ({ speedMs: h.windMs, gustMs: h.gustMs, dirDeg: 250, weight: 1 })));
+            // Hour slots keep a compass label, not degrees: speed blends, bearing stays unknown
+            windObj = blendWindVectors(sortedRealHours.map((h) => ({ speedMs: h.windMs, gustMs: h.gustMs, dirDeg: null, weight: 1 })));
         } else {
-            const c = degToCompass(250);
-            windObj = { windMs: 3.5, windMph: msToMph(3.5), gustMs: 6.0, gustMph: msToMph(6.0), windDeg: 250, windDirShort: c.s, windDirFull: c.f };
+            windObj = windSpeedOnly(3.5, 6.0);
         }
     }
 
@@ -1296,12 +1316,16 @@ function buildZoneDayRecord({
         avgArr(compHourVals.map((c) => c.soil54C)) ??
         +(soil18C * 0.7 + 1.5).toFixed(1);
 
+    // Humidity / dew point: without archive, hourly or Google data the numbers come from a formula.
+    // They still feed the precipitation-phase logic, but are flagged so charts do not plot them as data.
+    const modelledHumidity =
+        toNum(rawArchiveDay?.humidity) ??
+        (sortedRealHours.length ? avgArr(sortedRealHours.map((h) => h.humidity)) : null) ??
+        toNum(googleData?.dailyByDate?.get(isoDate)?.humidity);
+    const humidityEstimated = modelledHumidity === null;
     const humidity = Math.round(
         clamp(
-            toNum(rawArchiveDay?.humidity) ??
-                (sortedRealHours.length ? avgArr(sortedRealHours.map((h) => h.humidity)) : null) ??
-                toNum(googleData?.dailyByDate?.get(isoDate)?.humidity) ??
-                74 - (maxC - minC) * 1.1 + Math.min(18, precipMm * 3),
+            modelledHumidity ?? 74 - (maxC - minC) * 1.1 + Math.min(18, precipMm * 3),
             25,
             98
         )
@@ -1327,12 +1351,12 @@ function buildZoneDayRecord({
     const compSurf = avgArr(compHourVals.map((c) => c.surfacePressureHpa));
     const compMsl = avgArr(compHourVals.map((c) => c.pressureMslHpa));
 
-    const pObj = convertPressure({
-        surfaceHpa: toNum(rawArchiveDay?.surfacePressureHpa) ?? avgHourSurf ?? compSurf,
-        mslHpa: toNum(rawArchiveDay?.pressureMslHpa) ?? avgHourMsl ?? compMsl,
-        tempC: (maxC + minC) / 2,
-        elevM: ABAN_COORDS.elev
-    });
+    // All-null beyond the modelled range (days 17–35, daily-only archive): no pressure is invented
+    const pObj = resolvePressure(
+        toNum(rawArchiveDay?.surfacePressureHpa) ?? avgHourSurf ?? compSurf,
+        toNum(rawArchiveDay?.pressureMslHpa) ?? avgHourMsl ?? compMsl,
+        (maxC + minC) / 2
+    );
 
     const uv = Math.round(
         clamp(
@@ -1551,6 +1575,9 @@ function buildZoneDayRecord({
         dataQuality: {
             soilEstimated,
             snowEstimated,
+            humidityEstimated,
+            hasPressure: pObj.stationMm !== null,
+            hasWindDirection: windObj.windDeg !== null,
             ensembleBacked: Boolean(ensQ)
         },
         modelBreakdown,
@@ -1565,7 +1592,8 @@ function finalizeDaysSequence(days, todayIso) {
         d.idx = i;
         d.offsetFromToday = diffDaysIso(d.isoDate, todayIso);
         const isConsecutivePrev = i > 0 && diffDaysIso(d.isoDate, sorted[i - 1].isoDate) === 1;
-        d.deltaP24hMm = isConsecutivePrev ? d.pressureStationMm - sorted[i - 1].pressureStationMm : 0;
+        // null (not 0, and never a jump against a default value) when either day lacks pressure
+        d.deltaP24hMm = isConsecutivePrev ? diffOrNull(d.pressureStationMm, sorted[i - 1].pressureStationMm) : null;
 
         // True overnight: 20:00 of day d .. 08:00 of day d+1
         const nextDay = sorted[i + 1] && diffDaysIso(sorted[i + 1].isoDate, d.isoDate) === 1 ? sorted[i + 1] : null;
@@ -1758,7 +1786,7 @@ export function buildUnifiedDataset(rawBundle = {}, options = {}) {
             curWindSamples.push({
                 speedMs: gWs,
                 gustMs: parseGoogleSpeedMs(gCur.wind?.gust) ?? gWs * 1.6,
-                dirDeg: toNum(gCur.wind?.direction?.degrees) ?? 250,
+                dirDeg: toNum(gCur.wind?.direction?.degrees),
                 weight: gw
             });
         }
@@ -1773,7 +1801,7 @@ export function buildUnifiedDataset(rawBundle = {}, options = {}) {
             curWindSamples.push({
                 speedMs: toNum(omCur.wind_speed_10m),
                 gustMs: toNum(omCur.wind_gusts_10m) ?? toNum(omCur.wind_speed_10m) * 1.6,
-                dirDeg: toNum(omCur.wind_direction_10m) ?? 250,
+                dirDeg: toNum(omCur.wind_direction_10m),
                 weight: 0.45
             });
         }
@@ -1785,14 +1813,14 @@ export function buildUnifiedDataset(rawBundle = {}, options = {}) {
         curTempEntries.push({ value: todaySlot.tempC, weight: 1 });
         curHumEntries.push({ value: todaySlot.humidity, weight: 1 });
         curPrecipEntries.push({ value: todaySlot.precipMm, weight: 1 });
-        curWindSamples.push({ speedMs: todaySlot.windMs, gustMs: todaySlot.gustMs, dirDeg: todayDay?.windDeg ?? 250, weight: 1 });
+        curWindSamples.push({ speedMs: todaySlot.windMs, gustMs: todaySlot.gustMs, dirDeg: todayDay?.windDeg ?? null, weight: 1 });
     }
 
     const curTempC = +(weightedMean(curTempEntries) ?? todaySlot?.tempC ?? 0).toFixed(1);
     const curWind = curWindSamples.length ? blendWindVectors(curWindSamples) : {
         windMs: todaySlot?.windMs ?? 0, windMph: todaySlot?.windMph ?? 0,
         gustMs: todaySlot?.gustMs ?? 0, gustMph: msToMph(todaySlot?.gustMs ?? 0),
-        windDeg: todayDay?.windDeg ?? 250, windDirShort: todayDay?.windDirShort ?? 'З'
+        windDeg: todayDay?.windDeg ?? null, windDirShort: todayDay?.windDirShort ?? NO_DIRECTION.s
     };
     const curHumidity = Math.round(clamp(weightedMean(curHumEntries) ?? todaySlot?.humidity ?? 70, 10, 100));
     const curWetBulbC = computeWetBulbC(curTempC, curHumidity);
@@ -1804,23 +1832,22 @@ export function buildUnifiedDataset(rawBundle = {}, options = {}) {
         clamp(toNum(gCur?.precipitation?.probability?.percent) ?? todaySlot?.precipProb ?? todayDay?.precipDay ?? 0, 0, 100)
     );
     const curPhaseObj = classifyPrecipPhase(curTempC, curHumidity, curPrecipMm, curSoil0C);
-    const curPress = convertPressure({
-        surfaceHpa: weightedMean(curSurfEntries) ?? todaySlot?.pressureStationHpa,
-        mslHpa: weightedMean(curMslEntries) ?? todaySlot?.pressureMslHpa,
-        tempC: curTempC,
-        elevM: ABAN_COORDS.elev
-    });
+    const curPress = resolvePressure(
+        weightedMean(curSurfEntries) ?? todaySlot?.pressureStationHpa,
+        weightedMean(curMslEntries) ?? todaySlot?.pressureMslHpa,
+        curTempC
+    );
 
-    // Pressure tendencies (3h & 24h)
-    let p3hAgoMm = curPress.stationMm;
+    // Pressure tendencies (3h & 24h): null when the reference hour is missing — never "0 mm"
+    let p3hAgoMm = null;
     if (todayDay?.hours?.length) {
         if (currentHour >= 3) {
-            p3hAgoMm = todayDay.hours[currentHour - 3]?.pressureStationMm ?? curPress.stationMm;
+            p3hAgoMm = todayDay.hours[currentHour - 3]?.pressureStationMm ?? null;
         } else if (yesterdayDay?.hours?.length) {
-            p3hAgoMm = yesterdayDay.hours[24 + currentHour - 3]?.pressureStationMm ?? curPress.stationMm;
+            p3hAgoMm = yesterdayDay.hours[24 + currentHour - 3]?.pressureStationMm ?? null;
         }
     }
-    const p24hAgoMm = yesterdayDay?.hours?.[currentHour]?.pressureStationMm ?? yesterdayDay?.pressureStationMm ?? curPress.stationMm;
+    const p24hAgoMm = yesterdayDay?.hours?.[currentHour]?.pressureStationMm ?? yesterdayDay?.pressureStationMm ?? null;
 
     const isCurNight = todayDay ? (currentHour < todayDay.astronomy.sunriseHour || currentHour > todayDay.astronomy.sunsetHour) : false;
     const curMeta = gCur?.weatherCondition
@@ -1858,8 +1885,8 @@ export function buildUnifiedDataset(rawBundle = {}, options = {}) {
         pressureStationMm: curPress.stationMm,
         pressureMslHpa: curPress.mslHpa,
         pressureMslMm: curPress.mslMm,
-        deltaP3hMm: curPress.stationMm - p3hAgoMm,
-        deltaP24hMm: curPress.stationMm - p24hAgoMm,
+        deltaP3hMm: diffOrNull(curPress.stationMm, p3hAgoMm),
+        deltaP24hMm: diffOrNull(curPress.stationMm, p24hAgoMm),
         uv: Math.round(toNum(gCur?.uvIndex) ?? todayDay?.uv ?? 0),
         obsTimeLabel: `п. Абан • ${abanNow.label}`
     };
@@ -2013,9 +2040,9 @@ export function computeDayWindowStats(day, timeWindowKey = 'full') {
             precipProb: day.precipDay ?? 10,
             windMs: day.windMs ?? 3,
             gustMs: day.gustMs ?? 5,
-            windDeg: day.windDeg ?? 250,
-            pressureStationMm: day.pressureStationMm ?? 745,
-            pressureMslMm: day.pressureMslMm ?? 765,
+            windDeg: day.windDeg ?? null,
+            pressureStationMm: day.pressureStationMm ?? null,
+            pressureMslMm: day.pressureMslMm ?? null,
             cloudCoverPct: day.cloudCoverPct ?? 40,
             soil0C: day.soil0C ?? 0,
             astronomy: day.astronomy,
@@ -2073,6 +2100,11 @@ export function buildPentadSummary(days) {
         const first = chunk[0];
         const last = chunk[n - 1];
         const avg = (fn) => +(chunk.reduce((s, d) => s + (toNum(fn(d)) ?? 0), 0) / n).toFixed(1);
+        // Mean over the days that actually carry the value; null when none do (nothing is invented)
+        const avgAvailable = (fn, decimals = 1) => {
+            const vals = chunk.map((d) => toNum(fn(d))).filter((v) => v !== null);
+            return vals.length ? +(vals.reduce((a, b) => a + b, 0) / vals.length).toFixed(decimals) : null;
+        };
 
         const maxC = avg((d) => d.maxC);
         const minC = avg((d) => d.minC);
@@ -2081,7 +2113,7 @@ export function buildPentadSummary(days) {
         const meanC = +((maxC + minC) / 2).toFixed(1);
 
         const wind = blendWindVectors(
-            chunk.map((d) => ({ speedMs: d.windMs, gustMs: d.gustMs, dirDeg: d.windDeg ?? 250, weight: 1 }))
+            chunk.map((d) => ({ speedMs: d.windMs, gustMs: d.gustMs, dirDeg: d.windDeg ?? null, weight: 1 }))
         );
         const precipMm = +chunk.reduce((s, d) => s + (d.precipMm ?? 0), 0).toFixed(1);
         const precipP75Mm = +chunk.reduce((s, d) => s + (d.precipP75Mm ?? d.precipMm ?? 0), 0).toFixed(1);
@@ -2112,6 +2144,26 @@ export function buildPentadSummary(days) {
         );
 
         const repZone = chunk[Math.floor(n / 2)].zone;
+
+        // Sharpest day-to-day pressure change inside the period (signed). A first-to-last
+        // difference over five days is not a 24-hour jump and must not be labelled as one.
+        let peakDeltaP = null;
+        for (const d of chunk) {
+            const dp = toNum(d.deltaP24hMm);
+            if (dp !== null && (peakDeltaP === null || Math.abs(dp) > Math.abs(peakDeltaP))) peakDeltaP = dp;
+        }
+
+        // Per-model mean Max / Min so the model lines survive pentad grouping
+        const modelBreakdown = {};
+        const modelIds = new Set();
+        for (const d of chunk) {
+            for (const k of Object.keys(d.modelBreakdown || {})) modelIds.add(k);
+        }
+        for (const mId of modelIds) {
+            const mMax = avgAvailable((d) => d.modelBreakdown?.[mId]?.maxC);
+            const mMin = avgAvailable((d) => d.modelBreakdown?.[mId]?.minC);
+            if (mMax !== null || mMin !== null) modelBreakdown[mId] = { maxC: mMax, minC: mMin };
+        }
         const meanPhase = classifyPrecipPhase(meanC, Math.round(avg((d) => d.humidity ?? 70)), precipMm, avg((d) => d.soil0C ?? 0));
 
         pentads.push({
@@ -2158,19 +2210,25 @@ export function buildPentadSummary(days) {
             windMph: wind.windMph,
             gustMs: +Math.max(...chunk.map((d) => d.gustMs ?? 0)).toFixed(1),
             gustMph: msToMph(Math.max(...chunk.map((d) => d.gustMs ?? 0))),
+            windDeg: wind.windDeg,
             windDirShort: wind.windDirShort,
             soil0C: avg((d) => d.soil0C ?? 0),
             soil6C: avg((d) => d.soil6C ?? 0),
             soil18C: avg((d) => d.soil18C ?? 0),
             soil54C: avg((d) => d.soil54C ?? 0),
             dewPointC: avg((d) => d.dewPointC ?? 0),
-            pressureStationMm: Math.round(avg((d) => d.pressureStationMm ?? 745)),
-            pressureMslMm: Math.round(avg((d) => d.pressureMslMm ?? 765)),
-            deltaP24hMm: Math.round(last.pressureStationMm - first.pressureStationMm),
+            pressureStationMm: avgAvailable((d) => d.pressureStationMm, 0),
+            pressureMslMm: avgAvailable((d) => d.pressureMslMm, 0),
+            deltaP24hMm: peakDeltaP !== null ? Math.round(peakDeltaP) : null,
             dataQuality: {
                 soilEstimated: chunk.some((d) => d.dataQuality?.soilEstimated),
-                snowEstimated: chunk.some((d) => d.dataQuality?.snowEstimated)
+                snowEstimated: chunk.some((d) => d.dataQuality?.snowEstimated),
+                humidityEstimated: chunk.some((d) => d.dataQuality?.humidityEstimated),
+                hasPressure: chunk.some((d) => toNum(d.pressureStationMm) !== null),
+                hasWindDirection: wind.windDeg !== null,
+                ensembleBacked: chunk.some((d) => d.dataQuality?.ensembleBacked !== false)
             },
+            modelBreakdown,
             dayIds: chunk.map((d) => d.id)
         });
     }

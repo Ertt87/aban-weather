@@ -1,5 +1,5 @@
 import { ABAN_COORDS, MODEL_META, TIME_WINDOWS, REFERENCE_DATASET, buildDynamicReferenceDataset } from './config.js';
-import { cToF, msToMph, formatSignedC, computeFieldOpsMetrics } from './physics.js';
+import { cToF, msToMph, formatSignedC, computeFieldOpsMetrics, toFiniteNumber } from './physics.js';
 import {
   buildUnifiedDataset,
   mergeArchiveDaysIntoDataset,
@@ -185,10 +185,20 @@ function addDaysIso(isoDate, deltaDays) {
   return new Date(Date.UTC(y, m - 1, d + deltaDays)).toISOString().slice(0, 10);
 }
 
+/**
+ * Imperial value for display: the precomputed override when one exists, otherwise converted.
+ * The override must go through toFiniteNumber — `Number(null)` is 0, and treating a missing
+ * override as "0°F" / "0 mph" is exactly the bug this guards against.
+ */
+function resolveImperial(override, convert, metricValue) {
+  const fromOverride = toFiniteNumber(override);
+  return fromOverride !== null ? Math.round(fromOverride) : convert(metricValue);
+}
+
 function formatTemp(c, fOverride = null, withDual = true) {
-  if (c === null || c === undefined || !Number.isFinite(Number(c))) return '—';
-  const numC = Number(c);
-  const numF = Number.isFinite(Number(fOverride)) ? Math.round(Number(fOverride)) : cToF(numC);
+  const numC = toFiniteNumber(c);
+  if (numC === null) return '—';
+  const numF = resolveImperial(fOverride, cToF, numC);
   if (state.unit === 'imperial') return `${numF}°F`;
   const strC = formatSignedC(numC);
   if (state.unit === 'dual' && withDual) return `${strC} (${numF}°F)`;
@@ -196,46 +206,59 @@ function formatTemp(c, fOverride = null, withDual = true) {
 }
 
 function formatTempCompact(c, fOverride = null) {
-  if (c === null || c === undefined || !Number.isFinite(Number(c))) return '—';
-  const numC = Number(c);
-  const numF = Number.isFinite(Number(fOverride)) ? Math.round(Number(fOverride)) : cToF(numC);
-  if (state.unit === 'imperial') return `${numF}°`;
+  const numC = toFiniteNumber(c);
+  if (numC === null) return '—';
+  if (state.unit === 'imperial') return `${resolveImperial(fOverride, cToF, numC)}°`;
   return formatSignedC(numC).replace(/°C$/, '°');
 }
 
 function formatTempSecondary(c, fOverride = null) {
-  if (c === null || c === undefined || !Number.isFinite(Number(c))) return '';
-  const numC = Number(c);
-  const numF = Number.isFinite(Number(fOverride)) ? Math.round(Number(fOverride)) : cToF(numC);
+  const numC = toFiniteNumber(c);
+  if (numC === null) return '';
   if (state.unit === 'imperial') return formatSignedC(numC);
   if (state.unit === 'dual') return '';
-  return `${numF}°F`;
+  return `${resolveImperial(fOverride, cToF, numC)}°F`;
 }
 
 function formatWind(ms, mphOverride = null) {
-  if (ms === null || ms === undefined || !Number.isFinite(Number(ms))) return '—';
-  const numMs = Number(ms);
-  const numMph = Number.isFinite(Number(mphOverride)) ? Math.round(Number(mphOverride)) : msToMph(numMs);
-  if (state.unit === 'imperial') return `${numMph} mph`;
+  const numMs = toFiniteNumber(ms);
+  if (numMs === null) return '—';
+  if (state.unit === 'imperial') return `${resolveImperial(mphOverride, msToMph, numMs)} mph`;
   return `${numMs.toFixed(1)} м/с`;
 }
 
 function formatSignedInt(val, unit = 'мм') {
-  const n = Number(val);
-  if (!Number.isFinite(n)) return `0 ${unit}`;
+  const n = toFiniteNumber(val);
+  if (n === null) return '—';
   const r = Math.round(n);
   return `${r > 0 ? '+' : ''}${r} ${unit}`;
 }
 
+/**
+ * Pressure for the active reference (station 246 m / sea level). `has` is false when the record
+ * carries no pressure at all (far-range trend days, daily-only archive): callers then print «—»
+ * instead of a plausible-looking default.
+ */
 function getPressurePair(obj) {
-  if (state.pressureMode === 'msl') {
-    const mm = obj?.pressureMslMm ?? obj?.pressureStationMm ?? obj?.pressureMm ?? 765;
-    const hpa = obj?.pressureMslHpa ?? obj?.pressureStationHpa ?? obj?.pressureHpa ?? 1020;
-    return { mm, hpa, label: 'Ур. моря' };
-  }
-  const mm = obj?.pressureStationMm ?? obj?.pressureMm ?? obj?.pressureMslMm ?? 745;
-  const hpa = obj?.pressureStationHpa ?? obj?.pressureHpa ?? obj?.pressureMslHpa ?? 993;
-  return { mm, hpa, label: '246м' };
+  const isMsl = state.pressureMode === 'msl';
+  const mm = toFiniteNumber(
+    isMsl
+      ? obj?.pressureMslMm ?? obj?.pressureStationMm ?? obj?.pressureMm
+      : obj?.pressureStationMm ?? obj?.pressureMm ?? obj?.pressureMslMm
+  );
+  const hpa = toFiniteNumber(
+    isMsl
+      ? obj?.pressureMslHpa ?? obj?.pressureStationHpa ?? obj?.pressureHpa
+      : obj?.pressureStationHpa ?? obj?.pressureHpa ?? obj?.pressureMslHpa
+  );
+  return {
+    mm,
+    hpa,
+    has: mm !== null,
+    label: isMsl ? 'Ур. моря' : '246м',
+    mmText: mm !== null ? `${Math.round(mm)} мм` : '—',
+    hpaText: hpa !== null ? `${Math.round(hpa)} гПа` : '—',
+  };
 }
 
 function markAllAnalyticsTabsDirty() {
@@ -711,7 +734,8 @@ function renderCurrentConditions() {
   $('currentFeelsDisplay').textContent = formatTemp(cur.feelsC, cur.feelsF, true);
   $('currentWetBulbDisplay').textContent = formatTemp(cur.wetBulbC, null, false);
 
-  $('currentWindDirTag').textContent = `${cur.windDeg ?? 0}° ${cur.windDirShort || '—'}`;
+  $('currentWindDirTag').textContent =
+    toFiniteNumber(cur.windDeg) !== null ? `${Math.round(cur.windDeg)}° ${cur.windDirShort || '—'}` : '—';
   $('currentWindDisplay').textContent = formatWind(cur.windMs, cur.windMph);
   $('currentGustSub').textContent = `Порывы ${formatWind(cur.gustMs, cur.gustMph)}`;
 
@@ -729,15 +753,15 @@ function renderCurrentConditions() {
 
   const pPair = getPressurePair(cur);
   $('currentPressureRefLabel').textContent = `Давление (${pPair.label})`;
-  $('currentPressureDisplay').textContent = `${pPair.mm} мм (${pPair.hpa} гПа)`;
+  $('currentPressureDisplay').textContent = pPair.has ? `${pPair.mmText} (${pPair.hpaText})` : '— (нет данных)';
   $('currentUvTag').textContent = `УФ: ${cur.uv ?? 0}`;
 
-  const dp3 = Number(cur.deltaP3hMm ?? 0);
-  const dp24 = Number(cur.deltaP24hMm ?? 0);
+  const dp3 = toFiniteNumber(cur.deltaP3hMm);
+  const dp24 = toFiniteNumber(cur.deltaP24hMm);
   const dpEl = $('currentDeltaPBadge');
   dpEl.textContent = `ΔP3ч: ${formatSignedInt(dp3)} • ΔP24ч: ${formatSignedInt(dp24)}`;
   dpEl.className =
-    Math.abs(dp24) >= 6 || Math.abs(dp3) >= 3
+    Math.abs(dp24 ?? 0) >= 6 || Math.abs(dp3 ?? 0) >= 3
       ? 'metric-box__sub text-rose-400 font-bold'
       : 'metric-box__sub text-slate-400';
 
@@ -1127,7 +1151,7 @@ function updateSelectedHourBar(day) {
     $('selectedHourTemp').textContent = `${formatTemp(selPt.tempC, selPt.tempF)} (Ощущ. ${formatTemp(selPt.feelsC)})`;
     $('selectedHourWetBulb').textContent = `Tw: ${formatTempCompact(selPt.wetBulbC)} • Td: ${formatTempCompact(selPt.dewPointC)}`;
     $('diurnalWindowWind').textContent = `${formatWind(selPt.windMs, selPt.windMph)} (пор. ${formatWind(selPt.gustMs)}) ${selPt.windDirShort || ''}`;
-    $('diurnalWindowPressure').textContent = `Давл.: ${pPair.mm} мм (${pPair.label})`;
+    $('diurnalWindowPressure').textContent = pPair.has ? `Давл.: ${pPair.mmText} (${pPair.label})` : 'Давл.: — (нет данных)';
     $('diurnalWindowPrecip').textContent = `${selPt.precipProb ?? 0}% • ${Number(selPt.precipMm ?? 0).toFixed(1)} мм (${phaseRu})`;
     $('diurnalWindowSoil').textContent = `Почва 0см: ${formatSoilCompact(selPt.soil0C, day.dataQuality?.soilEstimated)}`;
   } else {
@@ -1135,7 +1159,7 @@ function updateSelectedHourBar(day) {
     $('selectedHourTemp').textContent = `${formatTemp(day.minC, day.minF)} .. ${formatTemp(day.maxC, day.maxF)}`;
     $('selectedHourWetBulb').textContent = 'Без почасовой сетки';
     $('diurnalWindowWind').textContent = `${formatWind(day.windMs, day.windMph)} ${day.windDirShort || ''}`;
-    $('diurnalWindowPressure').textContent = `Давл.: ${getPressurePair(day).mm} мм`;
+    $('diurnalWindowPressure').textContent = `Давл.: ${getPressurePair(day).mmText}`;
     $('diurnalWindowPrecip').textContent = `${day.precipDay ?? 0}% • ${Number(day.precipMm ?? 0).toFixed(1)} мм`;
     $('diurnalWindowSoil').textContent = `Почва 0см: ${formatSoilCompact(day.soil0C, day.dataQuality?.soilEstimated)}`;
   }
@@ -1255,11 +1279,20 @@ function renderDayInspector() {
   $('inspectorNightPrecip').textContent = `${nProb}% • ${Number(nMm).toFixed(1)} мм (${nType})`;
 
   // Vector Wind Compass
-  $('inspectorWindDirCode').textContent = `${day.windDirShort || '—'} (${day.windDeg ?? 0}°)`;
-  $('compassArrowGroup')?.setAttribute('transform', `rotate(${day.windDeg ?? 0}, 70, 70)`);
+  // No direction for far-range trend days (ensembles give speed only): show «—», hide the arrow
+  const windDeg = toFiniteNumber(day.windDeg);
+  const hasWindDir = windDeg !== null;
+  $('inspectorWindDirCode').textContent = hasWindDir ? `${day.windDirShort || '—'} (${Math.round(windDeg)}°)` : '—';
+  const arrowEl = $('compassArrowGroup');
+  if (arrowEl) {
+    arrowEl.setAttribute('transform', `rotate(${hasWindDir ? windDeg : 0}, 70, 70)`);
+    arrowEl.setAttribute('opacity', hasWindDir ? '1' : '0');
+  }
   $('inspectorWindSpeed').textContent = formatWind(day.windMs, day.windMph);
   $('inspectorWindGusts').textContent = `Порывы до: ${formatWind(day.gustMs, day.gustMph)}`;
-  $('inspectorWindName').textContent = `${day.windDirFull || 'Западный'} поток`;
+  $('inspectorWindName').textContent = hasWindDir
+    ? `${day.windDirFull || '—'} поток`
+    : 'Направление: нет данных на этом горизонте';
 
   // 4 Aban Field Operational Cards
   $('opsRoadCard').className = `ops-card ops-card--${ops.roadRisk.level || 'low'}`;
@@ -1277,8 +1310,12 @@ function renderDayInspector() {
   const pPair = getPressurePair(day);
   $('opsInversionLabel').textContent = day.inversion?.active
     ? `Активна (−${num(day.inversion.deltaC).toFixed(1)}°C • низины ${formatTempCompact(day.inversion.valleyMinC)})`
-    : `Инверсия слабая • ${pPair.mm} мм`;
-  $('opsInversionDetail').textContent = `${day.inversion?.noteRu || '—'} • Давл. ${pPair.mm} мм (Δ24ч: ${formatSignedInt(day.deltaP24hMm)})`;
+    : pPair.has
+    ? `Инверсия слабая • ${pPair.mmText}`
+    : 'Инверсия слабая';
+  $('opsInversionDetail').textContent = pPair.has
+    ? `${day.inversion?.noteRu || '—'} • Давл. ${pPair.mmText} (Δ24ч: ${formatSignedInt(day.deltaP24hMm)})`
+    : `${day.inversion?.noteRu || '—'} • Давление: нет данных на этом горизонте`;
 }
 
 // ============================================================================
@@ -1306,8 +1343,8 @@ function renderAnalyticsTab(tabKey) {
 
   if (tabKey === 'temp') {
     $('tempChartDynamicSummary').textContent = `Max: ${maxDay.dateStr} (${formatTemp(maxDay.maxC, maxDay.maxF)}) • Min: ${minDay.dateStr} (${formatTemp(minDay.minC, minDay.minF)})`;
-    const tempDaysArg = usePentad && days.length <= 16 ? pentads : days;
-    renderTempEnsembleChart($('tempChartWrapper'), tempDaysArg, uiState, selectDay);
+    // Same items as the other tabs and the table: pentads come from buildPentadSummary only
+    renderTempEnsembleChart($('tempChartWrapper'), chartItems, uiState, selectDay);
   } else if (tabKey === 'precip') {
     $('precipChartDynamicSummary').textContent = `Сумма осадков: ${sumMm.toFixed(1)} мм • Пик снега: ${Math.max(...days.map((d) => d.snowDepthCm ?? 0)).toFixed(1)} см`;
     renderPrecipSnowChart($('precipChartWrapper'), chartItems, uiState, selectDay);
@@ -1363,13 +1400,13 @@ function renderAnalyticsTab(tabKey) {
           const pPair = getPressurePair(p);
           const anom = num(p.climAnomalyC);
           const pSoilEst = Boolean(p.dataQuality?.soilEstimated);
-          return `<tr data-day-id="${escapeHtml(p.id)}" class="${isSel ? 'is-selected' : ''}">
+          return `<tr data-day-id="${escapeHtml(p.id)}" tabindex="0" aria-selected="${isSel ? 'true' : 'false'}" class="${isSel ? 'is-selected' : ''}">
             <td class="font-bold text-white">${escapeHtml(p.label)} (${num(p.dayCount)}д)</td>
             <td><span class="zone-pill ${ZONE_BADGE_META[p.zone]?.cls || ''}">${escapeHtml(ZONE_BADGE_META[p.zone]?.short || p.zone)} ${num(p.confidencePct)}%</span></td>
             <td><span class="text-amber-300 font-bold">${formatTemp(p.maxC)}</span> / <span class="text-cyan-300">${formatTemp(p.minC)}</span> <span class="text-slate-400">(${formatTempCompact(p.absMinC)}..${formatTempCompact(p.absMaxC)})</span></td>
             <td class="text-cyan-300">${num(p.precipMm).toFixed(1)} мм • ❄${formatSnowCm(p.snowDepthCm, p.dataQuality?.snowEstimated)}см</td>
             <td class="text-slate-200">${formatWind(p.windMs)} (пор. ${formatWind(p.gustMs)}) ${escapeHtml(p.windDirShort || '')}</td>
-            <td class="text-amber-300">${formatSoilCompact(p.soil0C, pSoilEst)} / ${formatSoilCompact(p.soil54C, pSoilEst)} • ${num(pPair.mm)} мм</td>
+            <td class="text-amber-300">${formatSoilCompact(p.soil0C, pSoilEst)} / ${formatSoilCompact(p.soil54C, pSoilEst)} • ${pPair.mmText}</td>
             <td class="${anom >= 0 ? 'text-amber-300' : 'text-cyan-300'}">${anom > 0 ? '+' : ''}${anom.toFixed(1)}°C</td>
           </tr>`;
         })
@@ -1400,7 +1437,7 @@ function renderAnalyticsTab(tabKey) {
               ? 'text-sky-300'
               : 'text-emerald-300';
 
-          return `<tr data-day-id="${escapeHtml(d.id)}" class="${d.id === state.selectedDayId ? 'is-selected' : ''}">
+          return `<tr data-day-id="${escapeHtml(d.id)}" tabindex="0" aria-selected="${d.id === state.selectedDayId ? 'true' : 'false'}" class="${d.id === state.selectedDayId ? 'is-selected' : ''}">
             <td class="font-bold text-white">${escapeHtml(d.dayShort)}, ${escapeHtml(d.dateStr)}</td>
             <td class="font-sans text-slate-300">
               <span class="zone-pill ${zMeta.cls}">${escapeHtml(zMeta.short)} ${num(d.confidencePct, 85)}%</span>
@@ -1413,7 +1450,7 @@ function renderAnalyticsTab(tabKey) {
             </td>
             <td class="text-cyan-300">${num(d.precipMm).toFixed(1)} мм (${num(d.precipDay)}%) • ❄${formatSnowCm(d.snowDepthCm, d.dataQuality?.snowEstimated, 0)}см</td>
             <td class="text-slate-200">${formatWind(d.windMs, d.windMph)} (пор. ${formatWind(d.gustMs, d.gustMph)}) ${escapeHtml(d.windDirShort || '')}</td>
-            <td class="text-amber-300">${formatSoilCompact(d.soil0C, d.dataQuality?.soilEstimated)} / ${formatSoilCompact(d.soil54C, d.dataQuality?.soilEstimated)} • ${num(pPair.mm)} мм</td>
+            <td class="text-amber-300">${formatSoilCompact(d.soil0C, d.dataQuality?.soilEstimated)} / ${formatSoilCompact(d.soil54C, d.dataQuality?.soilEstimated)} • ${pPair.mmText}</td>
             <td class="${riskCls}">${escapeHtml(ops.roadRisk.labelRu)}</td>
           </tr>`;
         })
@@ -1439,6 +1476,65 @@ function renderAnalyticsAndTable() {
 
   // Lazy tab rendering: only redraw active tab; hidden tabs render on switch
   renderAnalyticsTab(state.activeTab);
+  renderChartSelectionSummary();
+}
+
+/**
+ * One-line readout of the selected day (or of the pentad containing it) for the active tab.
+ * This is also where the P10–P90 fan gets its numbers: the chart draws the band, the line names it.
+ */
+function renderChartSelectionSummary() {
+  const el = $('activeChartSummaryText');
+  if (!el) return;
+  const days = getSelectedPeriodDays();
+  const day = days.find((d) => d.id === state.selectedDayId);
+  if (!day) {
+    el.textContent = 'Выберите узел графика для синхронизации с инспектором';
+    return;
+  }
+
+  const usePentad = state.groupByPentad && days.length > 14;
+  const pentad = usePentad ? buildPentadSummary(days).find((p) => p.dayIds.includes(day.id)) : null;
+  const item = pentad || day;
+  const head = pentad ? `${pentad.label} (${pentad.dayCount} дн., средние)` : `${day.dayShort}, ${day.dateStr}`;
+  const dq = item.dataQuality || {};
+  const band = (lo, hi) =>
+    toFiniteNumber(lo) !== null && toFiniteNumber(hi) !== null
+      ? ` (P10–P90: ${formatTempCompact(lo)}…${formatTempCompact(hi)})`
+      : '';
+
+  let body;
+  if (state.activeTab === 'precip') {
+    const p75 = toFiniteNumber(item.precipP75Mm);
+    body = [
+      `осадки ${num(item.precipMm).toFixed(1)} мм${p75 !== null ? ` (P75 ${p75.toFixed(1)} мм)` : ''}`,
+      `снег ${formatSnowCm(item.snowDepthCm, dq.snowEstimated)} см${dq.snowEstimated ? ' (норма)' : ''}`,
+      `влажность ${dq.humidityEstimated ? '—' : `${Math.round(num(item.humidity))}%`}`,
+    ].join(' • ');
+  } else if (state.activeTab === 'wind') {
+    const pPair = getPressurePair(item);
+    const dp = toFiniteNumber(item.deltaP24hMm);
+    body = [
+      `ветер ${formatWind(item.windMs, item.windMph)} (пор. ${formatWind(item.gustMs, item.gustMph)}) ${item.windDirShort || '—'}`,
+      pPair.has
+        ? `давление ${pPair.mmText}${dp !== null ? ` (${pentad ? 'макс. суточный ' : ''}Δ ${formatSignedInt(dp)})` : ''}`
+        : 'давление: нет данных',
+    ].join(' • ');
+  } else if (state.activeTab === 'ops') {
+    const est = Boolean(dq.soilEstimated);
+    body = [
+      `почва 0/6/18/54 см: ${formatSoilCompact(item.soil0C, est)} / ${formatSoilCompact(item.soil6C, est)} / ${formatSoilCompact(item.soil18C, est)} / ${formatSoilCompact(item.soil54C, est)}${est ? ' (оценка)' : ''}`,
+      `точка росы ${approxMark(dq.humidityEstimated)}${formatTempCompact(item.dewPointC)}`,
+    ].join(' • ');
+  } else {
+    body = [
+      `Max ${formatTemp(item.maxC, item.maxF)}${band(item.maxP10C, item.maxP90C)}`,
+      `Min ${formatTemp(item.minC, item.minF)}${band(item.minP10C, item.minP90C)}`,
+      `норма ${formatTempCompact(item.climMinC)}…${formatTempCompact(item.climMaxC)}`,
+    ].join(' • ');
+  }
+  el.textContent = `${head} • ${body}`;
+  el.title = el.textContent;
 }
 
 // ============================================================================
@@ -1642,15 +1738,36 @@ function setTimeOfDayWindow(winKey) {
   updateAllViews();
 }
 
+const ANALYTICS_TABS = ['temp', 'precip', 'wind', 'ops'];
+
 function switchAnalyticsTab(tabKey) {
   state.activeTab = tabKey;
-  ['temp', 'precip', 'wind', 'ops'].forEach((t) => {
-    $(`tabBtn-${t}`)?.classList.toggle('is-active', t === tabKey);
-    $(`tabContent-${t}`)?.classList.toggle('hidden', t !== tabKey);
+  ANALYTICS_TABS.forEach((t) => {
+    const btn = $(`tabBtn-${t}`);
+    const isActive = t === tabKey;
+    if (btn) {
+      btn.classList.toggle('is-active', isActive);
+      btn.setAttribute('aria-selected', String(isActive));
+      // Roving tabindex: Tab enters the tab list once, arrow keys move between tabs
+      btn.setAttribute('tabindex', isActive ? '0' : '-1');
+    }
+    $(`tabContent-${t}`)?.classList.toggle('hidden', !isActive);
   });
   if (state.dirtyTabs[tabKey]) {
     renderAnalyticsTab(tabKey);
   }
+  renderChartSelectionSummary();
+}
+
+/** Selects a day and, if keyboard focus was inside `containerId`, returns it to the same day there. */
+function selectDayKeepingFocus(dayId, containerId) {
+  if (!dayId) return;
+  const container = $(containerId);
+  const hadFocus = Boolean(container && document.activeElement && container.contains(document.activeElement));
+  selectDay(dayId);
+  if (!hadFocus) return;
+  const again = [...container.querySelectorAll('[data-day-id]')].find((el) => el.dataset.dayId === dayId);
+  again?.focus?.({ preventScroll: true });
 }
 
 function buildTelegramSummaryText() {
@@ -1667,7 +1784,7 @@ function buildTelegramSummaryText() {
     `📡 Источник: ${ds.sourceLabel} | ${ds.syncedAt}`,
     ds.mos?.summaryRu ? `🎯 ${ds.mos.summaryRu}` : null,
     `🌡️ Сейчас: *${formatSignedC(cur.tempC)}* (ощущ. ${formatSignedC(cur.feelsC)}, Tw ${formatSignedC(cur.wetBulbC)}), ${cur.condRu}`,
-    `💨 Ветер: ${cur.windMs.toFixed(1)} м/с (пор. ${cur.gustMs.toFixed(1)}) ${cur.windDirShort} | 🧭 Давл. (${pPair.label}): ${pPair.mm} мм (Δ24ч ${formatSignedInt(cur.deltaP24hMm)})`,
+    `💨 Ветер: ${cur.windMs.toFixed(1)} м/с (пор. ${cur.gustMs.toFixed(1)}) ${cur.windDirShort} | 🧭 Давл. (${pPair.label}): ${pPair.mmText} (Δ24ч ${formatSignedInt(cur.deltaP24hMm)})`,
     `🌱 Почва 0/6/18/54см${cur.soilEstimated ? ' (≈ оценка)' : ''}: ${formatSignedC(cur.soil0C)} / ${formatSignedC(cur.soil6C)} / ${formatSignedC(cur.soil18C)} / ${formatSignedC(cur.soil54C)} | ❄️ Снег: ${formatSnowCm(cur.snowDepthCm, cur.snowEstimated)} см${cur.snowEstimated ? ' (норма)' : ''}`,
     `📅 Период (${firstDay.dateStr}–${lastDay.dateStr}, ${periodDays.length} сут., ${winCfg.shortLabel}):`,
     ...periodDays.slice(0, 10).map((d) =>
@@ -2007,7 +2124,7 @@ function bindEventListeners() {
   });
   $('forecastStripContainer')?.addEventListener('click', (e) => {
     const card = e.target?.closest?.('[data-day-id]');
-    if (card?.dataset?.dayId) selectDay(card.dataset.dayId);
+    if (card?.dataset?.dayId) selectDayKeepingFocus(card.dataset.dayId, 'forecastStripContainer');
   });
 
   // Day Inspector stepper
@@ -2017,6 +2134,18 @@ function bindEventListeners() {
   // Analytics Tabs & Model/Climatology Toggles & Table row clicks
   document.querySelectorAll('[data-tab]').forEach((btn) => {
     btn.addEventListener('click', () => switchAnalyticsTab(btn.dataset.tab));
+    btn.addEventListener('keydown', (e) => {
+      const idx = ANALYTICS_TABS.indexOf(btn.dataset.tab);
+      let next = -1;
+      if (e.key === 'ArrowRight') next = (idx + 1) % ANALYTICS_TABS.length;
+      else if (e.key === 'ArrowLeft') next = (idx - 1 + ANALYTICS_TABS.length) % ANALYTICS_TABS.length;
+      else if (e.key === 'Home') next = 0;
+      else if (e.key === 'End') next = ANALYTICS_TABS.length - 1;
+      if (next === -1) return;
+      e.preventDefault();
+      switchAnalyticsTab(ANALYTICS_TABS[next]);
+      $(`tabBtn-${ANALYTICS_TABS[next]}`)?.focus();
+    });
   });
   $('toggleModelLinesBtn')?.addEventListener('click', () => {
     state.showModelLines = !state.showModelLines;
@@ -2032,7 +2161,14 @@ function bindEventListeners() {
   });
   $('operationalTableBody')?.addEventListener('click', (e) => {
     const row = e.target?.closest?.('[data-day-id]');
-    if (row?.dataset?.dayId) selectDay(row.dataset.dayId);
+    if (row?.dataset?.dayId) selectDayKeepingFocus(row.dataset.dayId, 'operationalTableBody');
+  });
+  $('operationalTableBody')?.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    const row = e.target?.closest?.('tr[data-day-id]');
+    if (!row?.dataset?.dayId) return;
+    e.preventDefault();
+    selectDayKeepingFocus(row.dataset.dayId, 'operationalTableBody');
   });
 
   // Lazy Windy Radar
