@@ -372,6 +372,20 @@ test('static security, offline-first, single-location, and relative-path audit',
   assert.equal(/<iframe\b/i.test(indexHtml), false, 'index.html must NOT mount Windy iframe eagerly');
   assert.match(appJs, /embed\.windy\.com\/embed2\.html/);
   assert.match(appJs, /navigator\.serviceWorker\.register\(\s*['"]\.\/sw\.js['"]/);
+  assert.match(appJs, /updatefound/);
+  assert.match(appJs, /controllerchange/);
+  assert.match(appJs, /renderApiChannelsPanel/);
+  assert.match(appJs, /dirtyTabs/);
+});
+
+test('buildDynamicReferenceDataset generates seasonal offline data anchored on today', async () => {
+  const { buildDynamicReferenceDataset } = await import('../js/config.js');
+  const dsJan = buildDynamicReferenceDataset('2026-01-15');
+  const dsJul = buildDynamicReferenceDataset('2026-07-15');
+  assert.equal(dsJan.days[1].isoDate, '2026-01-15');
+  assert.ok(dsJan.days[1].maxC < -10, `January maxC should be winter cold, got ${dsJan.days[1].maxC}`);
+  assert.equal(dsJul.days[1].isoDate, '2026-07-15');
+  assert.ok(dsJul.days[1].maxC > 20, `July maxC should be summer warm, got ${dsJul.days[1].maxC}`);
 });
 
 test('storage.js roundtrips prefs, API keys, cache, and 5-slot archive LRU; api.js aggregates ensemble quantiles', async () => {

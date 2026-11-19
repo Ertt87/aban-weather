@@ -161,29 +161,85 @@ export function getAbanClimatology(dateIso) {
 }
 
 // ============================================================================
-// COLD OFFLINE FALLBACK ONLY (REFERENCE_DATASET v4)
-// NEVER merged into live API payloads. Used solely when offline & cache is empty.
+// DYNAMIC SEASONAL COLD-OFFLINE FALLBACK (REFERENCE_DATASET v4)
+// NEVER merged into live API payloads. Anchored on today's date in Aban (UTC+7)
+// using WMO 29485 2-harmonic climatology so winter/summer starts stay realistic.
 // ============================================================================
 const REF_DIR_MAP = {
     'С': 'Северный', 'СВ': 'Северо-Восточный', 'В': 'Восточный', 'ЮВ': 'Юго-Восточный',
     'Ю': 'Южный', 'ЮЗ': 'Юго-Западный', 'З': 'Западный', 'СЗ': 'Северо-Западный'
 };
 
-const REF_PROFILES = [
-    { isoDate: '2026-10-17', dayShort: 'Сб', dateStr: '17 окт', label: 'Вчера (Архив)', maxC: 3.9, minC: -5.0, humidity: 72, uv: 1, precipDay: 5, precipNight: 0, precipMm: 0.0, rainMm: 0.0, snowMm: 0.0, snowDepthCm: 0.0, windMs: 2.7, gustMs: 5.1, windDeg: 135, windDirShort: 'ЮВ', soil0C: 0.2, soil6C: 0.9, soil18C: 2.2, soil54C: 4.9, dewPointC: -4.1, cloudCoverPct: 14, pressureStationHpa: 1006, dayCond: 'Ясно (Антициклон)', dayCondEn: 'Sunny', nightCond: 'Ясно, морозно', nightCondEn: 'Clear', iconType: 'sunny', nightIconType: 'clear-night', precipDayType: 'снег', precipNightType: 'снег' },
-    { isoDate: '2026-10-18', dayShort: 'Вс', dateStr: '18 окт', label: 'Сегодня', maxC: 5.6, minC: -3.9, humidity: 68, uv: 1, precipDay: 5, precipNight: 5, precipMm: 0.0, rainMm: 0.0, snowMm: 0.0, snowDepthCm: 0.0, windMs: 3.1, gustMs: 6.0, windDeg: 135, windDirShort: 'ЮВ', soil0C: 0.9, soil6C: 1.4, soil18C: 2.6, soil54C: 4.8, dewPointC: -3.0, cloudCoverPct: 12, pressureStationHpa: 1004, dayCond: 'Ясно', dayCondEn: 'Sunny', nightCond: 'Ясно с прояснениями', nightCondEn: 'Mostly clear', iconType: 'sunny', nightIconType: 'clear-night', precipDayType: 'снег', precipNightType: 'снег' },
-    { isoDate: '2026-10-19', dayShort: 'Пн', dateStr: '19 окт', label: 'Завтра', maxC: 7.8, minC: 0.6, humidity: 58, uv: 1, precipDay: 0, precipNight: 5, precipMm: 0.0, rainMm: 0.0, snowMm: 0.0, snowDepthCm: 0.0, windMs: 4.5, gustMs: 8.4, windDeg: 225, windDirShort: 'ЮЗ', soil0C: 2.3, soil6C: 2.0, soil18C: 2.7, soil54C: 4.7, dewPointC: -0.9, cloudCoverPct: 24, pressureStationHpa: 999, dayCond: 'Ясно и тепло', dayCondEn: 'Sunny & Warm', nightCond: 'Переменная облачность', nightCondEn: 'Partly cloudy', iconType: 'sunny', nightIconType: 'partly-cloudy-night', precipDayType: 'дождь', precipNightType: 'дождь' },
-    { isoDate: '2026-10-20', dayShort: 'Вт', dateStr: '20 окт', label: 'Вт', maxC: 6.1, minC: 1.1, humidity: 63, uv: 1, precipDay: 10, precipNight: 15, precipMm: 0.4, rainMm: 0.4, snowMm: 0.0, snowDepthCm: 0.0, windMs: 5.4, gustMs: 9.8, windDeg: 225, windDirShort: 'ЮЗ', soil0C: 2.6, soil6C: 2.4, soil18C: 2.9, soil54C: 4.6, dewPointC: 0.2, cloudCoverPct: 48, pressureStationHpa: 994, dayCond: 'Малооблачно', dayCondEn: 'Mostly sunny', nightCond: 'Облачно с прояснениями', nightCondEn: 'Mostly cloudy', iconType: 'mostly-sunny', nightIconType: 'partly-cloudy-night', precipDayType: 'дождь', precipNightType: 'дождь' },
-    { isoDate: '2026-10-21', dayShort: 'Ср', dateStr: '21 окт', label: 'Ср', maxC: 4.4, minC: -2.8, humidity: 74, uv: 0, precipDay: 30, precipNight: 25, precipMm: 1.8, rainMm: 1.1, snowMm: 0.7, snowDepthCm: 0.5, windMs: 6.7, gustMs: 11.8, windDeg: 225, windDirShort: 'ЮЗ', soil0C: 1.5, soil6C: 1.9, soil18C: 2.8, soil54C: 4.5, dewPointC: -1.1, cloudCoverPct: 86, pressureStationHpa: 989, dayCond: 'Облачно, небольшой дождь', dayCondEn: 'Light rain', nightCond: 'Переход в снег', nightCondEn: 'Rain to snow', iconType: 'rain-cloudy', nightIconType: 'snow', precipDayType: 'дождь', precipNightType: 'снег' },
-    { isoDate: '2026-10-22', dayShort: 'Чт', dateStr: '22 окт', label: 'Чт', maxC: 1.1, minC: -6.1, humidity: 71, uv: 0, precipDay: 15, precipNight: 10, precipMm: 0.5, rainMm: 0.0, snowMm: 0.5, snowDepthCm: 1.0, windMs: 4.9, gustMs: 8.6, windDeg: 225, windDirShort: 'ЮЗ', soil0C: -0.4, soil6C: 0.8, soil18C: 2.3, soil54C: 4.4, dewPointC: -4.8, cloudCoverPct: 54, pressureStationHpa: 997, dayCond: 'Переменная облачность', dayCondEn: 'Partly sunny', nightCond: 'Ясно, выхолаживание', nightCondEn: 'Clear & Cold', iconType: 'partly-sunny', nightIconType: 'clear-night', precipDayType: 'снег', precipNightType: 'снег' },
-    { isoDate: '2026-10-23', dayShort: 'Пт', dateStr: '23 окт', label: 'Пт', maxC: 2.8, minC: -3.3, humidity: 75, uv: 0, precipDay: 10, precipNight: 10, precipMm: 0.3, rainMm: 0.0, snowMm: 0.3, snowDepthCm: 1.1, windMs: 4.5, gustMs: 7.9, windDeg: 225, windDirShort: 'ЮЗ', soil0C: -0.1, soil6C: 0.6, soil18C: 2.0, soil54C: 4.3, dewPointC: -3.2, cloudCoverPct: 62, pressureStationHpa: 1001, dayCond: 'Переменная облачность', dayCondEn: 'Partly sunny', nightCond: 'Облачно с прояснениями', nightCondEn: 'Mostly cloudy', iconType: 'partly-sunny', nightIconType: 'partly-cloudy-night', precipDayType: 'снег', precipNightType: 'снег' },
-    { isoDate: '2026-10-24', dayShort: 'Сб', dateStr: '24 окт', label: 'Сб (Вых.)', maxC: 1.7, minC: -4.4, humidity: 82, uv: 0, precipDay: 35, precipNight: 25, precipMm: 1.6, rainMm: 0.0, snowMm: 1.6, snowDepthCm: 2.4, windMs: 5.2, gustMs: 9.4, windDeg: 270, windDirShort: 'З', soil0C: -0.3, soil6C: 0.4, soil18C: 1.8, soil54C: 4.2, dewPointC: -3.6, cloudCoverPct: 88, pressureStationHpa: 993, dayCond: 'Небольшой снег', dayCondEn: 'Light snow', nightCond: 'Снежные заряды', nightCondEn: 'Snow showers', iconType: 'snow', nightIconType: 'snow', precipDayType: 'снег', precipNightType: 'снег' },
-    { isoDate: '2026-10-25', dayShort: 'Вс', dateStr: '25 окт', label: 'Вс (Вых.)', maxC: 0.6, minC: -6.7, humidity: 74, uv: 1, precipDay: 10, precipNight: 5, precipMm: 0.1, rainMm: 0.0, snowMm: 0.1, snowDepthCm: 2.4, windMs: 3.6, gustMs: 6.5, windDeg: 315, windDirShort: 'СЗ', soil0C: -0.8, soil6C: 0.1, soil18C: 1.5, soil54C: 4.0, dewPointC: -5.4, cloudCoverPct: 28, pressureStationHpa: 1005, dayCond: 'Малооблачно', dayCondEn: 'Mostly sunny', nightCond: 'Морозно и ясно', nightCondEn: 'Clear & Frosty', iconType: 'mostly-sunny', nightIconType: 'clear-night', precipDayType: 'снег', precipNightType: 'снег' },
-    { isoDate: '2026-10-26', dayShort: 'Пн', dateStr: '26 окт', label: 'Пн', maxC: 2.2, minC: -3.9, humidity: 76, uv: 1, precipDay: 15, precipNight: 15, precipMm: 0.4, rainMm: 0.0, snowMm: 0.4, snowDepthCm: 2.5, windMs: 4.1, gustMs: 7.4, windDeg: 270, windDirShort: 'З', soil0C: -0.5, soil6C: 0.1, soil18C: 1.4, soil54C: 3.9, dewPointC: -3.8, cloudCoverPct: 58, pressureStationHpa: 1002, dayCond: 'Переменная облачность', dayCondEn: 'Partly sunny', nightCond: 'Облачно с прояснениями', nightCondEn: 'Mostly cloudy', iconType: 'partly-sunny', nightIconType: 'partly-cloudy-night', precipDayType: 'снег', precipNightType: 'снег' },
-    { isoDate: '2026-10-27', dayShort: 'Вт', dateStr: '27 окт', label: 'Вт', maxC: 1.1, minC: -5.0, humidity: 80, uv: 0, precipDay: 25, precipNight: 20, precipMm: 1.1, rainMm: 0.0, snowMm: 1.1, snowDepthCm: 3.3, windMs: 4.4, gustMs: 8.1, windDeg: 270, windDirShort: 'З', soil0C: -0.6, soil6C: 0.0, soil18C: 1.3, soil54C: 3.8, dewPointC: -4.2, cloudCoverPct: 82, pressureStationHpa: 998, dayCond: 'Облачно с прояснениями', dayCondEn: 'Mostly cloudy', nightCond: 'Небольшой снег', nightCondEn: 'Light snow', iconType: 'cloudy-snow', nightIconType: 'snow', precipDayType: 'снег', precipNightType: 'снег' }
-];
+const REF_WEEKDAYS = ['Вс', 'Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб'];
+const REF_MONTHS = ['янв', 'фев', 'мар', 'апр', 'мая', 'июн', 'июл', 'авг', 'сен', 'окт', 'ноя', 'дек'];
 
-function buildReferenceDays() {
+function getAbanNowIsoAndHour() {
+    try {
+        const now = new Date();
+        const isoDate = new Intl.DateTimeFormat('en-CA', {
+            timeZone: ABAN_COORDS.tz || 'Asia/Krasnoyarsk',
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit'
+        }).format(now);
+        const hourStr = new Intl.DateTimeFormat('en-GB', {
+            timeZone: ABAN_COORDS.tz || 'Asia/Krasnoyarsk',
+            hour: '2-digit',
+            hour12: false
+        }).format(now);
+        return { isoDate, hour: Math.min(23, Math.max(0, Number(hourStr === '24' ? 0 : hourStr) || 12)) };
+    } catch (_) {
+        const d = new Date(Date.now() + ABAN_COORDS.utcOffsetHours * 3600000);
+        return { isoDate: d.toISOString().slice(0, 10), hour: d.getUTCHours() };
+    }
+}
+
+function addDaysIsoUtc(isoDate, deltaDays) {
+    const [y, m, d] = String(isoDate).split('-').map(Number);
+    return new Date(Date.UTC(y, m - 1, d + deltaDays)).toISOString().slice(0, 10);
+}
+
+function computeAbanRefAstronomy(isoDate) {
+    const doy = getDayOfYear(isoDate);
+    const gamma = ((2 * Math.PI) / 365) * (doy - 1);
+    const eqTime =
+        229.18 *
+        (0.000075 + 0.001868 * Math.cos(gamma) - 0.032077 * Math.sin(gamma) - 0.014615 * Math.cos(2 * gamma) - 0.040849 * Math.sin(2 * gamma));
+    const decl =
+        0.006918 - 0.399912 * Math.cos(gamma) + 0.070257 * Math.sin(gamma) - 0.006758 * Math.cos(2 * gamma) + 0.000907 * Math.sin(2 * gamma) - 0.002697 * Math.cos(3 * gamma) + 0.00148 * Math.sin(3 * gamma);
+    const latRad = (ABAN_COORDS.lat * Math.PI) / 180;
+    const haDeg = (zen) => {
+        const cosH = Math.cos((zen * Math.PI) / 180) / (Math.cos(latRad) * Math.cos(decl)) - Math.tan(latRad) * Math.tan(decl);
+        return (Math.acos(Math.max(-1, Math.min(1, cosH))) * 180) / Math.PI;
+    };
+    const noonMin = 720 - 4 * ABAN_COORDS.lon - eqTime + ABAN_COORDS.utcOffsetHours * 60;
+    const haSun = haDeg(90.833);
+    const haCiv = haDeg(96.0);
+    const fmt = (hr) => {
+        const w = ((hr % 24) + 24) % 24;
+        let hh = Math.floor(w);
+        let mm = Math.round((w - hh) * 60);
+        if (mm >= 60) { mm = 0; hh = (hh + 1) % 24; }
+        return `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}`;
+    };
+    const sunriseHour = +((noonMin - 4 * haSun) / 60).toFixed(2);
+    const sunsetHour = +((noonMin + 4 * haSun) / 60).toFixed(2);
+    return {
+        sunriseStr: fmt(sunriseHour),
+        sunsetStr: fmt(sunsetHour),
+        dawnStr: fmt((noonMin - 4 * haCiv) / 60),
+        duskStr: fmt((noonMin + 4 * haCiv) / 60),
+        sunriseHour,
+        sunsetHour,
+        daylightHours: +Math.max(0, sunsetHour - sunriseHour).toFixed(2)
+    };
+}
+
+export function buildDynamicReferenceDataset(baseIsoDate = null) {
+    const nowParts = getAbanNowIsoAndHour();
+    const todayIso = baseIsoDate || nowParts.isoDate;
+    const curHour = nowParts.hour;
+
     const toF = (c) => Math.round((c * 9) / 5 + 32);
     const toMph = (ms) => Math.round(ms * 2.23694);
     const toMm = (hpa) => Math.round(hpa * 0.750062);
@@ -192,37 +248,90 @@ function buildReferenceDays() {
         0.28, 0.46, 0.64, 0.80, 0.92, 0.98, 1.0, 0.96,
         0.86, 0.72, 0.56, 0.44, 0.36, 0.31, 0.27, 0.24
     ];
+    const wavePattern = [-0.6, 0.0, 1.1, 0.4, -1.4, -2.1, -0.8, 0.3, 1.2, -0.5, -1.2];
+    const windDirs = [
+        { deg: 135, s: 'ЮВ' }, { deg: 135, s: 'ЮВ' }, { deg: 225, s: 'ЮЗ' },
+        { deg: 225, s: 'ЮЗ' }, { deg: 225, s: 'ЮЗ' }, { deg: 270, s: 'З' },
+        { deg: 225, s: 'ЮЗ' }, { deg: 270, s: 'З' }, { deg: 315, s: 'СЗ' },
+        { deg: 270, s: 'З' }, { deg: 270, s: 'З' }
+    ];
 
-    return REF_PROFILES.map((p, idx) => {
+    const days = [];
+    for (let idx = 0; idx < 11; idx++) {
         const offset = idx - 1;
         const isArchive = offset < 0;
-        const clim = getAbanClimatology(p.isoDate);
-        const stationMm = toMm(p.pressureStationHpa);
-        const mslHpa = Math.round(p.pressureStationHpa / Math.exp((-0.034163 * ABAN_COORDS.elev) / (273.15 + (p.maxC + p.minC) / 2 + 0.00325 * ABAN_COORDS.elev)));
+        const isoDate = addDaysIsoUtc(todayIso, offset);
+        const dtUtc = new Date(`${isoDate}T00:00:00Z`);
+        const dow = dtUtc.getUTCDay();
+        const dayShort = REF_WEEKDAYS[dow];
+        const dateStr = `${dtUtc.getUTCDate()} ${REF_MONTHS[dtUtc.getUTCMonth()]}`;
+        const year = dtUtc.getUTCFullYear();
+
+        const clim = getAbanClimatology(isoDate);
+        const wave = wavePattern[idx];
+        const maxC = +(clim.climMaxC + wave).toFixed(1);
+        const minC = +(clim.climMinC + wave * 0.9).toFixed(1);
+        const meanC = +((maxC + minC) / 2).toFixed(1);
+
+        const isWetDay = idx === 4 || idx === 7 || idx === 10;
+        const precipMm = isWetDay ? +(Math.max(0.8, clim.climPrecipMm * 1.4)).toFixed(1) : (idx === 3 || idx === 6 ? 0.3 : 0.0);
+        const precipDay = isWetDay ? 35 : (precipMm > 0 ? 15 : 5);
+        const precipNight = isWetDay ? 25 : (precipMm > 0 ? 10 : 5);
+        const isFreezing = meanC <= 0.5;
+        const snowMm = isFreezing ? precipMm : 0.0;
+        const rainMm = isFreezing ? 0.0 : precipMm;
+        const snowDepthCm = +(Math.max(0, clim.climSnowDepthCm + (snowMm > 0 ? snowMm * 0.4 : 0))).toFixed(1);
+        const precipPhase = precipMm <= 0 ? 'dry' : (isFreezing ? 'snow' : 'rain');
+        const precipTypeRu = isFreezing ? 'снег' : 'дождь';
+
+        const windMs = +(2.6 + (isWetDay ? 2.4 : 0.9) + (idx % 3) * 0.4).toFixed(1);
+        const gustMs = +(windMs * 1.8).toFixed(1);
+        const wDir = windDirs[idx];
+        const cloudCoverPct = isWetDay ? 84 : (idx === 0 || idx === 1 || idx === 8 ? 16 : 52);
+        const humidity = Math.round(Math.min(92, Math.max(44, isWetDay ? 82 : 68 + (isFreezing ? 8 : -4))));
+        const dewPointC = +(meanC - (100 - humidity) / 5).toFixed(1);
+
+        const mslHpa = Math.round(1019 - (isWetDay ? 11 : 0) + (idx === 0 || idx === 8 ? 9 : 0));
+        const baroFactor = (0.034163 * ABAN_COORDS.elev) / Math.max(180, meanC + 273.15 + 0.00325 * ABAN_COORDS.elev);
+        const stationHpa = Math.round(mslHpa * Math.exp(-baroFactor));
+        const stationMm = toMm(stationHpa);
         const mslMm = toMm(mslHpa);
-        const prevStationMm = idx > 0 ? toMm(REF_PROFILES[idx - 1].pressureStationHpa) : stationMm;
-        const spread = isArchive ? 0 : +(0.5 + offset * 0.12).toFixed(1);
-        const sunriseHour = +(7.52 + idx * 0.03).toFixed(2);
-        const sunsetHour = +(17.65 - idx * 0.035).toFixed(2);
-        const fmtHm = (hr) => {
-            const h = Math.floor(hr);
-            const m = Math.round((hr - h) * 60);
-            return `${String(h).padStart(2, '0')}:${String(m === 60 ? 59 : m).padStart(2, '0')}`;
-        };
+
+        const soil0C = +(meanC * 0.65).toFixed(1);
+        const soil6C = +(soil0C * 0.8 + 0.4).toFixed(1);
+        const soil18C = +(soil6C * 0.75 + 0.9).toFixed(1);
+        const soil54C = +(soil18C * 0.6 + 1.8).toFixed(1);
+
+        const astronomy = computeAbanRefAstronomy(isoDate);
+        const uv = Math.max(0, Math.min(8, Math.round((astronomy.daylightHours - 6) * 0.5)));
+        const spread = isArchive ? 0 : +(0.5 + offset * 0.14).toFixed(1);
+
+        let dayCond = 'Переменная облачность';
+        let nightCond = 'Облачно с прояснениями';
+        let iconType = 'partly-sunny';
+        let nightIconType = 'partly-cloudy-night';
+        if (isWetDay) {
+            dayCond = isFreezing ? 'Небольшой снег' : 'Небольшой дождь';
+            nightCond = isFreezing ? 'Снежные заряды' : 'Дождь ночью';
+            iconType = isFreezing ? 'snow' : 'rain-cloudy';
+            nightIconType = isFreezing ? 'snow' : 'rain-cloudy';
+        } else if (cloudCoverPct <= 25) {
+            dayCond = 'Ясно (Антициклон)';
+            nightCond = isFreezing ? 'Ясно, морозно' : 'Ясно';
+            iconType = 'sunny';
+            nightIconType = 'clear-night';
+        }
 
         const hours = diurnalShape.map((w, h) => {
-            const tempC = +(p.minC + w * (p.maxC - p.minC)).toFixed(1);
-            const windMs = +(p.windMs * (0.76 + 0.34 * w)).toFixed(1);
-            const gustMs = +(p.gustMs * (0.76 + 0.34 * w)).toFixed(1);
-            const feelsC = +(tempC <= 10 && windMs >= 1.3
-                ? 13.12 + 0.6215 * tempC - 11.37 * Math.pow(windMs * 3.6, 0.16) + 0.3965 * tempC * Math.pow(windMs * 3.6, 0.16)
-                : tempC - 1.8).toFixed(1);
-            const hum = Math.round(Math.min(96, Math.max(38, p.humidity + (1 - w) * 14 - w * 10)));
-            const isDay = h >= sunriseHour && h <= sunsetHour;
-            const slotPrecipProb = isDay ? p.precipDay : p.precipNight;
-            const slotPrecipMm = p.precipMm > 0 && ((isDay && p.precipDay >= 15) || (!isDay && p.precipNight >= 15))
-                ? +(p.precipMm / 12).toFixed(2)
-                : 0;
+            const tempC = +(minC + w * (maxC - minC)).toFixed(1);
+            const hWind = +(windMs * (0.76 + 0.34 * w)).toFixed(1);
+            const hGust = +(gustMs * (0.76 + 0.34 * w)).toFixed(1);
+            const feelsC = +(tempC <= 10 && hWind >= 1.3
+                ? 13.12 + 0.6215 * tempC - 11.37 * Math.pow(hWind * 3.6, 0.16) + 0.3965 * tempC * Math.pow(hWind * 3.6, 0.16)
+                : tempC - 0.8).toFixed(1);
+            const hum = Math.round(Math.min(96, Math.max(38, humidity + (1 - w) * 12 - w * 10)));
+            const isDay = h >= astronomy.sunriseHour && h <= astronomy.sunsetHour;
+            const slotPrecipMm = precipMm > 0 && isWetDay && h >= 10 && h <= 18 ? +(precipMm / 9).toFixed(2) : 0;
             const phase = slotPrecipMm <= 0 ? 'dry' : (tempC <= 0.5 ? 'snow' : 'rain');
             return {
                 hour: h,
@@ -231,199 +340,210 @@ function buildReferenceDays() {
                 tempF: toF(tempC),
                 feelsC,
                 wetBulbC: +(tempC - (100 - hum) * 0.07).toFixed(1),
-                dewPointC: p.dewPointC,
+                dewPointC,
                 humidity: hum,
                 precipMm: slotPrecipMm,
-                precipProb: slotPrecipProb,
+                precipProb: isDay ? precipDay : precipNight,
                 precipPhase: phase,
-                windMs,
-                windMph: toMph(windMs),
-                gustMs,
-                windDirShort: p.windDirShort,
+                windMs: hWind,
+                windMph: toMph(hWind),
+                gustMs: hGust,
+                windDirShort: wDir.s,
                 pressureStationMm: stationMm,
                 pressureMslMm: mslMm,
-                cloudCoverPct: p.cloudCoverPct,
-                soil0C: +(p.soil0C + (w - 0.5) * 0.8).toFixed(1),
-                iconType: isDay ? p.iconType : p.nightIconType
+                cloudCoverPct,
+                soil0C: +(soil0C + (w - 0.5) * 0.7).toFixed(1),
+                iconType: isDay ? iconType : nightIconType
             };
         });
 
-        const invActive = p.cloudCoverPct <= 30 && p.windMs <= 3.6;
-        const invDelta = invActive ? +(2.2 * (p.snowDepthCm > 0 ? 1.25 : 1.0)).toFixed(1) : 0;
-        const nextProf = REF_PROFILES[idx + 1] || p;
+        const invActive = cloudCoverPct <= 30 && windMs <= 3.6;
+        const invDelta = invActive ? +(2.2 * (snowDepthCm > 0 ? 1.25 : 1.0)).toFixed(1) : 0;
+        const isWeekend = dow === 0 || dow === 6;
+        const label = offset === -1 ? 'Вчера (Архив)' : offset === 0 ? 'Сегодня' : offset === 1 ? 'Завтра' : (isWeekend ? `${dayShort} (Вых.)` : dayShort);
 
-        return {
-            id: `day_${p.isoDate}`,
+        days.push({
+            id: `day_${isoDate}`,
             idx,
-            isoDate: p.isoDate,
+            isoDate,
             offsetFromToday: offset,
-            dayShort: p.dayShort,
-            dateStr: p.dateStr,
-            fullDateLabel: `${p.dayShort}, ${p.dateStr} 2026${isArchive ? ' (Архив)' : offset === 0 ? ' (Сегодня)' : ''}`,
-            label: p.label,
+            dayShort,
+            dateStr,
+            fullDateLabel: `${dayShort}, ${dateStr} ${year}${isArchive ? ' (Архив)' : offset === 0 ? ' (Сегодня)' : ''}`,
+            label,
             zone: isArchive ? 'archive' : 'deterministic',
             confidencePct: isArchive ? 99 : Math.round(93 - offset * 1.6),
             isArchive,
-            dayCond: p.dayCond,
-            dayCondEn: p.dayCondEn,
-            nightCond: p.nightCond,
-            nightCondEn: p.nightCondEn,
-            iconType: p.iconType,
-            nightIconType: p.nightIconType,
-            maxC: p.maxC,
-            maxF: toF(p.maxC),
-            minC: p.minC,
-            minF: toF(p.minC),
-            maxP10C: +(p.maxC - spread).toFixed(1),
-            maxP25C: +(p.maxC - spread * 0.5).toFixed(1),
-            maxP75C: +(p.maxC + spread * 0.5).toFixed(1),
-            maxP90C: +(p.maxC + spread).toFixed(1),
-            minP10C: +(p.minC - spread).toFixed(1),
-            minP25C: +(p.minC - spread * 0.5).toFixed(1),
-            minP75C: +(p.minC + spread * 0.5).toFixed(1),
-            minP90C: +(p.minC + spread).toFixed(1),
+            dayCond,
+            dayCondEn: dayCond,
+            nightCond,
+            nightCondEn: nightCond,
+            iconType,
+            nightIconType,
+            maxC,
+            maxF: toF(maxC),
+            minC,
+            minF: toF(minC),
+            maxP10C: +(maxC - spread).toFixed(1),
+            maxP25C: +(maxC - spread * 0.5).toFixed(1),
+            maxP75C: +(maxC + spread * 0.5).toFixed(1),
+            maxP90C: +(maxC + spread).toFixed(1),
+            minP10C: +(minC - spread).toFixed(1),
+            minP25C: +(minC - spread * 0.5).toFixed(1),
+            minP75C: +(minC + spread * 0.5).toFixed(1),
+            minP90C: +(minC + spread).toFixed(1),
             climMaxC: clim.climMaxC,
             climMinC: clim.climMinC,
-            climAnomalyC: +((((p.maxC + p.minC) / 2) - clim.climMeanC)).toFixed(1),
-            humidity: p.humidity,
-            uv: p.uv,
-            precipDay: p.precipDay,
-            precipNight: p.precipNight,
-            precipDayType: p.precipDayType,
-            precipNightType: p.precipNightType,
-            precipMm: p.precipMm,
-            precipP75Mm: +(p.precipMm * 1.35).toFixed(1),
-            rainMm: p.rainMm,
-            snowMm: p.snowMm,
-            snowDepthCm: p.snowDepthCm,
-            precipPhase: p.precipMm <= 0 ? 'dry' : (p.snowMm >= p.rainMm ? 'snow' : 'rain'),
-            windMs: p.windMs,
-            windMph: toMph(p.windMs),
-            gustMs: p.gustMs,
-            gustMph: toMph(p.gustMs),
-            windDirShort: p.windDirShort,
-            windDirFull: REF_DIR_MAP[p.windDirShort] || 'Западный',
-            windDeg: p.windDeg,
-            soil0C: p.soil0C,
-            soil6C: p.soil6C,
-            soil18C: p.soil18C,
-            soil54C: p.soil54C,
-            soilTempC: p.soil0C,
-            dewPointC: p.dewPointC,
-            cloudCoverPct: p.cloudCoverPct,
-            pressureStationHpa: p.pressureStationHpa,
+            climAnomalyC: +(meanC - clim.climMeanC).toFixed(1),
+            humidity,
+            uv,
+            precipDay,
+            precipNight,
+            precipDayType: precipTypeRu,
+            precipNightType: precipTypeRu,
+            precipMm,
+            precipP75Mm: +(precipMm * 1.35).toFixed(1),
+            rainMm,
+            snowMm,
+            snowDepthCm,
+            precipPhase,
+            windMs,
+            windMph: toMph(windMs),
+            gustMs,
+            gustMph: toMph(gustMs),
+            windDirShort: wDir.s,
+            windDirFull: REF_DIR_MAP[wDir.s] || 'Западный',
+            windDeg: wDir.deg,
+            soil0C,
+            soil6C,
+            soil18C,
+            soil54C,
+            soilTempC: soil0C,
+            dewPointC,
+            cloudCoverPct,
+            pressureStationHpa: stationHpa,
             pressureStationMm: stationMm,
             pressureMslHpa: mslHpa,
             pressureMslMm: mslMm,
-            deltaP24hMm: stationMm - prevStationMm,
-            astronomy: {
-                sunriseStr: fmtHm(sunriseHour),
-                sunsetStr: fmtHm(sunsetHour),
-                dawnStr: fmtHm(sunriseHour - 0.65),
-                duskStr: fmtHm(sunsetHour + 0.65),
-                sunriseHour,
-                sunsetHour,
-                daylightHours: +(sunsetHour - sunriseHour).toFixed(2)
-            },
+            deltaP24hMm: 0,
+            astronomy,
             inversion: {
                 active: invActive,
                 deltaC: invDelta,
-                valleyMinC: +(p.minC - invDelta).toFixed(1),
+                valleyMinC: +(minC - invDelta).toFixed(1),
                 noteRu: invActive
                     ? `Ясная тихая ночь в Абанской котловине: возможно выхолаживание на ${invDelta.toFixed(1)}°C ниже`
                     : 'Перемешивание воздуха: котловинная инверсия ослаблена'
             },
-            nextNightMinC: nextProf.minC,
-            nextNightMinF: toF(nextProf.minC),
-            nextNightMaxC: +(nextProf.minC + 2.5).toFixed(1),
-            nextNightMaxF: toF(nextProf.minC + 2.5),
-            nextNightPrecipProb: p.precipNight,
-            nextNightPrecipMm: +(p.precipMm * 0.4).toFixed(1),
-            nextNightPrecipType: p.precipNightType,
-            nextNightWindMs: +(p.windMs * 0.85).toFixed(1),
-            nextNightGustMs: +(p.gustMs * 0.85).toFixed(1),
-            nextNightWindDirShort: p.windDirShort,
-            nextNightCond: p.nightCond,
-            nextNightIconType: p.nightIconType,
-            probFrostBelowMinus20: p.minC <= -20 ? 85 : 0,
-            probSnowOver5mm: p.snowMm >= 5 ? 70 : (p.snowMm >= 1.5 ? 18 : 2),
-            modelBreakdown: {
-                google_wn3: { maxC: p.maxC, minC: p.minC, precipMm: p.precipMm, windMs: p.windMs }
-            },
+            nextNightMinC: minC,
+            nextNightMinF: toF(minC),
+            nextNightMaxC: +(minC + 2.5).toFixed(1),
+            nextNightMaxF: toF(minC + 2.5),
+            nextNightPrecipProb: precipNight,
+            nextNightPrecipMm: +(precipMm * 0.4).toFixed(1),
+            nextNightPrecipType: precipTypeRu,
+            nextNightWindMs: +(windMs * 0.85).toFixed(1),
+            nextNightGustMs: +(gustMs * 0.85).toFixed(1),
+            nextNightWindDirShort: wDir.s,
+            nextNightCond: nightCond,
+            nextNightIconType: nightIconType,
+            probFrostBelowMinus20: minC <= -20 ? 85 : 0,
+            probSnowOver5mm: snowMm >= 5 ? 70 : (snowMm >= 1.5 ? 18 : 2),
+            modelBreakdown: {},
             hours
-        };
-    });
+        });
+    }
+
+    for (let i = 1; i < days.length; i++) {
+        days[i].deltaP24hMm = days[i].pressureStationMm - days[i - 1].pressureStationMm;
+        days[i - 1].nextNightMinC = days[i].minC;
+        days[i - 1].nextNightMinF = days[i].minF;
+    }
+
+    const today = days[1];
+    const tomorrow = days[2];
+    const slot = today.hours[curHour] || today.hours[12];
+    const shiftHour = curHour < 8 ? 8 : (curHour < 20 ? 20 : 8);
+    const shiftDay = curHour >= 20 ? tomorrow : today;
+    const shiftSlot = shiftDay.hours[shiftHour] || slot;
+    const h3 = (curHour + 3) % 24;
+    const h3Day = curHour + 3 >= 24 ? tomorrow : today;
+    const h3Slot = h3Day.hours[h3] || shiftSlot;
+
+    return {
+        version: 4,
+        sourceType: 'reference_wn3',
+        sourceLabel: 'Сезонный эталон ВМО 29485 (Офлайн, Абан)',
+        syncedAt: `${today.dateStr}, ${String(curHour).padStart(2, '0')}:00 (UTC+7)`,
+        latencyMs: 0,
+        activeModels: [],
+        channels: {},
+        errors: {},
+        mos: {
+            models: {},
+            bestModelId: null,
+            summaryRu: 'Сезонный автономный эталон ВМО 29485 (подключите сеть или API-ключ для калибровки MOS)'
+        },
+        airQuality: {
+            pm25: null,
+            pm10: null,
+            co: null,
+            aqi: null,
+            statusRu: 'Офлайн',
+            smogRisk: 'unknown'
+        },
+        current: {
+            tempC: slot.tempC,
+            tempF: slot.tempF,
+            feelsC: slot.feelsC,
+            feelsF: toF(slot.feelsC),
+            wetBulbC: slot.wetBulbC,
+            condRu: today.dayCond,
+            iconType: slot.iconType,
+            windMs: slot.windMs,
+            windMph: slot.windMph,
+            gustMs: slot.gustMs,
+            gustMph: toMph(slot.gustMs),
+            windDeg: today.windDeg,
+            windDirShort: today.windDirShort,
+            precipProb: slot.precipProb,
+            precipMm: slot.precipMm,
+            precipPhase: slot.precipPhase,
+            snowDepthCm: today.snowDepthCm,
+            humidity: slot.humidity,
+            dewPointC: today.dewPointC,
+            cloudCoverPct: today.cloudCoverPct,
+            soil0C: slot.soil0C,
+            soil6C: today.soil6C,
+            soil18C: today.soil18C,
+            soil54C: today.soil54C,
+            pressureStationHpa: today.pressureStationHpa,
+            pressureStationMm: today.pressureStationMm,
+            pressureMslHpa: today.pressureMslHpa,
+            pressureMslMm: today.pressureMslMm,
+            deltaP3hMm: 0,
+            deltaP24hMm: today.deltaP24hMm,
+            uv: today.uv,
+            obsTimeLabel: `п. Абан • ${today.dateStr}, ${String(curHour).padStart(2, '0')}:00 (UTC+7)`
+        },
+        controlPoint: {
+            targetLabel: `Смена ${String(shiftHour).padStart(2, '0')}:00${curHour >= 20 ? ' (завтра)' : ''}`,
+            tempC: shiftSlot.tempC,
+            tempF: shiftSlot.tempF,
+            feelsC: shiftSlot.feelsC,
+            condRu: shiftDay.dayCond,
+            badgeRu: shiftDay.dayCond.split(' ')[0],
+            iconType: shiftSlot.iconType,
+            precipProb: shiftSlot.precipProb,
+            windMs: shiftSlot.windMs,
+            windMph: shiftSlot.windMph,
+            windDirShort: shiftSlot.windDirShort,
+            soil0C: shiftSlot.soil0C,
+            next3hLabel: `Через 3 ч (${String(h3).padStart(2, '0')}:00)`,
+            next3hTempC: h3Slot.tempC
+        },
+        days
+    };
 }
 
-export const REFERENCE_DATASET = {
-    version: 4,
-    sourceType: 'reference_wn3',
-    sourceLabel: 'Эталон WeatherNext 3 (Офлайн, Абан)',
-    syncedAt: '18.10.2026, 10:00 (UTC+7)',
-    latencyMs: 0,
-    activeModels: ['google_wn3'],
-    mos: {
-        models: {},
-        bestModelId: null,
-        summaryRu: 'Автономный эталон WeatherNext 3 (подключите сеть или API-ключ для калибровки MOS)'
-    },
-    airQuality: {
-        pm25: 6.4,
-        pm10: 12.1,
-        co: 215,
-        aqi: 18,
-        statusRu: 'Отличный',
-        smogRisk: 'low'
-    },
-    current: {
-        tempC: 4.8,
-        tempF: 41,
-        feelsC: 1.9,
-        feelsF: 35,
-        wetBulbC: 2.3,
-        condRu: 'Ясно (Антициклон)',
-        iconType: 'sunny',
-        windMs: 3.1,
-        windMph: 7,
-        gustMs: 6.0,
-        gustMph: 13,
-        windDeg: 135,
-        windDirShort: 'ЮВ',
-        precipProb: 5,
-        precipMm: 0.0,
-        precipPhase: 'dry',
-        snowDepthCm: 0.0,
-        humidity: 68,
-        dewPointC: -0.6,
-        cloudCoverPct: 12,
-        soil0C: 0.9,
-        soil6C: 1.4,
-        soil18C: 2.6,
-        soil54C: 4.8,
-        pressureStationHpa: 1004,
-        pressureStationMm: 753,
-        pressureMslHpa: 1035,
-        pressureMslMm: 776,
-        deltaP3hMm: -1,
-        deltaP24hMm: -2,
-        uv: 1,
-        obsTimeLabel: 'Вс, 18 октября 2026 • 10:00 (UTC+7)'
-    },
-    controlPoint: {
-        targetLabel: 'Смена 20:00',
-        tempC: 0.2,
-        tempF: 32,
-        feelsC: -3.2,
-        condRu: 'Ясно, прохладно',
-        badgeRu: 'Ясно',
-        iconType: 'clear-night',
-        precipProb: 5,
-        windMs: 2.8,
-        windMph: 6,
-        windDirShort: 'ЮВ',
-        soil0C: 0.5,
-        next3hLabel: 'Через 3 ч (13:00)',
-        next3hTempC: 5.2
-    },
-    days: buildReferenceDays()
-};
+export const REFERENCE_DATASET = buildDynamicReferenceDataset();

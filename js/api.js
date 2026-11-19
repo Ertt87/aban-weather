@@ -12,6 +12,16 @@ const RECENT_ARCHIVE_TTL_MS = 30 * 60 * 1000;
 const MIN_ARCHIVE_ISO = '1940-01-01';
 const OM_MODELS = ['ecmwf_ifs025', 'ecmwf_aifs025', 'icon_seamless', 'gfs_seamless'];
 
+const CHANNEL_LABELS = {
+  openMeteoMulti: 'Open-Meteo Multi (4 мод.)',
+  openMeteoCompanion: 'Open-Meteo Почва / Снег',
+  previousRuns: 'Open-Meteo MOS (14д)',
+  ensemble35: 'Ансамбль 35д (P10–P90)',
+  airQuality: 'Качество воздуха (AQI)',
+  metNo: 'MET Norway Global',
+  google: 'Google WeatherNext 3',
+};
+
 function round1(val) {
   return Number.isFinite(val) ? Math.round(val * 10) / 10 : null;
 }
@@ -387,7 +397,7 @@ async function fetchOpenMeteoCompanion() {
 async function fetchPreviousRunsMos(forceRefresh = false) {
   if (!forceRefresh) {
     const cached = loadMosCache(MOS_TTL_MS);
-    if (cached) return cached;
+    if (cached) return { data: cached, fromCache: true };
   }
 
   const baseObj = {
@@ -414,7 +424,7 @@ async function fetchPreviousRunsMos(forceRefresh = false) {
   }
 
   saveMosCache(data);
-  return data;
+  return { data, fromCache: false };
 }
 
 // ============================================================================
@@ -702,8 +712,52 @@ async function fetchAirQuality() {
 }
 
 // ============================================================================
-// UNIFIED SOURCE ORCHESTRATOR
+// UNIFIED SOURCE ORCHESTRATOR WITH PER-CHANNEL TELEMETRY
 // ============================================================================
+async function runTimedChannel(id, enabled, fn, disabledReason = 'Отключён режимом') {
+  const label = CHANNEL_LABELS[id] || id;
+  if (!enabled) {
+    return {
+      value: null,
+      channel: { id, label, status: 'disabled', latencyMs: 0, error: null, detail: disabledReason },
+    };
+  }
+  const t0 = performance.now();
+  try {
+    const out = await fn();
+    const latencyMs = Math.round(performance.now() - t0);
+    if (out && typeof out === 'object' && 'fromCache' in out && 'data' in out) {
+      return {
+        value: out.data,
+        channel: {
+          id,
+          label,
+          status: out.fromCache ? 'cached' : 'ok',
+          latencyMs,
+          error: null,
+          detail: out.fromCache ? 'Локальный кэш (TTL 1ч)' : 'Обновлено',
+        },
+      };
+    }
+    return {
+      value: out,
+      channel: { id, label, status: 'ok', latencyMs, error: null, detail: 'Ответ получен' },
+    };
+  } catch (err) {
+    return {
+      value: null,
+      channel: {
+        id,
+        label,
+        status: 'error',
+        latencyMs: Math.round(performance.now() - t0),
+        error: err?.message || 'Ошибка сети',
+        detail: err?.message || 'Ошибка сети',
+      },
+    };
+  }
+}
+
 export async function fetchAllWeatherSources({
   apiKey = '',
   mode = 'hybrid',
@@ -716,30 +770,55 @@ export async function fetchAllWeatherSources({
   const shouldGoogle = hasGoogleKey && (mode === 'hybrid' || mode === 'google_wn3');
   const shouldOpenMeteo = mode !== 'google_wn3';
 
-  const tasks = {
-    google: shouldGoogle ? fetchGoogleWeatherBundle(cleanKey) : Promise.resolve(null),
-    openMeteoMulti: shouldOpenMeteo ? fetchOpenMeteoMulti() : Promise.resolve(null),
-    openMeteoCompanion: shouldOpenMeteo ? fetchOpenMeteoCompanion() : Promise.resolve(null),
-    previousRuns: shouldOpenMeteo ? fetchPreviousRunsMos(forceRefresh) : Promise.resolve(null),
-    ensemble35: shouldOpenMeteo ? fetchEnsemble35() : Promise.resolve(null),
-    metNo: shouldOpenMeteo ? fetchMetNo() : Promise.resolve(null),
-    airQuality: fetchAirQuality(),
+  const [
+    googleRes,
+    multiRes,
+    compRes,
+    mosRes,
+    ensRes,
+    metRes,
+    aqRes,
+  ] = await Promise.all([
+    runTimedChannel(
+      'google',
+      shouldGoogle,
+      () => fetchGoogleWeatherBundle(cleanKey),
+      hasGoogleKey ? 'Отключён режимом' : 'Ключ API не задан'
+    ),
+    runTimedChannel('openMeteoMulti', shouldOpenMeteo, () => fetchOpenMeteoMulti()),
+    runTimedChannel('openMeteoCompanion', shouldOpenMeteo, () => fetchOpenMeteoCompanion()),
+    runTimedChannel('previousRuns', shouldOpenMeteo, () => fetchPreviousRunsMos(forceRefresh)),
+    runTimedChannel('ensemble35', shouldOpenMeteo, () => fetchEnsemble35()),
+    runTimedChannel('metNo', shouldOpenMeteo && mode === 'hybrid', () => fetchMetNo()),
+    runTimedChannel('airQuality', true, () => fetchAirQuality()),
+  ]);
+
+  const results = {
+    google: googleRes.value,
+    openMeteoMulti: multiRes.value,
+    openMeteoCompanion: compRes.value,
+    previousRuns: mosRes.value,
+    ensemble35: ensRes.value,
+    metNo: metRes.value,
+    airQuality: aqRes.value,
   };
 
-  const keys = Object.keys(tasks);
-  const settled = await Promise.allSettled(keys.map((k) => tasks[k]));
+  const channels = {
+    openMeteoMulti: multiRes.channel,
+    openMeteoCompanion: compRes.channel,
+    previousRuns: mosRes.channel,
+    ensemble35: ensRes.channel,
+    airQuality: aqRes.channel,
+    metNo: metRes.channel,
+    google: googleRes.channel,
+  };
 
-  const results = {};
   const errors = {};
-  keys.forEach((k, idx) => {
-    const res = settled[idx];
-    if (res.status === 'fulfilled') {
-      results[k] = res.value;
-    } else {
-      results[k] = null;
-      errors[k] = res.reason?.message || 'Fetch failed';
+  for (const [k, ch] of Object.entries(channels)) {
+    if (ch.status === 'error' && ch.error) {
+      errors[k] = ch.error;
     }
-  });
+  }
 
   if (mode === 'google_wn3' && hasGoogleKey && !results.google) {
     throw new Error(errors.google || 'Google Weather API недоступен');
@@ -765,6 +844,7 @@ export async function fetchAllWeatherSources({
     ensemble35: results.ensemble35,
     metNo: results.metNo,
     airQuality: results.airQuality,
+    channels,
     errors,
   };
 }

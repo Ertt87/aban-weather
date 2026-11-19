@@ -1555,3 +1555,64 @@ code {
 .rotate-180 {
   transform: rotate(180deg);
 }
+
+/* ============================================================================
+   API Channel Status Badges & PWA Update Banner
+   ============================================================================ */
+.pwa-update-banner {
+  position: sticky;
+  top: 0;
+  z-index: 60;
+  background: linear-gradient(90deg, rgba(14, 165, 233, 0.22), rgba(56, 189, 248, 0.14), rgba(16, 185, 129, 0.2));
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  border-bottom: 1px solid rgba(56, 189, 248, 0.48);
+  padding: 0.45rem 0.85rem;
+}
+
+.pwa-update-banner__inner {
+  max-width: 82rem;
+  margin: 0 auto;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.55rem;
+}
+
+.chan-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.12rem 0.48rem;
+  border-radius: 9999px;
+  font-family: var(--font-mono);
+  font-size: 0.65rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.chan-pill--ok {
+  background: rgba(16, 185, 129, 0.18);
+  border: 1px solid rgba(52, 211, 153, 0.45);
+  color: #6ee7b7;
+}
+
+.chan-pill--cached {
+  background: rgba(56, 189, 248, 0.16);
+  border: 1px solid rgba(56, 189, 248, 0.4);
+  color: #7dd3fc;
+}
+
+.chan-pill--error {
+  background: rgba(244, 63, 94, 0.18);
+  border: 1px solid rgba(251, 113, 133, 0.45);
+  color: #fda4af;
+}
+
+.chan-pill--disabled {
+  background: rgba(71, 85, 105, 0.25);
+  border: 1px solid rgba(100, 116, 139, 0.45);
+  color: #94a3b8;
+}
+

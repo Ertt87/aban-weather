@@ -16,6 +16,20 @@
   <title>п. Абан • Метео v4 • ВМО 29485</title>
 </head>
 <body>
+  <!-- PWA Update Notification Banner -->
+  <div id="pwaUpdateBanner" class="pwa-update-banner hidden" role="status" aria-live="polite">
+    <div class="pwa-update-banner__inner">
+      <div class="flex items-center gap-2 text-xs sm:text-sm font-mono text-sky-200">
+        <span class="status-dot status-dot--pulse text-emerald-400"></span>
+        <span id="pwaUpdateBannerText">Доступна новая версия приложения — обновите страницу для применения изменений.</span>
+      </div>
+      <div class="flex items-center gap-2">
+        <button id="btnApplyPwaUpdate" type="button" class="btn-action btn-action--solid font-mono" style="min-height:32px;padding:0 0.7rem">🔄 Обновить сейчас</button>
+        <button id="btnDismissPwaUpdate" type="button" class="btn-action font-mono" style="min-height:32px;padding:0 0.55rem" aria-label="Скрыть уведомление">✕</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Toast Notification Container -->
   <div id="toastContainer" class="toast-container" aria-live="polite"></div>
 
@@ -103,11 +117,34 @@
         </div>
       </div>
 
-      <!-- 4. 14-Day Model MAE Leaderboard (MOS) -->
+      <!-- 4. API Channel Status Diagnostics -->
+      <div id="apiChannelsSection" class="sub-card p-4 flex flex-col gap-2.5">
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <span class="text-xs font-mono uppercase tracking-wider text-cyan-300 font-bold">
+            📡 4. Статус каналов данных (API)
+          </span>
+          <span id="apiChannelsBadge" class="badge-mono">Офлайн</span>
+        </div>
+        <div class="data-table-wrap">
+          <table class="data-table" style="min-width:500px">
+            <thead>
+              <tr>
+                <th>Канал данных</th>
+                <th>Статус</th>
+                <th>Задержка</th>
+                <th>Детали / Ошибка</th>
+              </tr>
+            </thead>
+            <tbody id="apiChannelsBody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- 5. 14-Day Model MAE Leaderboard (MOS) -->
       <div id="mosLeaderboardSection" class="sub-card p-4 flex flex-col gap-2.5">
         <div class="flex flex-wrap items-center justify-between gap-2">
           <span class="text-xs font-mono uppercase tracking-wider text-purple-300 font-bold">
-            🏆 4. Рейтинг точности моделей (MOS за 14 дней • Абан)
+            🏆 5. Рейтинг точности моделей (MOS за 14 дней • Абан)
           </span>
           <span id="mosBestBadge" class="badge-mono">Лидер: расчёт...</span>
         </div>
@@ -131,11 +168,11 @@
         </div>
       </div>
 
-      <!-- 5. Offline Cache Manager + JSON Export/Import -->
+      <!-- 6. Offline Cache Manager + JSON Export/Import -->
       <div class="sub-card p-4 flex flex-col gap-2.5">
         <div class="flex flex-wrap items-center justify-between gap-2">
           <span class="text-xs font-mono uppercase tracking-wider text-amber-400 font-bold">
-            💾 5. Автономный офлайн-кэш и архивные срезы
+            💾 6. Автономный офлайн-кэш и архивные срезы
           </span>
           <span id="modalCacheSizeBadge" class="text-[11px] font-mono text-amber-300">Кэш: проверка...</span>
         </div>
@@ -153,10 +190,10 @@
         </div>
       </div>
 
-      <!-- 6. Mobile Home Screen PWA Guide -->
+      <!-- 7. Mobile Home Screen PWA Guide -->
       <div class="p-4 rounded-xl flex flex-col gap-1.5" style="background:rgba(30,27,75,0.45);border:1px solid rgba(99,102,241,0.32)">
         <div class="text-xs font-mono uppercase tracking-wider text-indigo-300 font-bold">
-          📱 6. Установка PWA на главный экран смартфона
+          📱 7. Установка PWA на главный экран смартфона
         </div>
         <div class="text-xs text-slate-300">
           • <strong>Android (Chrome):</strong> меню <code>⋮</code> → <strong>«Установить приложение»</strong>.<br />

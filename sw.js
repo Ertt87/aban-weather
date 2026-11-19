@@ -1,4 +1,4 @@
-const CACHE_NAME = 'aban-weather-v4-shell-v1';
+const CACHE_NAME = 'aban-weather-v4-shell-v2';
 
 const PRECACHE_ASSETS = [
   './',
@@ -30,7 +30,7 @@ self.addEventListener('install', (event) => {
   event.waitUntil(
     caches.open(CACHE_NAME).then((cache) => cache.addAll(PRECACHE_ASSETS))
   );
-  self.skipWaiting();
+  // Controlled update: wait for client SKIP_WAITING message when an active controller exists
 });
 
 self.addEventListener('activate', (event) => {

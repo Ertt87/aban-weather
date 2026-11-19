@@ -1,4 +1,4 @@
-import { ABAN_COORDS, MODEL_META, TIME_WINDOWS, REFERENCE_DATASET } from './config.js';
+import { ABAN_COORDS, MODEL_META, TIME_WINDOWS, REFERENCE_DATASET, buildDynamicReferenceDataset } from './config.js';
 import { cToF, msToMph, formatSignedC, computeFieldOpsMetrics } from './physics.js';
 import {
   buildUnifiedDataset,
@@ -89,6 +89,8 @@ const state = {
   groupByPentad: Boolean(prefs.groupByPentad),
   filter: 'all',
   activeTab: 'temp',
+  dirtyTabs: { temp: true, precip: true, wind: true, ops: true },
+  waitingSw: null,
   startIso: null,
   endIso: null,
   selectedDayId: null,
@@ -192,6 +194,13 @@ function getPressurePair(obj) {
   const mm = obj?.pressureStationMm ?? obj?.pressureMm ?? obj?.pressureMslMm ?? 745;
   const hpa = obj?.pressureStationHpa ?? obj?.pressureHpa ?? obj?.pressureMslHpa ?? 993;
   return { mm, hpa, label: '246м' };
+}
+
+function markAllAnalyticsTabsDirty() {
+  state.dirtyTabs.temp = true;
+  state.dirtyTabs.precip = true;
+  state.dirtyTabs.wind = true;
+  state.dirtyTabs.ops = true;
 }
 
 function showToast(message) {
@@ -445,11 +454,11 @@ async function refreshWeatherData(showNotice = true) {
       updateAllViews();
       if (showNotice) showToast('Загружен локальный офлайн-кэш');
     } else {
-      state.dataset = REFERENCE_DATASET;
+      state.dataset = buildDynamicReferenceDataset();
       state.fromCache = false;
       applyPeriodPreset('10d', { silent: true });
       updateAllViews();
-      if (showNotice) showToast('Кэш пуст — показан эталон п. Абан');
+      if (showNotice) showToast('Кэш пуст — показан сезонный эталон п. Абан');
     }
     return;
   }
@@ -570,10 +579,12 @@ function renderHeader() {
     }
   }
 
+  const errCount = Object.keys(ds.errors || {}).length;
   const syncEl = $('syncTimestampText');
   if (syncEl) {
     const lat = ds.latencyMs ? ` • ${ds.latencyMs} мс` : '';
-    syncEl.textContent = `Синхр.: ${ds.syncedAt || '—'}${lat}`;
+    const errTag = errCount > 0 ? ` • ⚠️ ${errCount} канал.` : '';
+    syncEl.textContent = `Синхр.: ${ds.syncedAt || '—'}${lat}${errTag}`;
   }
 
   const pressBtnText = $('pressureToggleText');
@@ -1150,25 +1161,17 @@ function renderDayInspector() {
 }
 
 // ============================================================================
-// RENDERING: SECTION 4 (4 CHARTS & FIELD OPERATIONAL TABLE)
+// RENDERING: SECTION 4 (LAZY-RENDERED ANALYTICS TABS & FIELD MATRIX)
 // ============================================================================
-function renderAnalyticsAndTable() {
+function renderAnalyticsTab(tabKey) {
   const days = getSelectedPeriodDays();
   if (!days.length) return;
 
-  const firstDay = days[0];
-  const lastDay = days[days.length - 1];
-  const winCfg = TIME_WINDOWS[state.timeWindow] || TIME_WINDOWS.full;
   const uiState = getUiChartState();
   const usePentad = state.groupByPentad && days.length > 14;
   const pentads = usePentad ? buildPentadSummary(days) : null;
   const chartItems = usePentad ? pentads : days;
 
-  $('analyticsPeriodBadge').textContent = `${firstDay.dateStr} – ${lastDay.dateStr} (${days.length} сут.${usePentad ? ' • 5-дневки' : ''} • ${winCfg.shortLabel})`;
-  $('toggleModelLinesBtn')?.classList.toggle('is-active', state.showModelLines);
-  $('toggleClimatologyBtn')?.classList.toggle('is-active', state.showClimatology);
-
-  // Summaries
   let maxDay = days[0];
   let minDay = days[0];
   let peakWind = days[0];
@@ -1179,126 +1182,197 @@ function renderAnalyticsAndTable() {
     if ((d.gustMs ?? d.windMs) > (peakWind.gustMs ?? peakWind.windMs)) peakWind = d;
     sumMm += Number(d.precipMm ?? 0);
   }
-  $('tempChartDynamicSummary').textContent = `Max: ${maxDay.dateStr} (${formatTemp(maxDay.maxC, maxDay.maxF)}) • Min: ${minDay.dateStr} (${formatTemp(minDay.minC, minDay.minF)})`;
-  $('precipChartDynamicSummary').textContent = `Сумма осадков: ${sumMm.toFixed(1)} мм • Пик снега: ${Math.max(...days.map((d) => d.snowDepthCm ?? 0)).toFixed(1)} см`;
-  $('windChartDynamicSummary').textContent = `Пик: ${peakWind.dateStr} — ${formatWind(peakWind.windMs)} (пор. ${formatWind(peakWind.gustMs)})`;
 
-  // Charts
-  // Note: charts.js renderTempEnsembleChart groups into pentads automatically when uiState.groupByPentad && days.length > 16;
-  // when 15-16 days and groupByPentad is active, pass pentads directly.
-  const tempDaysArg = usePentad && days.length <= 16 ? pentads : days;
-  renderTempEnsembleChart($('tempChartWrapper'), tempDaysArg, uiState, selectDay);
-  renderPrecipSnowChart($('precipChartWrapper'), chartItems, uiState, selectDay);
-  renderWindPressureChart($('windChartWrapper'), chartItems, uiState, selectDay);
-  renderSoilProfileChart($('soilChartWrapper'), chartItems, uiState, selectDay);
+  if (tabKey === 'temp') {
+    $('tempChartDynamicSummary').textContent = `Max: ${maxDay.dateStr} (${formatTemp(maxDay.maxC, maxDay.maxF)}) • Min: ${minDay.dateStr} (${formatTemp(minDay.minC, minDay.minF)})`;
+    const tempDaysArg = usePentad && days.length <= 16 ? pentads : days;
+    renderTempEnsembleChart($('tempChartWrapper'), tempDaysArg, uiState, selectDay);
+  } else if (tabKey === 'precip') {
+    $('precipChartDynamicSummary').textContent = `Сумма осадков: ${sumMm.toFixed(1)} мм • Пик снега: ${Math.max(...days.map((d) => d.snowDepthCm ?? 0)).toFixed(1)} см`;
+    renderPrecipSnowChart($('precipChartWrapper'), chartItems, uiState, selectDay);
+  } else if (tabKey === 'wind') {
+    $('windChartDynamicSummary').textContent = `Пик: ${peakWind.dateStr} — ${formatWind(peakWind.windMs)} (пор. ${formatWind(peakWind.gustMs)})`;
+    renderWindPressureChart($('windChartWrapper'), chartItems, uiState, selectDay);
+  } else if (tabKey === 'ops') {
+    renderSoilProfileChart($('soilChartWrapper'), chartItems, uiState, selectDay);
 
-  // 4 Period Ops Summary Cards
-  const frostDays = days.filter((d) => d.minC < 0);
-  const soilFreezeDays = days.filter((d) => (d.soil0C ?? 0) <= 0.2);
-  const dryDays = days.filter((d) => (d.precipDay ?? 0) < 15 && (d.precipNight ?? 0) < 15 && (d.precipMm ?? 0) < 0.5);
-  const iceDays = days.filter((d, i) => matchesRiskFilter(d, 'ice_blizzard', days.slice(0, i)));
+    const frostDays = days.filter((d) => d.minC < 0);
+    const soilFreezeDays = days.filter((d) => (d.soil0C ?? 0) <= 0.2);
+    const dryDays = days.filter((d) => (d.precipDay ?? 0) < 15 && (d.precipNight ?? 0) < 15 && (d.precipMm ?? 0) < 0.5);
+    const iceDays = days.filter((d, i) => matchesRiskFilter(d, 'ice_blizzard', days.slice(0, i)));
 
-  $('opsSummaryCardsGrid').innerHTML = `
-    <div class="ops-card">
-      <div class="text-[11px] font-mono text-cyan-400 font-bold">❄️ ЗАМОРОЗКИ (${frostDays.length}/${days.length})</div>
-      <div class="text-xs font-bold text-white">${frostDays.length ? frostDays.slice(0, 4).map((d) => d.dateStr).join(', ') : 'Без заморозков'}</div>
-    </div>
-    <div class="ops-card">
-      <div class="text-[11px] font-mono text-rose-400 font-bold">🛣️ ГОЛОЛЁД / МЕТЕЛЬ (${iceDays.length})</div>
-      <div class="text-xs font-bold text-white">${iceDays.length ? iceDays.slice(0, 4).map((d) => d.dateStr).join(', ') : 'Трасса чистая'}</div>
-    </div>
-    <div class="ops-card">
-      <div class="text-[11px] font-mono text-amber-400 font-bold">🌱 ПОЧВА ≤0°C (${soilFreezeDays.length})</div>
-      <div class="text-xs font-bold text-white">${soilFreezeDays.length ? soilFreezeDays.slice(0, 4).map((d) => d.dateStr).join(', ') : 'Почва талая'}</div>
-    </div>
-    <div class="ops-card">
-      <div class="text-[11px] font-mono text-emerald-400 font-bold">☀️ СУХИЕ ОКНА (${dryDays.length})</div>
-      <div class="text-xs font-bold text-white">${dryDays.length ? dryDays.slice(0, 4).map((d) => d.dateStr).join(', ') : 'Влажный период'}</div>
-    </div>
-  `;
+    $('opsSummaryCardsGrid').innerHTML = `
+      <div class="ops-card">
+        <div class="text-[11px] font-mono text-cyan-400 font-bold">❄️ ЗАМОРОЗКИ (${frostDays.length}/${days.length})</div>
+        <div class="text-xs font-bold text-white">${frostDays.length ? frostDays.slice(0, 4).map((d) => d.dateStr).join(', ') : 'Без заморозков'}</div>
+      </div>
+      <div class="ops-card">
+        <div class="text-[11px] font-mono text-rose-400 font-bold">🛣️ ГОЛОЛЁД / МЕТЕЛЬ (${iceDays.length})</div>
+        <div class="text-xs font-bold text-white">${iceDays.length ? iceDays.slice(0, 4).map((d) => d.dateStr).join(', ') : 'Трасса чистая'}</div>
+      </div>
+      <div class="ops-card">
+        <div class="text-[11px] font-mono text-amber-400 font-bold">🌱 ПОЧВА ≤0°C (${soilFreezeDays.length})</div>
+        <div class="text-xs font-bold text-white">${soilFreezeDays.length ? soilFreezeDays.slice(0, 4).map((d) => d.dateStr).join(', ') : 'Почва талая'}</div>
+      </div>
+      <div class="ops-card">
+        <div class="text-[11px] font-mono text-emerald-400 font-bold">☀️ СУХИЕ ОКНА (${dryDays.length})</div>
+        <div class="text-xs font-bold text-white">${dryDays.length ? dryDays.slice(0, 4).map((d) => d.dateStr).join(', ') : 'Влажный период'}</div>
+      </div>
+    `;
 
-  // Field Operational Table (Daily OR 5-Day Pentads)
-  const thead = $('operationalTableHead');
-  const tbody = $('operationalTableBody');
+    const thead = $('operationalTableHead');
+    const tbody = $('operationalTableBody');
 
-  if (usePentad && pentads) {
-    thead.innerHTML = `<tr>
-      <th>Пентада</th>
-      <th>Зона / Увер.</th>
-      <th>Ср. Max / Min (Экстр.)</th>
-      <th>Осадки / Снег</th>
-      <th>Ветер (пор.)</th>
-      <th>Почва 0/54см • Давл.</th>
-      <th>Аномалия</th>
-    </tr>`;
-    tbody.innerHTML = pentads
-      .map((p) => {
-        const isSel = Array.isArray(p.dayIds) ? p.dayIds.includes(state.selectedDayId) : p.id === state.selectedDayId;
-        const pPair = getPressurePair(p);
-        const anom = Number(p.climAnomalyC ?? 0);
-        return `<tr data-day-id="${escapeHtml(p.id)}" class="${isSel ? 'is-selected' : ''}">
-          <td class="font-bold text-white">${escapeHtml(p.label)} (${p.dayCount}д)</td>
-          <td><span class="zone-pill ${ZONE_BADGE_META[p.zone]?.cls || ''}">${escapeHtml(ZONE_BADGE_META[p.zone]?.short || p.zone)} ${p.confidencePct}%</span></td>
-          <td><span class="text-amber-300 font-bold">${formatTemp(p.maxC)}</span> / <span class="text-cyan-300">${formatTemp(p.minC)}</span> <span class="text-slate-400">(${formatTempCompact(p.absMinC)}..${formatTempCompact(p.absMaxC)})</span></td>
-          <td class="text-cyan-300">${p.precipMm.toFixed(1)} мм • ❄${p.snowDepthCm}см</td>
-          <td class="text-slate-200">${formatWind(p.windMs)} (пор. ${formatWind(p.gustMs)}) ${escapeHtml(p.windDirShort || '')}</td>
-          <td class="text-amber-300">${formatTempCompact(p.soil0C)} / ${formatTempCompact(p.soil54C)} • ${pPair.mm} мм</td>
-          <td class="${anom >= 0 ? 'text-amber-300' : 'text-cyan-300'}">${anom > 0 ? '+' : ''}${anom.toFixed(1)}°C</td>
-        </tr>`;
-      })
-      .join('');
+    if (usePentad && pentads) {
+      thead.innerHTML = `<tr>
+        <th>Пентада</th>
+        <th>Зона / Увер.</th>
+        <th>Ср. Max / Min (Экстр.)</th>
+        <th>Осадки / Снег</th>
+        <th>Ветер (пор.)</th>
+        <th>Почва 0/54см • Давл.</th>
+        <th>Аномалия</th>
+      </tr>`;
+      tbody.innerHTML = pentads
+        .map((p) => {
+          const isSel = Array.isArray(p.dayIds) ? p.dayIds.includes(state.selectedDayId) : p.id === state.selectedDayId;
+          const pPair = getPressurePair(p);
+          const anom = Number(p.climAnomalyC ?? 0);
+          return `<tr data-day-id="${escapeHtml(p.id)}" class="${isSel ? 'is-selected' : ''}">
+            <td class="font-bold text-white">${escapeHtml(p.label)} (${p.dayCount}д)</td>
+            <td><span class="zone-pill ${ZONE_BADGE_META[p.zone]?.cls || ''}">${escapeHtml(ZONE_BADGE_META[p.zone]?.short || p.zone)} ${p.confidencePct}%</span></td>
+            <td><span class="text-amber-300 font-bold">${formatTemp(p.maxC)}</span> / <span class="text-cyan-300">${formatTemp(p.minC)}</span> <span class="text-slate-400">(${formatTempCompact(p.absMinC)}..${formatTempCompact(p.absMaxC)})</span></td>
+            <td class="text-cyan-300">${p.precipMm.toFixed(1)} мм • ❄${p.snowDepthCm}см</td>
+            <td class="text-slate-200">${formatWind(p.windMs)} (пор. ${formatWind(p.gustMs)}) ${escapeHtml(p.windDirShort || '')}</td>
+            <td class="text-amber-300">${formatTempCompact(p.soil0C)} / ${formatTempCompact(p.soil54C)} • ${pPair.mm} мм</td>
+            <td class="${anom >= 0 ? 'text-amber-300' : 'text-cyan-300'}">${anom > 0 ? '+' : ''}${anom.toFixed(1)}°C</td>
+          </tr>`;
+        })
+        .join('');
+    } else {
+      thead.innerHTML = `<tr>
+        <th>Дата</th>
+        <th>Условия / Зона</th>
+        <th>Max / Min (Окно)</th>
+        <th>Осадки / Снег</th>
+        <th>Ветер (пор.)</th>
+        <th>Почва 0/54см • Давл.</th>
+        <th>Риск Р-255</th>
+      </tr>`;
+
+      tbody.innerHTML = days
+        .map((d, idx) => {
+          const winStats = computeDayWindowStats(d, state.timeWindow);
+          const ops = computeFieldOpsMetrics(d, days.slice(Math.max(0, idx - 3), idx));
+          const pPair = getPressurePair(d);
+          const zMeta = ZONE_BADGE_META[d.zone] || ZONE_BADGE_META.deterministic;
+          const riskCls =
+            ops.roadRisk.level === 'severe'
+              ? 'text-rose-400 font-bold'
+              : ops.roadRisk.level === 'high'
+              ? 'text-amber-300 font-bold'
+              : ops.roadRisk.level === 'moderate'
+              ? 'text-sky-300'
+              : 'text-emerald-300';
+
+          return `<tr data-day-id="${escapeHtml(d.id)}" class="${d.id === state.selectedDayId ? 'is-selected' : ''}">
+            <td class="font-bold text-white">${escapeHtml(d.dayShort)}, ${escapeHtml(d.dateStr)}</td>
+            <td class="font-sans text-slate-300">
+              <span class="zone-pill ${zMeta.cls}">${escapeHtml(zMeta.short)} ${d.confidencePct ?? 85}%</span>
+              <span style="margin-left:4px">${escapeHtml(d.dayCond || '—')}</span>
+            </td>
+            <td>
+              <span class="text-amber-300 font-bold">${formatTemp(d.maxC, d.maxF)}</span> /
+              <span class="text-cyan-300">${formatTemp(d.minC, d.minF)}</span>
+              <span class="text-sky-400">(${formatTempCompact(winStats.avgC, winStats.avgF)})</span>
+            </td>
+            <td class="text-cyan-300">${Number(d.precipMm ?? 0).toFixed(1)} мм (${d.precipDay ?? 0}%) • ❄${Number(d.snowDepthCm ?? 0).toFixed(0)}см</td>
+            <td class="text-slate-200">${formatWind(d.windMs, d.windMph)} (пор. ${formatWind(d.gustMs, d.gustMph)}) ${escapeHtml(d.windDirShort || '')}</td>
+            <td class="text-amber-300">${formatTempCompact(d.soil0C)} / ${formatTempCompact(d.soil54C)} • ${pPair.mm} мм</td>
+            <td class="${riskCls}">${escapeHtml(ops.roadRisk.labelRu)}</td>
+          </tr>`;
+        })
+        .join('');
+    }
+  }
+
+  state.dirtyTabs[tabKey] = false;
+}
+
+function renderAnalyticsAndTable() {
+  const days = getSelectedPeriodDays();
+  if (!days.length) return;
+
+  const firstDay = days[0];
+  const lastDay = days[days.length - 1];
+  const winCfg = TIME_WINDOWS[state.timeWindow] || TIME_WINDOWS.full;
+  const usePentad = state.groupByPentad && days.length > 14;
+
+  $('analyticsPeriodBadge').textContent = `${firstDay.dateStr} – ${lastDay.dateStr} (${days.length} сут.${usePentad ? ' • 5-дневки' : ''} • ${winCfg.shortLabel})`;
+  $('toggleModelLinesBtn')?.classList.toggle('is-active', state.showModelLines);
+  $('toggleClimatologyBtn')?.classList.toggle('is-active', state.showClimatology);
+
+  // Lazy tab rendering: only redraw active tab; hidden tabs render on switch
+  renderAnalyticsTab(state.activeTab);
+}
+
+// ============================================================================
+// RENDERING: SETTINGS MODAL, API CHANNEL STATUS & 14-DAY MODEL MAE LEADERBOARD
+// ============================================================================
+function renderApiChannelsPanel() {
+  const body = $('apiChannelsBody');
+  const badge = $('apiChannelsBadge');
+  if (!body) return;
+
+  const list = Object.values(state.dataset?.channels || {});
+  if (!list.length) {
+    if (badge) {
+      badge.textContent = 'Нет сетевого среза';
+      badge.className = 'badge-mono text-slate-400';
+    }
+    body.innerHTML = '<tr><td colspan="4" class="text-slate-400">Данные загружаются или используется сезонный офлайн-эталон. Нажмите «Обновить» для диагностики всех 7 каналов.</td></tr>';
     return;
   }
 
-  thead.innerHTML = `<tr>
-    <th>Дата</th>
-    <th>Условия / Зона</th>
-    <th>Max / Min (Окно)</th>
-    <th>Осадки / Снег</th>
-    <th>Ветер (пор.)</th>
-    <th>Почва 0/54см • Давл.</th>
-    <th>Риск Р-255</th>
-  </tr>`;
+  let okCount = 0;
+  let errCount = 0;
+  let activeCount = 0;
+  for (const ch of list) {
+    if (ch.status === 'disabled') continue;
+    activeCount++;
+    if (ch.status === 'ok' || ch.status === 'cached') okCount++;
+    else if (ch.status === 'error') errCount++;
+  }
 
-  tbody.innerHTML = days
-    .map((d, idx) => {
-      const winStats = computeDayWindowStats(d, state.timeWindow);
-      const ops = computeFieldOpsMetrics(d, days.slice(Math.max(0, idx - 3), idx));
-      const pPair = getPressurePair(d);
-      const zMeta = ZONE_BADGE_META[d.zone] || ZONE_BADGE_META.deterministic;
-      const riskCls =
-        ops.roadRisk.level === 'severe'
-          ? 'text-rose-400 font-bold'
-          : ops.roadRisk.level === 'high'
-          ? 'text-amber-300 font-bold'
-          : ops.roadRisk.level === 'moderate'
-          ? 'text-sky-300'
-          : 'text-emerald-300';
+  if (badge) {
+    badge.textContent = errCount > 0 ? `${okCount}/${activeCount} OK • ${errCount} ош.` : `${okCount}/${activeCount} OK`;
+    badge.className = errCount > 0 ? 'badge-mono text-amber-300' : 'badge-mono text-emerald-300';
+  }
 
-      return `<tr data-day-id="${escapeHtml(d.id)}" class="${d.id === state.selectedDayId ? 'is-selected' : ''}">
-        <td class="font-bold text-white">${escapeHtml(d.dayShort)}, ${escapeHtml(d.dateStr)}</td>
-        <td class="font-sans text-slate-300">
-          <span class="zone-pill ${zMeta.cls}">${escapeHtml(zMeta.short)} ${d.confidencePct ?? 85}%</span>
-          <span style="margin-left:4px">${escapeHtml(d.dayCond || '—')}</span>
-        </td>
-        <td>
-          <span class="text-amber-300 font-bold">${formatTemp(d.maxC, d.maxF)}</span> /
-          <span class="text-cyan-300">${formatTemp(d.minC, d.minF)}</span>
-          <span class="text-sky-400">(${formatTempCompact(winStats.avgC, winStats.avgF)})</span>
-        </td>
-        <td class="text-cyan-300">${Number(d.precipMm ?? 0).toFixed(1)} мм (${d.precipDay ?? 0}%) • ❄${Number(d.snowDepthCm ?? 0).toFixed(0)}см</td>
-        <td class="text-slate-200">${formatWind(d.windMs, d.windMph)} (пор. ${formatWind(d.gustMs, d.gustMph)}) ${escapeHtml(d.windDirShort || '')}</td>
-        <td class="text-amber-300">${formatTempCompact(d.soil0C)} / ${formatTempCompact(d.soil54C)} • ${pPair.mm} мм</td>
-        <td class="${riskCls}">${escapeHtml(ops.roadRisk.labelRu)}</td>
+  const statusMeta = {
+    ok: { label: '✅ OK', cls: 'chan-pill--ok' },
+    cached: { label: '💾 Кэш', cls: 'chan-pill--cached' },
+    error: { label: '⚠️ Ошибка', cls: 'chan-pill--error' },
+    disabled: { label: '⏸ Выкл', cls: 'chan-pill--disabled' },
+  };
+
+  body.innerHTML = list
+    .map((ch) => {
+      const m = statusMeta[ch.status] || statusMeta.disabled;
+      const latText = ch.latencyMs > 0 ? `${ch.latencyMs} мс` : '—';
+      const detail = ch.error || ch.detail || '—';
+      return `<tr>
+        <td class="font-sans font-bold text-white">${escapeHtml(ch.label || ch.id)}</td>
+        <td><span class="chan-pill ${m.cls}">${m.label}</span></td>
+        <td class="text-slate-300">${latText}</td>
+        <td class="${ch.status === 'error' ? 'text-rose-300' : 'text-slate-400'}">${escapeHtml(detail)}</td>
       </tr>`;
     })
     .join('');
 }
 
-// ============================================================================
-// RENDERING: SETTINGS MODAL & 14-DAY MODEL MAE LEADERBOARD
-// ============================================================================
 function renderSettingsModal() {
+  renderApiChannelsPanel();
   const keyInput = $('googleApiKeyInput');
   const keyBadge = $('modalKeyStatusBadge');
   if (keyInput && document.activeElement !== keyInput) {
@@ -1425,6 +1499,9 @@ function switchAnalyticsTab(tabKey) {
     $(`tabBtn-${t}`)?.classList.toggle('is-active', t === tabKey);
     $(`tabContent-${t}`)?.classList.toggle('hidden', t !== tabKey);
   });
+  if (state.dirtyTabs[tabKey]) {
+    renderAnalyticsTab(tabKey);
+  }
 }
 
 function buildTelegramSummaryText() {
@@ -1559,6 +1636,7 @@ function unloadWindyRadar() {
 // ============================================================================
 function updateAllViews() {
   ensureSelectionConsistency();
+  markAllAnalyticsTabsDirty();
   renderHeader();
   renderCurrentConditions();
   renderFiltersAndKpis();
@@ -1571,6 +1649,18 @@ function updateAllViews() {
 }
 
 function bindEventListeners() {
+  // PWA Update Notification Banner
+  $('btnApplyPwaUpdate')?.addEventListener('click', () => {
+    if (state.waitingSw) {
+      state.waitingSw.postMessage({ type: 'SKIP_WAITING' });
+    } else if (typeof window !== 'undefined' && window.location?.reload) {
+      window.location.reload();
+    }
+  });
+  $('btnDismissPwaUpdate')?.addEventListener('click', () => {
+    $('pwaUpdateBanner')?.classList.add('hidden');
+  });
+
   // Header controls
   $('refreshDataBtn')?.addEventListener('click', () => refreshWeatherData(true));
   $('btnPressureToggle')?.addEventListener('click', () => {
@@ -1766,11 +1856,13 @@ function bindEventListeners() {
   $('toggleModelLinesBtn')?.addEventListener('click', () => {
     state.showModelLines = !state.showModelLines;
     savePrefs({ showModelLines: state.showModelLines });
+    state.dirtyTabs.temp = true;
     renderAnalyticsAndTable();
   });
   $('toggleClimatologyBtn')?.addEventListener('click', () => {
     state.showClimatology = !state.showClimatology;
     savePrefs({ showClimatology: state.showClimatology });
+    state.dirtyTabs.temp = true;
     renderAnalyticsAndTable();
   });
   $('operationalTableBody')?.addEventListener('click', (e) => {
@@ -1809,12 +1901,41 @@ function bindEventListeners() {
 }
 
 // ============================================================================
-// BOOTSTRAP & SERVICE WORKER REGISTRATION
+// BOOTSTRAP & PWA UPDATE NOTIFICATION
 // ============================================================================
+function showPwaUpdateBanner(worker) {
+  state.waitingSw = worker;
+  $('pwaUpdateBanner')?.classList.remove('hidden');
+}
+
 function registerServiceWorker() {
   if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) return;
+  let reloading = false;
   try {
-    navigator.serviceWorker.register('./sw.js', { scope: './' }).catch(() => {});
+    navigator.serviceWorker.addEventListener?.('controllerchange', () => {
+      if (reloading) return;
+      reloading = true;
+      if (typeof window !== 'undefined' && window.location?.reload) {
+        window.location.reload();
+      }
+    });
+
+    navigator.serviceWorker.register('./sw.js', { scope: './' })
+      .then((reg) => {
+        if (reg?.waiting) {
+          showPwaUpdateBanner(reg.waiting);
+        }
+        reg?.addEventListener?.('updatefound', () => {
+          const installing = reg.installing;
+          if (!installing) return;
+          installing.addEventListener('statechange', () => {
+            if (installing.state === 'installed' && navigator.serviceWorker.controller) {
+              showPwaUpdateBanner(installing);
+            }
+          });
+        });
+      })
+      .catch(() => {});
   } catch (_) {}
 }
 
@@ -1826,7 +1947,7 @@ function initApp() {
     state.dataset = cached;
     state.fromCache = true;
   } else {
-    state.dataset = REFERENCE_DATASET;
+    state.dataset = buildDynamicReferenceDataset();
     state.fromCache = false;
   }
 

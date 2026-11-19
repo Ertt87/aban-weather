@@ -1903,6 +1903,8 @@ export function buildUnifiedDataset(rawBundle = {}, options = {}) {
         syncedAt: abanNow.label,
         latencyMs,
         activeModels,
+        channels: rawBundle.channels || {},
+        errors: rawBundle.errors || {},
         mos,
         airQuality,
         current,
