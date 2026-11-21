@@ -841,6 +841,23 @@ function renderCurrentConditions() {
 // ============================================================================
 // RENDERING: SECTION 1.5 (FILTERS, TIMELINE STRIP & PERIOD KPIs)
 // ============================================================================
+/**
+ * The day strip scrolls sideways (14 archive days come first), so bring the chosen day into view:
+ * only when it is not already visible, leaving a little context to its left. A no-op while the
+ * filters drawer is collapsed (zero width) — call it again when the drawer opens.
+ */
+function revealTimelineSelection() {
+  const track = $('confidenceTimelineTrack');
+  const focusNode = track?.querySelector?.('.is-selected') || track?.querySelector?.('.is-edge');
+  if (!focusNode || typeof focusNode.getBoundingClientRect !== 'function') return;
+  const trackRect = track.getBoundingClientRect();
+  if (!(trackRect.width > 0)) return;
+  const nodeRect = focusNode.getBoundingClientRect();
+  if (nodeRect.left < trackRect.left || nodeRect.right > trackRect.right) {
+    track.scrollLeft += nodeRect.left - trackRect.left - trackRect.width * 0.18;
+  }
+}
+
 function renderFiltersAndKpis() {
   const allDays = getAllDays();
   const periodDays = getSelectedPeriodDays();
@@ -905,6 +922,8 @@ function renderFiltersAndKpis() {
         </button>`;
       })
       .join('');
+
+    revealTimelineSelection();
   }
 
   // Time-of-day window buttons
@@ -2076,6 +2095,8 @@ function bindEventListeners() {
       if (btnText) btnText.textContent = state.drawerOpenMobile ? 'Свернуть' : 'Настроить';
       trigger?.setAttribute('aria-expanded', String(state.drawerOpenMobile));
     }
+    // The strip had no width while the drawer was collapsed, so position it now
+    revealTimelineSelection();
   });
 
   // Source modes, Presets, Time Windows
@@ -2195,6 +2216,8 @@ function bindEventListeners() {
         $('controlsDrawerBody')?.classList.add('is-open');
         $('drawerToggleChevron')?.classList.add('rotate-180');
         $('drawerToggleBtnText').textContent = 'Свернуть';
+        $('drawerToggleTrigger')?.setAttribute('aria-expanded', 'true');
+        revealTimelineSelection();
       }
       $(targetId)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
     });

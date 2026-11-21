@@ -388,3 +388,31 @@ test('static: tabs are real ARIA tabs, the selection line is live, table rows ar
   assert.match(appJs, /<tr data-day-id="\$\{escapeHtml\(d\.id\)\}" tabindex="0"/);
   assert.match(css, /\.data-table--sticky-first th:first-child,\s*\.data-table--sticky-first td:first-child \{\s*position: sticky;/);
 });
+
+test('layout: the day timeline cannot blow out the «Произвольные даты» card', () => {
+  const css = readText('css/styles.css');
+  const indexHtml = readText('index.html');
+  const appJs = readText('js/app.js');
+
+  // A bare `1fr` track cannot shrink below its content. The timeline is a ~2400px no-wrap row, so
+  // with `1fr` it stretched the card and pushed «По дату» and the time-of-day card off-screen.
+  const gridRules = [...css.matchAll(/\.filters-split-grid\s*\{([^}]*)\}/g)].map((m) => m[1]);
+  const columns = gridRules.map((r) => (r.match(/grid-template-columns:\s*([^;]+);/) || [])[1]).filter(Boolean);
+  assert.deepEqual(columns, ['minmax(0, 1fr)', 'minmax(0, 1.2fr) minmax(0, 1fr)']);
+  assert.match(css, /\.filters-split-grid > \* \{\s*min-width: 0;/);
+
+  const timelineRule = (css.match(/\.confidence-timeline \{([^}]*)\}/) || [])[1] || '';
+  assert.match(timelineRule, /overflow-x: auto;/);
+  assert.match(timelineRule, /min-width: 0;/);
+  assert.match(timelineRule, /flex-wrap: nowrap;/);
+
+  // Both date fields share one row and may shrink
+  assert.match(css, /\.date-range-grid \{[^}]*grid-template-columns: repeat\(2, minmax\(0, 1fr\)\);/);
+  assert.match((css.match(/\.date-input \{([^}]*)\}/) || [])[1] || '', /min-width: 0;/);
+  const rangeBlock = indexHtml.slice(indexHtml.indexOf('class="date-range-grid"'), indexHtml.indexOf('id="confidenceTimelineTrack"'));
+  assert.ok(rangeBlock.includes('id="inputStartDate"') && rangeBlock.includes('id="inputEndDate"'));
+
+  // The scrolling strip keeps the chosen day in view, including when the drawer opens on a phone
+  assert.match(appJs, /function revealTimelineSelection\(\)/);
+  assert.ok((appJs.match(/revealTimelineSelection\(\);/g) || []).length >= 3, 'called after render and on both drawer-open paths');
+});
