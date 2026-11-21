@@ -419,23 +419,33 @@ async function handleCustomDateRangeChange(changedSide) {
   const maxAllowedIso = days[days.length - 1]?.isoDate || addDaysIso(todayIso, 34);
   if (endIso > maxAllowedIso) endIso = maxAllowedIso;
 
+  // Anything the app changed on the user's behalf is kept in `notice` and shown once the range is
+  // applied. (It used to be written straight into the hint and then overwritten a few lines below,
+  // so an auto-corrected range looked like nothing had happened.)
+  let notice = null;
+  const fmtIso = (iso) => {
+    try {
+      return new Date(`${iso}T00:00:00Z`).toLocaleDateString('ru-RU', { day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC' });
+    } catch (_) {
+      return iso;
+    }
+  };
+
   // When user picks a historical archive start date while end date is still in the forecast horizon,
   // auto-frame a crisp 14-day historical window (which the user can freely widen via "По дату").
   if (changedSide === 'start' && endIso >= todayIso && startIso < addDaysIso(todayIso, -45)) {
     const candidateEnd = addDaysIso(startIso, 13);
     endIso = candidateEnd < todayIso ? candidateEnd : addDaysIso(todayIso, -1);
-    if (hint) {
-      hint.textContent = 'Выбран архив 14 дн. (можно изменить «По дату»)';
-      hint.className = 'text-[11px] font-mono text-sky-300';
-    }
+    notice = { text: 'Выбран архив 14 дн. (можно изменить «По дату»)', cls: 'text-sky-300' };
   }
 
   if (startIso > endIso) {
-    if (changedSide === 'start') endIso = startIso;
-    else startIso = endIso;
-    if (hint) {
-      hint.textContent = 'Диапазон скорректирован («С» ≤ «По»)';
-      hint.className = 'text-[11px] font-mono text-amber-300';
+    if (changedSide === 'start') {
+      endIso = startIso;
+      notice = { text: `«По дату» сдвинута на ${fmtIso(endIso)}: она была раньше «С даты»`, cls: 'text-amber-300' };
+    } else {
+      startIso = endIso;
+      notice = { text: `«С даты» сдвинута на ${fmtIso(startIso)}: она была позже «По дату»`, cls: 'text-amber-300' };
     }
   }
 
@@ -479,15 +489,19 @@ async function handleCustomDateRangeChange(changedSide) {
     if (archiveResult?.days?.length) {
       state.dataset = mergeArchiveDaysIntoDataset(state.dataset, archiveResult);
       if (hint) {
-        hint.textContent = `✅ Загружено суток архива: ${archiveResult.days.length}`;
-        hint.className = 'text-[11px] font-mono text-emerald-300';
+        hint.textContent = `✅ Загружено суток архива: ${archiveResult.days.length}${notice ? ` • ${notice.text}` : ''}`;
+        hint.className = `text-[11px] font-mono ${notice?.cls === 'text-amber-300' ? 'text-amber-300' : 'text-emerald-300'}`;
       }
       showToast(`Архив ERA5-Land: добавлено ${archiveResult.days.length} сут.`);
+    } else if (hint && notice) {
+      hint.textContent = notice.text;
+      hint.className = `text-[11px] font-mono ${notice.cls}`;
     }
   } else if (hint) {
-    hint.textContent = 'ERA5-Land + Прогноз';
-    hint.className = 'text-[11px] font-mono text-slate-400';
+    hint.textContent = notice ? notice.text : 'ERA5-Land + Прогноз';
+    hint.className = `text-[11px] font-mono ${notice ? notice.cls : 'text-slate-400'}`;
   }
+  if (notice?.cls === 'text-amber-300') showToast(notice.text);
 
   state.activePreset = 'custom';
   state.startIso = startIso;
@@ -1704,18 +1718,77 @@ function isSettingsModalOpen() {
   return Boolean($('settingsModal')?.classList.contains('is-open'));
 }
 
+/** Everything that sits behind the settings dialog. */
+const MODAL_BACKGROUND_SELECTOR = '.app-header, .app-main, .mobile-thumb-bar';
+const FOCUSABLE_SELECTOR =
+  'a[href], button:not([disabled]), input:not([disabled]):not([type="hidden"]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+function getSettingsModalFocusables() {
+  const modal = $('settingsModal');
+  if (!modal) return [];
+  // offsetParent is null for display:none elements (e.g. the hidden file input)
+  return [...modal.querySelectorAll(FOCUSABLE_SELECTOR)].filter((el) => el.offsetParent !== null);
+}
+
+/**
+ * A modal dialog must own the page while it is open: the content behind it becomes inert
+ * (not focusable, not clickable, hidden from assistive tech) and the page stops scrolling.
+ */
+function setPageBehindModalInert(isInert) {
+  document.querySelectorAll(MODAL_BACKGROUND_SELECTOR).forEach((el) => {
+    if (isInert) {
+      el.setAttribute('inert', '');
+      el.setAttribute('aria-hidden', 'true');
+    } else {
+      el.removeAttribute('inert');
+      el.removeAttribute('aria-hidden');
+    }
+  });
+  const body = document.body;
+  if (isInert) {
+    // Keep the layout from jumping sideways when the page scrollbar disappears
+    const scrollbarWidth = window.innerWidth - document.documentElement.clientWidth;
+    body.style.overflow = 'hidden';
+    if (scrollbarWidth > 0) body.style.paddingRight = `${scrollbarWidth}px`;
+  } else {
+    body.style.overflow = '';
+    body.style.paddingRight = '';
+  }
+}
+
+/** Keeps Tab / Shift+Tab cycling inside the dialog (also covers browsers without `inert`). */
+function trapSettingsModalTab(e) {
+  const items = getSettingsModalFocusables();
+  if (!items.length) return;
+  const first = items[0];
+  const last = items[items.length - 1];
+  const active = document.activeElement;
+  const inside = Boolean($('settingsModal')?.contains(active));
+  if (e.shiftKey && (active === first || !inside)) {
+    e.preventDefault();
+    last.focus();
+  } else if (!e.shiftKey && (active === last || !inside)) {
+    e.preventDefault();
+    first.focus();
+  }
+}
+
 function openSettingsModal() {
   renderSettingsModal();
-  if (!isSettingsModalOpen() && typeof document !== 'undefined') {
+  const wasOpen = isSettingsModalOpen();
+  if (!wasOpen && typeof document !== 'undefined') {
     settingsModalOpener = document.activeElement;
   }
   $('settingsModal')?.classList.add('is-open');
+  if (!wasOpen) setPageBehindModalInert(true);
   $('btnCloseSettings')?.focus?.();
 }
 
 function closeSettingsModal() {
   if (!isSettingsModalOpen()) return;
   $('settingsModal')?.classList.remove('is-open');
+  // Un-inert the page first: an inert opener could not take the focus back
+  setPageBehindModalInert(false);
   // Hand keyboard focus back to whatever opened the dialog
   settingsModalOpener?.focus?.();
   settingsModalOpener = null;
@@ -1962,9 +2035,12 @@ function bindEventListeners() {
     if (e.target?.id === 'settingsModal') closeSettingsModal();
   });
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && isSettingsModalOpen()) {
+    if (!isSettingsModalOpen()) return;
+    if (e.key === 'Escape') {
       e.preventDefault();
       closeSettingsModal();
+    } else if (e.key === 'Tab') {
+      trapSettingsModalTab(e);
     }
   });
 

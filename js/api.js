@@ -101,6 +101,18 @@ function round2(val) {
   return Number.isFinite(val) ? Math.round(val * 100) / 100 : null;
 }
 
+/** Finite number or null. Guards the `Number(null) === 0` / `Math.round(null) === 0` traps. */
+function finiteOrNull(val) {
+  if (val === null || val === undefined || val === '') return null;
+  const n = Number(val);
+  return Number.isFinite(n) ? n : null;
+}
+
+function roundOrNull(val) {
+  const n = finiteOrNull(val);
+  return n === null ? null : Math.round(n);
+}
+
 function avgFinite(arr) {
   let sum = 0;
   let count = 0;
@@ -1057,7 +1069,14 @@ const RECENT_HOURLY_VARS = [
   'snow_depth',
 ].join(',');
 
-function normalizeDailyFromPayload(payload, isRecentForecast = false, minIso = null, maxIso = null) {
+/**
+ * Open-Meteo archive / recent-forecast payload -> raw archive day rows.
+ * A value the source does not have stays null. Earlier this layer filled gaps with constants
+ * (humidity 75 %, pressure 1015 / 985 hPa, wind from 240°, soil 0 °C, "partly cloudy"), and those
+ * constants then travelled through the ensemble into charts and tables as if they were data.
+ * The only fallbacks kept are other real values of the same day (daily mean / max / dominant).
+ */
+export function normalizeDailyFromPayload(payload, isRecentForecast = false, minIso = null, maxIso = null) {
   const daily = payload?.daily;
   if (!daily || !Array.isArray(daily.time)) return [];
 
@@ -1123,9 +1142,9 @@ function normalizeDailyFromPayload(payload, isRecentForecast = false, minIso = n
     const hRows = hourlyByDate.get(isoDate) || [];
     const snowDepthM = maxFinite(hRows.map((h) => h.snowDepthM));
     const snowDepthCm = snowDepthM !== null ? round1(snowDepthM * 100) : null;
-    const humidity = hRows.length ? Math.round(avgFinite(hRows.map((h) => h.humidity)) ?? 75) : null;
+    const humidity = roundOrNull(avgFinite(hRows.map((h) => h.humidity)));
     const dewPointC = round1(avgFinite(hRows.map((h) => h.dewPointC)));
-    const cloudCoverPct = hRows.length ? Math.round(avgFinite(hRows.map((h) => h.cloudCoverPct)) ?? 40) : null;
+    const cloudCoverPct = roundOrNull(avgFinite(hRows.map((h) => h.cloudCoverPct)));
     const pressureMslHpa = round1(avgFinite(hRows.map((h) => h.pressureMslHpa)));
     const surfacePressureHpa = round1(avgFinite(hRows.map((h) => h.surfacePressureHpa)));
     const soil0C = round1(avgFinite(hRows.map((h) => h.soil0C)));
@@ -1133,21 +1152,26 @@ function normalizeDailyFromPayload(payload, isRecentForecast = false, minIso = n
     const soil18C = round1(avgFinite(hRows.map((h) => h.soil18C)));
     const soil54C = round1(avgFinite(hRows.map((h) => h.soil54C)));
 
+    const dayWindMs = finiteOrNull(daily.wind_speed_10m_max?.[i]);
+    const dayGustMs = finiteOrNull(daily.wind_gusts_10m_max?.[i]);
+    const dayWindDeg = finiteOrNull(daily.wind_direction_10m_dominant?.[i]);
+    const dayWeatherCode = finiteOrNull(daily.weather_code?.[i]);
+
     const hourlyRaw = hRows.length === 24
       ? hRows.map((h) => ({
           hour: h.hour,
-          tempC: round1(h.tempC ?? meanC),
-          precipMm: round2(h.precipMm ?? 0),
-          windMs: round1(h.windMs ?? daily.wind_speed_10m_max?.[i] ?? 2.5),
-          windDeg: Math.round(h.windDeg ?? daily.wind_direction_10m_dominant?.[i] ?? 240),
-          gustMs: round1(h.gustMs ?? daily.wind_gusts_10m_max?.[i] ?? 4.5),
-          humidity: Math.round(h.humidity ?? 75),
-          dewPointC: round1(h.dewPointC ?? minC - 1.5),
-          cloudCoverPct: Math.round(h.cloudCoverPct ?? 40),
-          pressureMslHpa: round1(h.pressureMslHpa ?? 1015),
-          surfacePressureHpa: round1(h.surfacePressureHpa ?? 985),
-          soil0C: round1(h.soil0C ?? 0),
-          weatherCode: h.weatherCode ?? daily.weather_code?.[i] ?? 2,
+          tempC: round1(finiteOrNull(h.tempC) ?? meanC),
+          precipMm: round2(finiteOrNull(h.precipMm) ?? 0),
+          windMs: round1(finiteOrNull(h.windMs) ?? dayWindMs),
+          windDeg: roundOrNull(finiteOrNull(h.windDeg) ?? dayWindDeg),
+          gustMs: round1(finiteOrNull(h.gustMs) ?? dayGustMs),
+          humidity: roundOrNull(h.humidity),
+          dewPointC: round1(finiteOrNull(h.dewPointC)),
+          cloudCoverPct: roundOrNull(h.cloudCoverPct),
+          pressureMslHpa: round1(finiteOrNull(h.pressureMslHpa)),
+          surfacePressureHpa: round1(finiteOrNull(h.surfacePressureHpa)),
+          soil0C: round1(finiteOrNull(h.soil0C)),
+          weatherCode: finiteOrNull(h.weatherCode) ?? dayWeatherCode,
         }))
       : null;
 
@@ -1158,14 +1182,14 @@ function normalizeDailyFromPayload(payload, isRecentForecast = false, minIso = n
       maxC,
       minC,
       meanC,
-      weatherCode: daily.weather_code?.[i] ?? 2,
+      weatherCode: dayWeatherCode,
       precipMm: round1(Number(daily.precipitation_sum?.[i] ?? 0)),
       rainMm: round1(Number(daily.rain_sum?.[i] ?? 0)),
       snowfallCm: round1(Number(daily.snowfall_sum?.[i] ?? 0)),
       snowDepthCm,
-      windMs: round1(Number(daily.wind_speed_10m_max?.[i] ?? 3.0)),
-      gustMs: round1(Number(daily.wind_gusts_10m_max?.[i] ?? 5.5)),
-      windDeg: Math.round(Number(daily.wind_direction_10m_dominant?.[i] ?? 240)),
+      windMs: round1(dayWindMs),
+      gustMs: round1(dayGustMs),
+      windDeg: roundOrNull(dayWindDeg),
       shortwaveRadMj: round1(Number(daily.shortwave_radiation_sum?.[i] ?? 0)),
       humidity,
       dewPointC,

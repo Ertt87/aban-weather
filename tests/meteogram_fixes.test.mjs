@@ -416,3 +416,166 @@ test('layout: the day timeline cannot blow out the «Произвольные д
   assert.match(appJs, /function revealTimelineSelection\(\)/);
   assert.ok((appJs.match(/revealTimelineSelection\(\);/g) || []).length >= 3, 'called after render and on both drawer-open paths');
 });
+
+test('time-of-day windows: day shift and night split the 24 hours without overlap', async () => {
+  const { TIME_WINDOWS } = await import('../js/config.js');
+  const hours = Array.from({ length: 24 }, (_, h) => h);
+  const day = hours.filter((h) => TIME_WINDOWS.day_shift.isHourActive(h));
+  const night = hours.filter((h) => TIME_WINDOWS.night.isHourActive(h));
+  assert.equal(day.length, 12);
+  assert.equal(night.length, 12);
+  assert.deepEqual(hours.filter((h) => day.includes(h) && night.includes(h)), [], '08:00 and 20:00 used to be in both windows');
+  assert.deepEqual([...day, ...night].sort((a, b) => a - b), hours);
+  assert.deepEqual([day[0], day[day.length - 1]], [8, 19]);
+  assert.equal(TIME_WINDOWS.full.isHourActive(0) && TIME_WINDOWS.full.isHourActive(23), true);
+});
+
+test('archive loader keeps gaps as null instead of stand-in constants', async () => {
+  const { normalizeDailyFromPayload } = await import('../js/api.js');
+  const { mergeArchiveDaysIntoDataset } = await import('../js/ensemble.js');
+  const iso = '2020-01-05';
+  const hours = Array.from({ length: 24 }, (_, h) => `${iso}T${String(h).padStart(2, '0')}:00`);
+  const nulls = hours.map(() => null);
+  const payload = {
+    daily: {
+      time: [iso],
+      temperature_2m_max: [-10],
+      temperature_2m_min: [-20],
+      temperature_2m_mean: [-15],
+      precipitation_sum: [1.2],
+      weather_code: [null],
+      wind_speed_10m_max: [null],
+      wind_gusts_10m_max: [null],
+      wind_direction_10m_dominant: [null],
+    },
+    hourly: {
+      time: hours,
+      temperature_2m: hours.map(() => -15),
+      precipitation: hours.map(() => 0.05),
+      wind_speed_10m: hours.map(() => 4),
+      relative_humidity_2m: nulls,
+      dew_point_2m: nulls,
+      weather_code: nulls,
+      pressure_msl: nulls,
+      surface_pressure: nulls,
+      cloud_cover: nulls,
+      wind_direction_10m: nulls,
+      wind_gusts_10m: nulls,
+      soil_temperature_0_to_7cm: nulls,
+      snow_depth: nulls,
+    },
+  };
+
+  const [raw] = normalizeDailyFromPayload(payload, false);
+  for (const key of ['humidity', 'cloudCoverPct', 'pressureMslHpa', 'surfacePressureHpa', 'windDeg', 'windMs', 'gustMs', 'weatherCode', 'soil0C', 'dewPointC', 'snowDepthCm']) {
+    assert.equal(raw[key], null, `daily ${key} must stay null when the source has no value`);
+  }
+  assert.equal(raw.maxC, -10);
+  assert.equal(raw.precipMm, 1.2);
+  assert.equal(raw.hourlyRaw.length, 24);
+  for (const hr of raw.hourlyRaw) {
+    for (const key of ['humidity', 'cloudCoverPct', 'pressureMslHpa', 'surfacePressureHpa', 'windDeg', 'gustMs', 'weatherCode', 'soil0C', 'dewPointC']) {
+      assert.equal(hr[key], null, `hourly ${key} must stay null`);
+    }
+    assert.equal(hr.tempC, -15);
+    assert.equal(hr.windMs, 4, 'a real hourly value is kept as is');
+  }
+  // None of the old stand-ins may reappear anywhere in the rows
+  const flat = JSON.stringify(raw);
+  for (const standIn of [':75,', ':1015,', ':985,', ':240,', ':40,']) {
+    assert.equal(flat.includes(standIn), false, `stand-in ${standIn} leaked into the archive row`);
+  }
+
+  // A real value of the same day is still used for an hour that lacks its own
+  const withDaily = JSON.parse(JSON.stringify(payload));
+  withDaily.daily.wind_direction_10m_dominant = [200];
+  withDaily.daily.weather_code = [71];
+  const [raw2] = normalizeDailyFromPayload(withDaily, false);
+  assert.equal(raw2.hourlyRaw[5].windDeg, 200);
+  assert.equal(raw2.hourlyRaw[5].weatherCode, 71);
+
+  // End to end: the day record says "no pressure / no bearing / humidity estimated" instead of showing constants
+  const merged = mergeArchiveDaysIntoDataset(buildDataset(), [raw]);
+  const day = merged.days.find((d) => d.isoDate === iso);
+  assert.ok(day, 'archive day is merged into the dataset');
+  assert.equal(day.isArchive, true);
+  assert.equal(day.pressureStationMm, null);
+  assert.equal(day.windDirShort, '—');
+  assert.equal(day.windMs, 4, 'wind speed comes from the real hourly values');
+  assert.deepEqual(
+    [day.dataQuality.hasPressure, day.dataQuality.hasWindDirection, day.dataQuality.humidityEstimated, day.dataQuality.soilEstimated, day.dataQuality.snowEstimated],
+    [false, false, true, true, true]
+  );
+  assert.ok(day.hours.every((h) => h.pressureStationMm === null));
+});
+
+test('keyboard on the hourly chart: Enter picks, arrows step, focus returns after re-render', async () => {
+  const { renderDiurnalChart } = await import('../js/charts.js');
+  const ds = buildDataset();
+  const day = ds.days.find((d) => d.offsetFromToday === 0);
+  assert.equal(day.hours.length, 24);
+
+  let focusedHour = null;
+  const makeHourNode = (h) => ({
+    getAttribute: (name) => (name === 'data-hour' ? String(h) : name === 'tabindex' ? '0' : null),
+    closest: () => makeHourNode(h),
+    focus: () => {
+      focusedHour = h;
+    },
+  });
+  const el = makeContainer();
+  el.querySelectorAll = () => Array.from({ length: 24 }, (_, h) => makeHourNode(h));
+
+  const picked = [];
+  renderDiurnalChart(el, day, { ...UI, selectedDayId: day.id, selectedHourSlot: 12 }, (h) => picked.push(h));
+  const keydown = el.listeners.keydown[0];
+  const press = (key, hour) => {
+    let prevented = false;
+    keydown({ key, target: makeHourNode(hour), preventDefault: () => { prevented = true; } });
+    return prevented;
+  };
+
+  assert.equal(press('Enter', 9), true);
+  assert.deepEqual(picked, [9]);
+  assert.equal(focusedHour, 9, 'focus must return to the picked hour');
+
+  press('ArrowRight', 9);
+  assert.deepEqual(picked, [9, 10]);
+  assert.equal(focusedHour, 10);
+
+  press('ArrowLeft', 10);
+  assert.equal(picked[picked.length - 1], 9);
+  assert.equal(focusedHour, 9);
+
+  // Stepping past either end stays on the edge hour
+  press('ArrowLeft', 0);
+  assert.equal(focusedHour, 0);
+  press('ArrowRight', 23);
+  assert.equal(focusedHour, 23);
+
+  const before = picked.length;
+  assert.equal(press('a', 5), false, 'other keys are left alone');
+  assert.equal(picked.length, before);
+});
+
+test('static: settings dialog owns the page, and an auto-corrected date range says so', () => {
+  const appJs = readText('js/app.js');
+
+  // Dialog: background inert + scroll lock on open, undone before focus goes back to the opener
+  assert.match(appJs, /function setPageBehindModalInert\(isInert\)/);
+  assert.match(appJs, /el\.setAttribute\('inert', ''\)/);
+  assert.match(appJs, /body\.style\.overflow = 'hidden'/);
+  assert.match(appJs, /function trapSettingsModalTab\(e\)/);
+  assert.match(appJs, /else if \(e\.key === 'Tab'\) \{\s*trapSettingsModalTab\(e\);/);
+  const closeFn = appJs.slice(appJs.indexOf('function closeSettingsModal()'));
+  assert.ok(
+    closeFn.indexOf('setPageBehindModalInert(false)') < closeFn.indexOf('settingsModalOpener?.focus'),
+    'the page must stop being inert before the opener is focused'
+  );
+
+  // Date range: the correction notice is applied at the end, not overwritten by the default hint
+  assert.equal(/hint\.textContent = 'Диапазон скорректирован/.test(appJs), false);
+  assert.match(appJs, /hint\.textContent = notice \? notice\.text : 'ERA5-Land \+ Прогноз';/);
+  assert.match(appJs, /«С даты» сдвинута на/);
+  assert.match(appJs, /«По дату» сдвинута на/);
+});

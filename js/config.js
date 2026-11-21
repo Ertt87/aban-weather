@@ -80,7 +80,9 @@ export const TIME_WINDOWS = {
         id: 'day_shift',
         label: 'Дневная смена (08:00–20:00)',
         shortLabel: '08–20ч',
-        isHourActive: (h) => h >= 8 && h <= 20
+        // Half-open [08, 20): together with the night window this covers the day exactly once.
+        // With both ends included, 08:00 and 20:00 were counted in the day AND the night window.
+        isHourActive: (h) => h >= 8 && h < 20
     },
     daylight: {
         id: 'daylight',
@@ -96,7 +98,7 @@ export const TIME_WINDOWS = {
         id: 'night',
         label: 'Ночь (20:00–08:00)',
         shortLabel: '20–08ч',
-        isHourActive: (h) => h >= 20 || h <= 8
+        isHourActive: (h) => h >= 20 || h < 8
     }
 };
 

@@ -922,6 +922,7 @@ function buildZoneDayRecord({
     // Build real 24h hours[0..23] when hourly observations/forecasts exist
     // ------------------------------------------------------------------------
     const realHours = [];
+    let hoursWithHumidity = 0;
     const hasAnyHourly = modelSourcesForDay.some((m) => m.hourlyMap && m.hourlyMap.size >= 4) || (Array.isArray(rawArchiveDay?.hourlyRaw) && rawArchiveDay.hourlyRaw.length >= 6);
 
     if (hasAnyHourly && zone !== 'subseasonal') {
@@ -1006,6 +1007,9 @@ function buildZoneDayRecord({
             if (rawTemp === null) continue;
 
             const tempC = +rawTemp.toFixed(1);
+            // 72 % is only a working value for the wet-bulb / phase maths of this hour;
+            // the day is flagged as "humidity estimated" unless some hour had a real reading.
+            if (humEntries.length) hoursWithHumidity++;
             const humidity = Math.round(clamp(weightedMean(humEntries) ?? 72, 10, 100));
             const dewPointC = +(weightedMean(dewEntries) ?? (tempC - (100 - humidity) / 5)).toFixed(1);
             const precipMm = +(Math.max(0, weightedMean(precipEntries) ?? 0)).toFixed(2);
@@ -1320,7 +1324,7 @@ function buildZoneDayRecord({
     // They still feed the precipitation-phase logic, but are flagged so charts do not plot them as data.
     const modelledHumidity =
         toNum(rawArchiveDay?.humidity) ??
-        (sortedRealHours.length ? avgArr(sortedRealHours.map((h) => h.humidity)) : null) ??
+        (sortedRealHours.length && hoursWithHumidity > 0 ? avgArr(sortedRealHours.map((h) => h.humidity)) : null) ??
         toNum(googleData?.dailyByDate?.get(isoDate)?.humidity);
     const humidityEstimated = modelledHumidity === null;
     const humidity = Math.round(

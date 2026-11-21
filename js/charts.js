@@ -481,14 +481,28 @@ function bindDiurnalScrubbing(containerEl, { onSelectHour, slots, viewBoxW }) {
         });
 
         containerEl.addEventListener('keydown', (e) => {
-            if (e.key !== 'Enter' && e.key !== ' ') return;
+            const isActivate = e.key === 'Enter' || e.key === ' ';
+            const stepBy = e.key === 'ArrowRight' ? 1 : e.key === 'ArrowLeft' ? -1 : 0;
+            if (!isActivate && !stepBy) return;
             const target = e.target?.closest?.('[data-hour]');
             if (!target || typeof state.onSelectHour !== 'function') return;
-            const h = Number(target.getAttribute('data-hour'));
-            if (Number.isFinite(h)) {
-                e.preventDefault();
-                notifyHour(h, true);
-            }
+            const current = Number(target.getAttribute('data-hour'));
+            if (!Number.isFinite(current)) return;
+
+            // Enter / Space pick the focused hour; ← / → step to the neighbouring one
+            const hours = (state.slots || []).map((s) => s.hour);
+            const minHour = hours.length ? Math.min(...hours) : 0;
+            const maxHour = hours.length ? Math.max(...hours) : 23;
+            const h = clamp(current + stepBy, minHour, maxHour);
+            e.preventDefault();
+            notifyHour(h, true);
+
+            // Selecting re-renders the chart and destroys the focused node: hand focus back to
+            // the same hour so keyboard navigation can continue from where it was.
+            const again = [...(containerEl.querySelectorAll?.('[data-hour][tabindex]') || [])].find(
+                (el) => Number(el.getAttribute('data-hour')) === h
+            );
+            again?.focus?.({ preventScroll: true });
         });
     }
 
