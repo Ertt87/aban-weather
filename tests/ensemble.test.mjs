@@ -285,25 +285,16 @@ test('buildUnifiedDataset builds all 4 zones covering past + 35d with monotonic 
   assert.ok(dataset.channels && typeof dataset.channels === 'object');
   assert.ok(dataset.errors && typeof dataset.errors === 'object');
 
-  // Monotonic quantiles on all forecast days
+  // Ensemble percentiles are ordered around the members' median; the point forecast
+  // blends other models and can legitimately fall outside their interval.
   for (const day of dataset.days) {
-    if (day.maxP10C != null && day.maxP90C != null) {
-      assert.ok(
-        day.maxP10C <= day.maxP25C &&
-          day.maxP25C <= day.maxC &&
-          day.maxC <= day.maxP75C &&
-          day.maxP75C <= day.maxP90C,
-        `max quantiles not monotonic on ${day.isoDate}: ${day.maxP10C} <= ${day.maxP25C} <= ${day.maxC} <= ${day.maxP75C} <= ${day.maxP90C}`,
-      );
-    }
-    if (day.minP10C != null && day.minP90C != null) {
-      assert.ok(
-        day.minP10C <= day.minP25C &&
-          day.minP25C <= day.minC &&
-          day.minC <= day.minP75C &&
-          day.minP75C <= day.minP90C,
-        `min quantiles not monotonic on ${day.isoDate}: ${day.minP10C} <= ${day.minP25C} <= ${day.minC} <= ${day.minP75C} <= ${day.minP90C}`,
-      );
+    const row = bundle.ensemble35.dailyQuantiles.find(q => q.isoDate === day.isoDate);
+    for (const series of ['max', 'min']) {
+      const bounds = [10, 25, 75, 90].map(q => day[`${series}P${q}C`]);
+      if (!bounds.every(Number.isFinite)) continue;
+      const center = day.temperatureRange.kind === 'ensemble' ? row[series + 'P50C'] : day[series + 'C'];
+      assert.ok(bounds[0] <= bounds[1] && bounds[1] <= center && center <= bounds[2] && bounds[2] <= bounds[3],
+        `unordered ${series} bounds on ${day.isoDate}: ${bounds}, center ${center}`);
     }
     assert.ok(day.minC <= day.maxC, `minC (${day.minC}) must be <= maxC (${day.maxC}) on ${day.isoDate}`);
   }

@@ -1,3 +1,4 @@
+import { localHourStart, localParts, openMeteoHourSlots, precipInterval, sumPrecipIntervals, weatherTimeMs } from './precipitation.js';
 import { ABAN_COORDS } from './config.js';
 import {
   loadMosCache,
@@ -140,22 +141,14 @@ function maxFinite(arr) {
   return found ? best : null;
 }
 
-function createTimeoutSignal(ms) {
-  if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') {
-    return { signal: AbortSignal.timeout(ms), cleanup: () => {} };
-  }
+async function fetchJsonWithTimeout(url, parentSignal, timeoutMs = REQUEST_TIMEOUT_MS) {
+  if (parentSignal?.aborted) throw parentSignal.reason;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(new Error(`Timeout ${ms}ms`)), ms);
-  return {
-    signal: controller.signal,
-    cleanup: () => clearTimeout(timer),
-  };
-}
-
-async function fetchJsonWithTimeout(url, timeoutMs = REQUEST_TIMEOUT_MS, init = {}) {
-  const { signal, cleanup } = createTimeoutSignal(timeoutMs);
+  const cancel = () => controller.abort(parentSignal.reason);
+  parentSignal?.addEventListener('abort', cancel, { once: true });
+  const timer = setTimeout(() => controller.abort(new Error(`Timeout ${timeoutMs}ms`)), timeoutMs);
   try {
-    const resp = await fetch(url, { ...init, signal });
+    const resp = await fetch(url, { signal: controller.signal });
     if (!resp.ok) {
       let detail = `HTTP ${resp.status}`;
       try {
@@ -166,9 +159,12 @@ async function fetchJsonWithTimeout(url, timeoutMs = REQUEST_TIMEOUT_MS, init = 
       err.status = resp.status;
       throw err;
     }
-    return await resp.json();
+    const data = await resp.json();
+    if (controller.signal.aborted) throw controller.signal.reason;
+    return data;
   } finally {
-    cleanup();
+    clearTimeout(timer);
+    parentSignal?.removeEventListener('abort', cancel);
   }
 }
 
@@ -215,7 +211,7 @@ function buildGoogleBaseQuery(apiKey) {
   });
 }
 
-async function fetchGooglePaginated(endpoint, baseParams, extraParams, arrayField, maxPages, maxItems) {
+async function fetchGooglePaginated(endpoint, baseParams, extraParams, arrayField, maxPages, maxItems, signal) {
   const collected = [];
   let pageToken = '';
   let page = 0;
@@ -228,7 +224,7 @@ async function fetchGooglePaginated(endpoint, baseParams, extraParams, arrayFiel
     if (pageToken) {
       params.set('pageToken', pageToken);
     }
-    const json = await fetchJsonWithTimeout(`https://weather.googleapis.com/v1/${endpoint}?${params.toString()}`);
+    const json = await fetchJsonWithTimeout(`https://weather.googleapis.com/v1/${endpoint}?${params.toString()}`, signal);
     const items = Array.isArray(json?.[arrayField]) ? json[arrayField] : [];
     if (items.length) {
       collected.push(...items);
@@ -241,15 +237,15 @@ async function fetchGooglePaginated(endpoint, baseParams, extraParams, arrayFiel
   return collected.slice(0, maxItems);
 }
 
-async function fetchGoogleWeatherBundle(apiKey) {
+async function fetchGoogleWeatherBundle(apiKey, signal) {
   const t0 = performance.now();
   const baseParams = buildGoogleBaseQuery(apiKey);
 
   const [curRes, daysRes, hoursRes, histRes] = await Promise.allSettled([
-    fetchJsonWithTimeout(`https://weather.googleapis.com/v1/currentConditions:lookup?${baseParams.toString()}`),
-    fetchGooglePaginated('forecast/days:lookup', baseParams, { days: 10, pageSize: 10 }, 'forecastDays', 3, 10),
-    fetchGooglePaginated('forecast/hours:lookup', baseParams, { hours: 240, pageSize: 24 }, 'forecastHours', 10, 240),
-    fetchGooglePaginated('history/hours:lookup', baseParams, { hours: 24, pageSize: 24 }, 'historyHours', 2, 24),
+    fetchJsonWithTimeout(`https://weather.googleapis.com/v1/currentConditions:lookup?${baseParams.toString()}`, signal),
+    fetchGooglePaginated('forecast/days:lookup', baseParams, { days: 10, pageSize: 10 }, 'forecastDays', 3, 10, signal),
+    fetchGooglePaginated('forecast/hours:lookup', baseParams, { hours: 240, pageSize: 24 }, 'forecastHours', 10, 240, signal),
+    fetchGooglePaginated('history/hours:lookup', baseParams, { hours: 24, pageSize: 24 }, 'historyHours', 2, 24, signal),
   ]);
 
   if (curRes.status === 'rejected' && daysRes.status === 'rejected') {
@@ -366,7 +362,7 @@ function mergeSingleModelIntoMulti(target, singleJson, modelName) {
   return target;
 }
 
-async function fetchOpenMeteoMulti() {
+async function fetchOpenMeteoMulti(signal) {
   const baseObj = {
     latitude: String(ABAN_COORDS.lat),
     longitude: String(ABAN_COORDS.lon),
@@ -384,7 +380,7 @@ async function fetchOpenMeteoMulti() {
   let data;
   try {
     data = normalizeOpenMeteoModelKeys(
-      await fetchJsonWithTimeout(`https://api.open-meteo.com/v1/forecast?${new URLSearchParams(baseObj).toString()}`)
+      await fetchJsonWithTimeout(`https://api.open-meteo.com/v1/forecast?${new URLSearchParams(baseObj).toString()}`, signal)
     );
   } catch (err) {
     if (err.status !== 400) throw err;
@@ -402,8 +398,8 @@ async function fetchOpenMeteoMulti() {
     });
 
     const [coreRes, aifsRes] = await Promise.allSettled([
-      fetchJsonWithTimeout(`https://api.open-meteo.com/v1/forecast?${coreParams.toString()}`),
-      fetchJsonWithTimeout(`https://api.open-meteo.com/v1/forecast?${aifsParams.toString()}`),
+      fetchJsonWithTimeout(`https://api.open-meteo.com/v1/forecast?${coreParams.toString()}`, signal),
+      fetchJsonWithTimeout(`https://api.open-meteo.com/v1/forecast?${aifsParams.toString()}`, signal),
     ]);
 
     if (coreRes.status === 'rejected') throw coreRes.reason;
@@ -421,7 +417,7 @@ async function fetchOpenMeteoMulti() {
   return { data, fromCache: false, detail: `Все ${OM_MODELS.length} модели отдали данные` };
 }
 
-async function fetchOpenMeteoCompanion(forceRefresh = false) {
+async function fetchOpenMeteoCompanion(forceRefresh = false, signal) {
   if (!forceRefresh) {
     const fresh = loadCompanionCache(COMPANION_TTL_MS);
     if (fresh?.payload) {
@@ -457,10 +453,11 @@ async function fetchOpenMeteoCompanion(forceRefresh = false) {
 
   try {
     const data = await fetchJsonWithTimeout(
-      `https://api.open-meteo.com/v1/forecast?${params.toString()}`,
+      `https://api.open-meteo.com/v1/forecast?${params.toString()}`, signal,
       COMPANION_TIMEOUT_MS
     );
     // `current` is time-stamped: never persist it, or a cached slice would pin "today" to the past
+    if (signal?.aborted) throw signal.reason;
     saveCompanionCache({ ...data, current: undefined });
     return { data, fromCache: false };
   } catch (err) {
@@ -480,7 +477,7 @@ async function fetchOpenMeteoCompanion(forceRefresh = false) {
   }
 }
 
-async function fetchPreviousRunsMos(forceRefresh = false) {
+async function fetchPreviousRunsMos(forceRefresh = false, signal) {
   if (!forceRefresh) {
     const cached = loadMosCache(MOS_TTL_MS);
     if (cached) return { data: cached, fromCache: true };
@@ -500,7 +497,7 @@ async function fetchPreviousRunsMos(forceRefresh = false) {
   let data;
   try {
     data = await fetchJsonWithTimeout(
-      `https://previous-runs-api.open-meteo.com/v1/forecast?${new URLSearchParams(baseObj).toString()}`,
+      `https://previous-runs-api.open-meteo.com/v1/forecast?${new URLSearchParams(baseObj).toString()}`, signal,
       SLOW_CHANNEL_TIMEOUT_MS
     );
   } catch (err) {
@@ -510,12 +507,13 @@ async function fetchPreviousRunsMos(forceRefresh = false) {
       models: 'ecmwf_ifs025,icon_seamless,gfs_seamless',
     });
     data = await fetchJsonWithTimeout(
-      `https://previous-runs-api.open-meteo.com/v1/forecast?${fallbackParams.toString()}`,
+      `https://previous-runs-api.open-meteo.com/v1/forecast?${fallbackParams.toString()}`, signal,
       SLOW_CHANNEL_TIMEOUT_MS
     );
   }
 
   normalizeOpenMeteoModelKeys(data);
+  if (signal?.aborted) throw signal.reason;
   saveMosCache(data);
   return { data, fromCache: false };
 }
@@ -541,7 +539,7 @@ function classifyEnsembleKey(key) {
   return null;
 }
 
-function addSixHourlyToDailyBuckets(sixHourly, byDate) {
+function addSixHourlyToDailyBuckets(sixHourly, byDate, source) {
   const times = sixHourly?.time;
   if (!Array.isArray(times) || !times.length) return;
 
@@ -558,7 +556,7 @@ function addSixHourlyToDailyBuckets(sixHourly, byDate) {
     }
     let rec = dm.get(key);
     if (!rec) {
-      rec = { max: -Infinity, min: Infinity, precip: 0, hasPrecip: false, wind: -Infinity };
+      rec = { max: -Infinity, min: Infinity, precip: [], wind: -Infinity };
       dm.set(key, rec);
     }
     return rec;
@@ -580,9 +578,9 @@ function addSixHourlyToDailyBuckets(sixHourly, byDate) {
       const v = sixHourly[k]?.[i];
       if (v !== null && v !== undefined && Number.isFinite(Number(v))) {
         const suffix = k.replace(/^precipitation/, '');
-        const m = ensureMember(isoDate, suffix);
-        m.precip += Number(v);
-        m.hasPrecip = true;
+        const start = weatherTimeMs(times[i]) - 6 * 3_600_000;
+        const block = precipInterval(start, 6, Number(v));
+        if (block) ensureMember(localParts(start).isoDate, suffix).precip.push(block);
       }
     }
     for (const k of windKeys) {
@@ -599,13 +597,15 @@ function addSixHourlyToDailyBuckets(sixHourly, byDate) {
   for (const [isoDate, members] of dayMemberAcc.entries()) {
     let bucket = byDate.get(isoDate);
     if (!bucket) {
-      bucket = { maxVals: [], minVals: [], precipVals: [], windVals: [] };
+      bucket = { maxVals: [], minVals: [], precipVals: [], windVals: [], sources: new Set() };
       byDate.set(isoDate, bucket);
     }
     for (const m of members.values()) {
+      if (source && (m.max > -Infinity || m.min < Infinity)) bucket.sources.add(source);
       if (m.max > -Infinity) bucket.maxVals.push(m.max);
       if (m.min < Infinity) bucket.minVals.push(m.min);
-      if (m.hasPrecip) bucket.precipVals.push(m.precip);
+      const amount = sumPrecipIntervals(m.precip, localHourStart(isoDate, 0), 24).mm;
+      if (amount !== null) bucket.precipVals.push(amount);
       if (m.wind > -Infinity) bucket.windVals.push(m.wind);
     }
   }
@@ -633,18 +633,19 @@ export function aggregateEnsembleQuantiles(entries) {
         const isoDate = String(times[i]).slice(0, 10);
         let bucket = byDate.get(isoDate);
         if (!bucket) {
-          bucket = { maxVals: [], minVals: [], precipVals: [], windVals: [] };
+          bucket = { maxVals: [], minVals: [], precipVals: [], windVals: [], sources: new Set() };
           byDate.set(isoDate, bucket);
         }
         for (const [field, arr] of keysByBucket) {
           const val = arr[i];
           if (val !== null && val !== undefined && Number.isFinite(Number(val))) {
             bucket[field].push(Number(val));
+            if (source && (field === 'maxVals' || field === 'minVals')) bucket.sources.add(source);
           }
         }
       }
     } else if (payload.six_hourly && Array.isArray(payload.six_hourly.time)) {
-      addSixHourlyToDailyBuckets(payload.six_hourly, byDate);
+      addSixHourlyToDailyBuckets(payload.six_hourly, byDate, source);
     }
   }
 
@@ -658,7 +659,7 @@ export function aggregateEnsembleQuantiles(entries) {
     const pS = [...b.precipVals].sort((a, c) => a - c);
     const wS = [...b.windVals].sort((a, c) => a - c);
 
-    if (!maxS.length && !minS.length) continue;
+    if (!maxS.length && !minS.length && !pS.length && !wS.length) continue;
 
     const maxP10C = round1(quantile(maxS, 0.1));
     const maxP25C = round1(quantile(maxS, 0.25));
@@ -672,19 +673,19 @@ export function aggregateEnsembleQuantiles(entries) {
     const minP75C = round1(quantile(minS, 0.75));
     const minP90C = round1(quantile(minS, 0.9));
 
-    const precipP50Mm = round1(quantile(pS, 0.5) ?? 0);
-    const precipP75Mm = round1(quantile(pS, 0.75) ?? precipP50Mm ?? 0);
-    const precipP90Mm = round1(quantile(pS, 0.9) ?? precipP75Mm ?? 0);
+    const precipP50Mm = round1(quantile(pS, 0.5));
+    const precipP75Mm = round1(quantile(pS, 0.75));
+    const precipP90Mm = round1(quantile(pS, 0.9));
 
-    const windP50Ms = round1(quantile(wS, 0.5) ?? 3.5);
-    const windP90Ms = round1(quantile(wS, 0.9) ?? windP50Ms ?? 6.0);
+    const windP50Ms = round1(quantile(wS, 0.5));
+    const windP90Ms = round1(quantile(wS, 0.9));
 
     const probBelowMinus20 = minS.length
       ? Math.round((minS.filter((v) => v <= -20).length / minS.length) * 100)
-      : 0;
+      : null;
     const probPrecipOver5 = pS.length
       ? Math.round((pS.filter((v) => v >= 5).length / pS.length) * 100)
-      : 0;
+      : null;
 
     dailyQuantiles.push({
       isoDate,
@@ -706,13 +707,15 @@ export function aggregateEnsembleQuantiles(entries) {
       probBelowMinus20,
       probPrecipOver5,
       memberCount: Math.max(maxS.length, minS.length),
+      temperatureMemberCount: Math.min(maxS.length, minS.length),
+      sources: [...b.sources],
     });
   }
 
   return { sources, dailyQuantiles };
 }
 
-async function fetchEnsemble35() {
+async function fetchEnsemble35(signal) {
   const commonParams = {
     latitude: String(ABAN_COORDS.lat),
     longitude: String(ABAN_COORDS.lon),
@@ -736,9 +739,9 @@ async function fetchEnsemble35() {
   // GEFS usually ends 1–2 days short of the 35-day horizon, so the seasonal ensemble is fetched
   // in parallel and used ONLY for the dates the primary ensembles leave uncovered.
   const [ecmwfRes, gefsRes, seasonalRes] = await Promise.allSettled([
-    fetchJsonWithTimeout(`https://ensemble-api.open-meteo.com/v1/ensemble?${ecmwfParams.toString()}`),
-    fetchJsonWithTimeout(`https://ensemble-api.open-meteo.com/v1/ensemble?${gefsParams.toString()}`),
-    fetchSeasonalEnsemble(commonParams),
+    fetchJsonWithTimeout(`https://ensemble-api.open-meteo.com/v1/ensemble?${ecmwfParams.toString()}`, signal),
+    fetchJsonWithTimeout(`https://ensemble-api.open-meteo.com/v1/ensemble?${gefsParams.toString()}`, signal),
+    fetchSeasonalEnsemble(commonParams, signal),
   ]);
 
   const payloads = [];
@@ -761,14 +764,14 @@ async function fetchEnsemble35() {
   return aggregated;
 }
 
-async function fetchSeasonalEnsemble(commonParams) {
+async function fetchSeasonalEnsemble(commonParams, signal) {
   const seasonalParams = new URLSearchParams({
     ...commonParams,
     forecast_days: '35',
   });
   try {
     return await fetchJsonWithTimeout(
-      `https://seasonal-api.open-meteo.com/v1/seasonal?${seasonalParams.toString()}`,
+      `https://seasonal-api.open-meteo.com/v1/seasonal?${seasonalParams.toString()}`, signal,
       SLOW_CHANNEL_TIMEOUT_MS
     );
   } catch (err) {
@@ -783,7 +786,7 @@ async function fetchSeasonalEnsemble(commonParams) {
       six_hourly: 'temperature_2m,precipitation,wind_speed_10m',
     });
     return fetchJsonWithTimeout(
-      `https://seasonal-api.open-meteo.com/v1/seasonal?${sixHourlyParams.toString()}`,
+      `https://seasonal-api.open-meteo.com/v1/seasonal?${sixHourlyParams.toString()}`, signal,
       SLOW_CHANNEL_TIMEOUT_MS
     );
   }
@@ -815,19 +818,19 @@ export function mergeQuantileFallback(primary, fallback) {
 // ============================================================================
 // MET NORWAY & OPEN-METEO AIR QUALITY
 // ============================================================================
-async function fetchMetNo() {
+async function fetchMetNo(signal) {
   const url = `https://api.met.no/weatherapi/locationforecast/2.0/compact?lat=${ABAN_COORDS.lat}&lon=${ABAN_COORDS.lon}&altitude=${ABAN_COORDS.elev}`;
-  return fetchJsonWithTimeout(url);
+  return fetchJsonWithTimeout(url, signal);
 }
 
-async function fetchAirQuality() {
+async function fetchAirQuality(signal) {
   const params = new URLSearchParams({
     latitude: String(ABAN_COORDS.lat),
     longitude: String(ABAN_COORDS.lon),
     current: 'pm2_5,pm10,carbon_monoxide,european_aqi',
     timezone: ABAN_COORDS.tz,
   });
-  return fetchJsonWithTimeout(`https://air-quality-api.open-meteo.com/v1/air-quality?${params.toString()}`);
+  return fetchJsonWithTimeout(`https://air-quality-api.open-meteo.com/v1/air-quality?${params.toString()}`, signal);
 }
 
 // ============================================================================
@@ -901,6 +904,7 @@ export async function fetchAllWeatherSources({
   preferredOmModel = 'multi',
   forceRefresh = false,
   onPartial = null,
+  signal,
   partialGraceMs = PARTIAL_GRACE_MS,
 } = {}) {
   const t0 = performance.now();
@@ -913,15 +917,15 @@ export async function fetchAllWeatherSources({
     google: runTimedChannel(
       'google',
       shouldGoogle,
-      () => fetchGoogleWeatherBundle(cleanKey),
+      () => fetchGoogleWeatherBundle(cleanKey, signal),
       hasGoogleKey ? 'Отключён режимом' : 'Ключ API не задан'
     ),
-    openMeteoMulti: runTimedChannel('openMeteoMulti', shouldOpenMeteo, () => fetchOpenMeteoMulti()),
-    openMeteoCompanion: runTimedChannel('openMeteoCompanion', shouldOpenMeteo, () => fetchOpenMeteoCompanion(forceRefresh)),
-    previousRuns: runTimedChannel('previousRuns', shouldOpenMeteo, () => fetchPreviousRunsMos(forceRefresh)),
-    ensemble35: runTimedChannel('ensemble35', shouldOpenMeteo, () => fetchEnsemble35()),
-    metNo: runTimedChannel('metNo', shouldOpenMeteo && mode === 'hybrid', () => fetchMetNo()),
-    airQuality: runTimedChannel('airQuality', true, () => fetchAirQuality()),
+    openMeteoMulti: runTimedChannel('openMeteoMulti', shouldOpenMeteo, () => fetchOpenMeteoMulti(signal)),
+    openMeteoCompanion: runTimedChannel('openMeteoCompanion', shouldOpenMeteo, () => fetchOpenMeteoCompanion(forceRefresh, signal)),
+    previousRuns: runTimedChannel('previousRuns', shouldOpenMeteo, () => fetchPreviousRunsMos(forceRefresh, signal)),
+    ensemble35: runTimedChannel('ensemble35', shouldOpenMeteo, () => fetchEnsemble35(signal)),
+    metNo: runTimedChannel('metNo', shouldOpenMeteo && mode === 'hybrid', () => fetchMetNo(signal)),
+    airQuality: runTimedChannel('airQuality', true, () => fetchAirQuality(signal)),
   };
 
   // runTimedChannel never rejects, so these trackers are safe to await/race directly
@@ -986,7 +990,7 @@ export async function fetchAllWeatherSources({
         : allDone
     );
     const first = await Promise.race([allDone, coreThenGrace]);
-    if (first === 'partial' && Object.keys(settled).length < CHANNEL_ORDER.length) {
+    if (!signal?.aborted && first === 'partial' && Object.keys(settled).length < CHANNEL_ORDER.length) {
       try {
         onPartial(assembleBundle(true));
       } catch (_) {
@@ -996,6 +1000,7 @@ export async function fetchAllWeatherSources({
   }
 
   await allDone;
+  if (signal?.aborted) throw signal.reason;
   const bundle = assembleBundle(false);
 
   if (mode === 'google_wn3' && hasGoogleKey && !bundle.google) {
@@ -1005,6 +1010,7 @@ export async function fetchAllWeatherSources({
     shouldOpenMeteo &&
     !bundle.openMeteoMulti &&
     !bundle.openMeteoCompanion &&
+    !bundle.ensemble35?.dailyQuantiles?.length &&
     !bundle.google
   ) {
     throw new Error(bundle.errors.openMeteoMulti || bundle.errors.openMeteoCompanion || 'Нет связи с метеосерверами');
@@ -1083,18 +1089,15 @@ export function normalizeDailyFromPayload(payload, isRecentForecast = false, min
   const hourly = payload?.hourly;
   const hourlyByDate = new Map();
   if (hourly && Array.isArray(hourly.time)) {
-    for (let i = 0; i < hourly.time.length; i++) {
-      const tStr = String(hourly.time[i]);
-      const isoDate = tStr.slice(0, 10);
-      const hour = Number(tStr.slice(11, 13));
+    for (const { isoDate, hour, instantIndex: i, precipIndex: p } of openMeteoHourSlots(hourly.time)) {
       if (!hourlyByDate.has(isoDate)) hourlyByDate.set(isoDate, []);
       hourlyByDate.get(isoDate).push({
         hour,
         tempC: hourly.temperature_2m?.[i] ?? null,
         humidity: hourly.relative_humidity_2m?.[i] ?? null,
         dewPointC: hourly.dew_point_2m?.[i] ?? null,
-        precipMm: hourly.precipitation?.[i] ?? null,
-        snowfallCm: hourly.snowfall?.[i] ?? null,
+        precipMm: hourly.precipitation?.[p] ?? null,
+        snowfallCm: hourly.snowfall?.[p] ?? null,
         weatherCode: hourly.weather_code?.[i] ?? null,
         pressureMslHpa: hourly.pressure_msl?.[i] ?? null,
         surfacePressureHpa: hourly.surface_pressure?.[i] ?? null,
@@ -1157,11 +1160,11 @@ export function normalizeDailyFromPayload(payload, isRecentForecast = false, min
     const dayWindDeg = finiteOrNull(daily.wind_direction_10m_dominant?.[i]);
     const dayWeatherCode = finiteOrNull(daily.weather_code?.[i]);
 
-    const hourlyRaw = hRows.length === 24
+    const hourlyRaw = hRows.length
       ? hRows.map((h) => ({
           hour: h.hour,
-          tempC: round1(finiteOrNull(h.tempC) ?? meanC),
-          precipMm: round2(finiteOrNull(h.precipMm) ?? 0),
+          tempC: round1(finiteOrNull(h.tempC)),
+          precipMm: round2(finiteOrNull(h.precipMm)),
           windMs: round1(finiteOrNull(h.windMs) ?? dayWindMs),
           windDeg: roundOrNull(finiteOrNull(h.windDeg) ?? dayWindDeg),
           gustMs: round1(finiteOrNull(h.gustMs) ?? dayGustMs),
@@ -1172,18 +1175,20 @@ export function normalizeDailyFromPayload(payload, isRecentForecast = false, min
           surfacePressureHpa: round1(finiteOrNull(h.surfacePressureHpa)),
           soil0C: round1(finiteOrNull(h.soil0C)),
           weatherCode: finiteOrNull(h.weatherCode) ?? dayWeatherCode,
+          weatherCodeFromDay: finiteOrNull(h.weatherCode) === null,
         }))
       : null;
 
     results.push({
       isoDate,
       zone: 'archive',
-      confidencePct: 99,
+      confidencePct: null,
       maxC,
       minC,
       meanC,
       weatherCode: dayWeatherCode,
-      precipMm: round1(Number(daily.precipitation_sum?.[i] ?? 0)),
+      roadRiskInputsAvailable: finiteOrNull(daily.precipitation_sum?.[i]) !== null && dayWindMs !== null && dayGustMs !== null,
+      precipMm: round1(finiteOrNull(daily.precipitation_sum?.[i])),
       rainMm: round1(Number(daily.rain_sum?.[i] ?? 0)),
       snowfallCm: round1(Number(daily.snowfall_sum?.[i] ?? 0)),
       snowDepthCm,
@@ -1207,7 +1212,7 @@ export function normalizeDailyFromPayload(payload, isRecentForecast = false, min
   return results;
 }
 
-async function fetchEra5Segment(startIso, endIso, includeHourly) {
+async function fetchEra5Segment(startIso, endIso, includeHourly, signal) {
   const attemptFetch = async (endDateIso, withHourly) => {
     const params = new URLSearchParams({
       latitude: String(ABAN_COORDS.lat),
@@ -1222,7 +1227,7 @@ async function fetchEra5Segment(startIso, endIso, includeHourly) {
     if (withHourly) {
       params.set('hourly', ARCHIVE_HOURLY_VARS);
     }
-    return fetchJsonWithTimeout(`https://archive-api.open-meteo.com/v1/archive?${params.toString()}`);
+    return fetchJsonWithTimeout(`https://archive-api.open-meteo.com/v1/archive?${params.toString()}`, signal);
   };
 
   try {
@@ -1248,7 +1253,7 @@ async function fetchEra5Segment(startIso, endIso, includeHourly) {
   }
 }
 
-async function fetchRecentArchiveSegment() {
+async function fetchRecentArchiveSegment(signal) {
   const params = new URLSearchParams({
     latitude: String(ABAN_COORDS.lat),
     longitude: String(ABAN_COORDS.lon),
@@ -1262,10 +1267,11 @@ async function fetchRecentArchiveSegment() {
     daily: ARCHIVE_DAILY_VARS.replace('temperature_2m_mean,', ''),
     hourly: RECENT_HOURLY_VARS,
   });
-  return fetchJsonWithTimeout(`https://api.open-meteo.com/v1/forecast?${params.toString()}`);
+  return fetchJsonWithTimeout(`https://api.open-meteo.com/v1/forecast?${params.toString()}`, signal);
 }
 
-export async function fetchCustomArchiveRange(rawStartIso, rawEndIso) {
+export async function fetchCustomArchiveRange(rawStartIso, rawEndIso, { signal } = {}) {
+  if (signal?.aborted) throw signal.reason;
   const todayIso = getAbanTodayIso(0);
   let startIso = String(rawStartIso || todayIso).slice(0, 10);
   let endIso = String(rawEndIso || todayIso).slice(0, 10);
@@ -1277,7 +1283,7 @@ export async function fetchCustomArchiveRange(rawStartIso, rawEndIso) {
   if (endIso > todayIso) endIso = todayIso;
   if (startIso > endIso) startIso = endIso;
 
-  const cacheKey = `${startIso}__${endIso}`;
+  const cacheKey = `interval-start:${startIso}__${endIso}`;
   const recentWindowStart = getAbanTodayIso(-13);
   const ttlMs = endIso >= recentWindowStart ? RECENT_ARCHIVE_TTL_MS : null;
   const cached = loadArchiveSlice(cacheKey, ttlMs);
@@ -1291,13 +1297,16 @@ export async function fetchCustomArchiveRange(rawStartIso, rawEndIso) {
 
   const needEra5 = startIso <= era5SafeEnd;
   const era5EndIso = endIso <= era5SafeEnd ? endIso : era5SafeEnd;
+  // Fetch the following midnight's end-stamped amount for the last requested 23:00 slot.
+  const era5RequestEnd = includeHourly && era5EndIso < era5SafeEnd ? addDaysIso(era5EndIso, 1) : era5EndIso;
   const needRecent = endIso > era5SafeEnd || endIso >= recentWindowStart;
 
   const [era5Res, recentRes] = await Promise.allSettled([
-    needEra5 ? fetchEra5Segment(startIso, era5EndIso, includeHourly) : Promise.resolve(null),
-    needRecent ? fetchRecentArchiveSegment() : Promise.resolve(null),
+    needEra5 ? fetchEra5Segment(startIso, era5RequestEnd, includeHourly, signal) : Promise.resolve(null),
+    needRecent ? fetchRecentArchiveSegment(signal) : Promise.resolve(null),
   ]);
 
+  if (signal?.aborted) throw signal.reason;
   if (needEra5 && era5Res.status === 'rejected' && (!needRecent || recentRes.status === 'rejected')) {
     throw era5Res.reason;
   }

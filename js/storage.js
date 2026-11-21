@@ -1,4 +1,4 @@
-import { ABAN_COORDS, STORAGE_KEYS } from './config.js';
+import { ABAN_COORDS, STORAGE_KEYS, missingForecastDay } from './config.js';
 
 const LEGACY_SOURCE_KEY = 'aban_preferred_source_mode';
 const LEGACY_OM_MODEL_KEY = 'aban_open_meteo_model';
@@ -126,11 +126,26 @@ function sanitizeValue(val, depth) {
 
 const DAY_NUMERIC_FIELDS = [
   'maxC', 'minC', 'maxF', 'minF', 'confidencePct', 'offsetFromToday', 'humidity',
-  'precipMm', 'precipP75Mm', 'rainMm', 'snowMm', 'snowDepthCm', 'precipDay', 'precipNight',
+  'precipMm', 'precipP75Mm', 'rainMm', 'snowMm', 'snowDepthCm', 'precipDay', 'precipNight', 'dailyPrecipProbability',
   'windMs', 'windMph', 'gustMs', 'gustMph', 'windDeg', 'cloudCoverPct', 'uv',
   'soil0C', 'soil6C', 'soil18C', 'soil54C', 'dewPointC', 'deltaP24hMm',
   'pressureStationMm', 'pressureStationHpa', 'pressureMslMm', 'pressureMslHpa',
 ];
+
+function isRecord(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function snapshotNumber(value) {
+  if (typeof value !== 'number' && !(typeof value === 'string' && value.trim())) return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+// Unversioned exports and v3 snapshots can be read if their actual fields pass v4 validation.
+function supportedVersion(record) {
+  return !Object.hasOwn(record, 'version') || [3, 4].includes(snapshotNumber(record.version));
+}
 
 /**
  * Returns a deep, markup-free copy of an untrusted dataset, or null when it is not a usable
@@ -138,25 +153,86 @@ const DAY_NUMERIC_FIELDS = [
  * formats as numbers are coerced so that a crafted file cannot inject HTML or crash rendering.
  */
 export function sanitizeDataset(raw) {
-  if (!raw || typeof raw !== 'object' || !Array.isArray(raw.days)) return null;
+  if (!isRecord(raw) || !Array.isArray(raw.days) || !supportedVersion(raw)) return null;
   const clean = sanitizeValue(raw, 0);
-  if (!clean || !Array.isArray(clean.days)) return null;
-
-  clean.days = clean.days.filter((day) => {
-    if (!day || typeof day !== 'object' || Array.isArray(day)) return false;
-    if (typeof day.isoDate !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(day.isoDate)) return false;
-    for (const field of DAY_NUMERIC_FIELDS) {
-      if (!(field in day)) continue;
-      const n = day[field] === null || day[field] === '' ? NaN : Number(day[field]);
-      day[field] = Number.isFinite(n) ? n : null;
+  if (['current', 'controlPoint', 'airQuality', 'mos', 'channels'].some(key =>
+    clean[key] != null && !isRecord(clean[key]))) return null;
+  if (clean.mos?.models != null && !isRecord(clean.mos.models)) return null;
+  for (const group of [clean.channels, clean.mos?.models]) {
+    for (const key of Object.keys(group || {})) {
+      if (!isRecord(group[key])) delete group[key];
     }
-    if (day.maxC === null || day.maxC === undefined || day.minC === null || day.minC === undefined) return false;
+  }
+
+  clean.days = clean.days.map(day => {
+    if (!isRecord(day) || typeof day.isoDate !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(day.isoDate)) return null;
+    const date = new Date(day.isoDate);
+    if (!Number.isFinite(date.getTime()) || date.toISOString().slice(0, 10) !== day.isoDate) return null;
+    for (const field of ['dateStr', 'dayShort']) {
+      if (typeof day[field] !== 'string') delete day[field];
+    }
+    if (day.hasForecast === false) return missingForecastDay(day);
+    // Older live snapshots expanded the calendar with wholly synthetic, model-free days.
+    const legacy = day.hasForecast === undefined && String(clean.sourceType).startsWith('live_');
+    if (day.hasForecast === false || (legacy && !day.isArchive && day.dataQuality?.ensembleBacked === false &&
+        day.modelBreakdown && !Object.keys(day.modelBreakdown).length && Array.isArray(day.hours) &&
+        day.hours.every(h => h?.isSynthetic && !h.weather) && !day.dayConditionIsDaily)) {
+      return missingForecastDay(day);
+    }
+    if (day.hasForecast === undefined && Array.isArray(day.hours) && day.hours.some(h => h?.isSynthetic)) {
+      for (const h of day.hours) {
+        if (h?.isSynthetic) Object.assign(h, { precipMm: null, precipProb: null, precipPhase: null });
+      }
+      day.nextNightPrecipMm = null;
+      day.nextNightPrecipProb = null;
+      if (day.hours.every(h => h?.isSynthetic)) {
+        day.precipDay = null;
+        day.precipNight = null;
+      }
+    }
+    return day;
+  }).filter((day) => {
+    if (!day) return false;
+    for (const field of DAY_NUMERIC_FIELDS) {
+      if (field in day) day[field] = snapshotNumber(day[field]);
+    }
+    // Legacy v4 confidence percentages were derived solely from the lead time.
+    day.confidencePct = null;
+    if (day.hasForecast === false) return true;
+    // Old blended snapshots do not identify whether the stored hour was a start or an end.
+    if (day.precipTimeBasis !== 'interval-start') {
+      for (const hour of Array.isArray(day.hours) ? day.hours : []) {
+        if (hour && typeof hour === 'object') Object.assign(hour, { precipMm: null, precipProb: null, precipPhase: null, precipInterval: null });
+      }
+      day.precipBlocks = [];
+      day.dayShiftPrecip = day.nextNightPrecip = day.nextNightPrecipProb = day.nextNightPrecipMm = null;
+    }
+    const partialForecast = day.hasForecast === true && (
+      ['minC', 'maxC', 'precipMm', 'windMs', 'gustMs', 'pressureMslMm', 'dailyPrecipProbability'].some(key => Number.isFinite(day[key])) ||
+      (Number.isFinite(day.snowDepthCm) && !day.dataQuality?.snowEstimated) ||
+      [day.iconType, day.nightIconType].some(icon => typeof icon === 'string' && icon && icon !== 'unknown') ||
+      (Array.isArray(day.hours) && day.hours.some(h => h && (
+        (!h.isSynthetic && Number.isFinite(h.tempC)) || Number.isFinite(h.precipMm) || Number.isFinite(h.precipProb) || h.weather?.ru
+      )))
+    );
+    if ((!Number.isFinite(day.maxC) || !Number.isFinite(day.minC)) && !partialForecast) return false;
     day.id = `day_${day.isoDate}`;
     if (!Array.isArray(day.hours)) day.hours = [];
-    day.hours = day.hours.filter((h) => h && typeof h === 'object' && Number.isFinite(Number(h.hour)));
+    day.hours = day.hours.filter(h => {
+      if (!isRecord(h)) return false;
+      const hour = snapshotNumber(h.hour);
+      if (!Number.isInteger(hour) || hour < 0 || hour > 23) return false;
+      h.hour = hour;
+      if (typeof h.hourStr !== 'string' || !h.hourStr) h.hourStr = String(hour).padStart(2, '0') + ':00';
+      return true;
+    });
     return true;
   });
   if (!clean.days.length) return null;
+  if (!clean.days.some(d => d.precipTimeBasis === 'interval-start')) {
+    if (clean.current) Object.assign(clean.current, { precipMm: null, precipProb: null, precipPhase: null });
+    if (clean.controlPoint && typeof clean.controlPoint === 'object') clean.controlPoint.precipProb = null;
+  }
   clean.days.sort((a, b) => (a.isoDate < b.isoDate ? -1 : a.isoDate > b.isoDate ? 1 : 0));
   return clean;
 }
@@ -255,6 +331,7 @@ export function loadDatasetCache() {
     const raw = store.getItem(STORAGE_KEYS.CACHE_V4);
     if (!raw) return null;
     const parsed = JSON.parse(raw);
+    if (!isRecord(parsed) || !supportedVersion(parsed)) return null;
     // localStorage is shared by everything served from this origin: re-validate on the way in
     const ds = sanitizeDataset(parsed?.dataset || parsed?.payload || (Array.isArray(parsed?.days) ? parsed : null));
     if (!ds) return null;
@@ -379,7 +456,7 @@ function readFileAsText(file) {
   return Promise.reject(new Error('Неподдерживаемый источник файла'));
 }
 
-export async function importDatasetJsonFile(file) {
+export async function readDatasetJsonFile(file) {
   if (!file) throw new Error('Файл не выбран');
   const rawText = await readFileAsText(file);
   let parsed;
@@ -394,13 +471,22 @@ export async function importDatasetJsonFile(file) {
     throw new Error('Неверный формат JSON-среза (отсутствует массив days)');
   }
 
+  if (!supportedVersion(parsed) || !supportedVersion(rawDs)) {
+    throw new Error('Неподдерживаемая версия JSON-снимка');
+  }
   // An imported file is untrusted input: keep only a validated, markup-free copy
   const ds = sanitizeDataset(rawDs);
-  if (!ds) {
-    throw new Error('Неверная структура записей в JSON-срезе');
+  if (!ds || !ds.days.some(day => day.hasForecast !== false)) {
+    throw new Error('Неверная структура записей в JSON-срезе. Проверьте разделы и наличие хотя бы одного дня с датой, минимумом и максимумом температуры');
   }
 
-  saveDatasetCache(ds);
+  if (!ds.sourceLabel) ds.sourceLabel = 'Снимок прогноза из JSON';
+  return ds;
+}
+
+export async function importDatasetJsonFile(file) {
+  const ds = await readDatasetJsonFile(file);
+  if (!saveDatasetCache(ds).ok) throw new Error('Не удалось сохранить JSON-снимок в кэш');
   return ds;
 }
 

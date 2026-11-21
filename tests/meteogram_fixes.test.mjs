@@ -266,7 +266,8 @@ test('pentads: one grouping for every chart and the table, honest ΔP and gaps',
 
   // The chart no longer keeps a second, different grouping
   assert.equal(/groupDaysIntoPentads/.test(readText('js/charts.js')), false);
-  assert.match(readText('js/app.js'), /renderTempEnsembleChart\(\$\('tempChartWrapper'\), chartItems,/);
+  assert.match(readText('js/app.js'), /drawChart\(\$\('tempChartWrapper'\), renderTempEnsembleChart\)/);
+  assert.match(readText('js/app.js'), /render\(container, usePentad \? pentads : days, uiState, selectDay\)/);
 });
 
 test('charts: axes, units, estimate styling and explicit "no data" instead of invented lines', () => {

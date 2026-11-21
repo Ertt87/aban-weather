@@ -235,6 +235,7 @@
             <span>•</span>
             <span id="syncTimestampText" class="text-slate-300 truncate">Синхр.: загрузка...</span>
           </div>
+          <div id="refreshErrorText" class="text-xs text-amber-300" role="status" hidden></div>
         </div>
       </div>
 
@@ -281,12 +282,12 @@
         <div class="panel-head">
           <h2 class="panel-title">
             <span class="status-dot text-emerald-400"></span>
-            <span>Сейчас в п. Абан</span>
+            <span id="currentSummaryTitle">Сейчас в п. Абан</span>
           </h2>
           <span id="currentObsTimeBadge" class="badge-mono">UTC+7 • Абан</span>
         </div>
 
-        <div class="hero-current-body">
+        <div id="currentSummaryBody" class="hero-current-body">
           <!-- Main Temp & Wet Bulb -->
           <div class="hero-temp-block">
             <div id="currentWeatherIcon" class="hero-icon-box"></div>
@@ -316,7 +317,7 @@
 
             <div class="metric-box">
               <div class="metric-box__head">
-                <span>Осадки и снег</span>
+                <span id="currentPrecipPeriod">Осадки и снег</span>
                 <span id="currentPrecipPhaseTag" class="badge-mono" style="padding:0.05rem 0.38rem;font-size:0.625rem">сухо</span>
               </div>
               <div id="currentPrecipProbDisplay" class="metric-box__val text-cyan-300">0% • 0.0 мм</div>
@@ -443,6 +444,11 @@
       </div>
     </section>
 
+    <section class="glass-panel panel-pad" aria-labelledby="upcomingTitle">
+      <h2 id="upcomingTitle" class="text-lg font-bold">Ближайшие часы</h2>
+      <div id="upcomingHours" class="upcoming-hours"></div>
+    </section>
+
     <!-- SECTION 1.5: Filters, Source Selector, 1940..+35d Archive/Ensemble Timeline & Period KPIs -->
     <section id="sec-filters" class="section-anchor glass-panel glass-panel--accent" style="overflow:hidden">
       <button id="drawerToggleTrigger" type="button" class="drawer-trigger" aria-expanded="false" aria-controls="controlsDrawerBody">
@@ -501,9 +507,9 @@
             <button id="presetBtn-archive7_7" data-preset="archive7_7" type="button" class="preset-btn text-amber-300">Архив 7д + 7д</button>
             <button id="presetBtn-3d" data-preset="3d" type="button" class="preset-btn">3 дня</button>
             <button id="presetBtn-7d" data-preset="7d" type="button" class="preset-btn">7 дней</button>
-            <button id="presetBtn-10d" data-preset="10d" type="button" class="preset-btn preset-btn-active">10 дней (Точный)</button>
+            <button id="presetBtn-10d" data-preset="10d" type="button" class="preset-btn preset-btn-active">10 дней</button>
             <button id="presetBtn-16d" data-preset="16d" type="button" class="preset-btn">16 дней (Ансамбль)</button>
-            <button id="presetBtn-35d" data-preset="35d" type="button" class="preset-btn text-purple-300">35 дней (Тренд P10–P90)</button>
+            <button id="presetBtn-35d" data-preset="35d" type="button" class="preset-btn text-purple-300">35 дней (тренд)</button>
             <button id="presetBtn-weekend" data-preset="weekend" type="button" class="preset-btn">Выходные</button>
           </div>
         </div>
@@ -531,8 +537,8 @@
             <div class="flex flex-wrap items-center justify-between gap-2 text-[10px] font-mono text-slate-400">
               <div class="flex flex-wrap items-center gap-2">
                 <span class="text-amber-300">■ Архив</span>
-                <span class="text-sky-300">■ Точный</span>
-                <span class="text-indigo-300">■ Ансамбль</span>
+                <span class="text-sky-300">■ 1–10 дней</span>
+                <span class="text-indigo-300">■ 11–16 дней</span>
                 <span class="text-purple-300">■ Тренд</span>
               </div>
               <div id="pentadToggleWrap" class="hidden">
@@ -542,7 +548,7 @@
               </div>
             </div>
 
-            <div id="confidenceTimelineTrack" class="confidence-timeline" aria-label="Шкала уверенности по суткам"></div>
+            <div id="confidenceTimelineTrack" class="confidence-timeline" aria-label="Выбор дня прогноза"></div>
           </div>
 
           <!-- Time-of-Day Window Buttons -->
@@ -588,13 +594,13 @@
           </div>
 
           <div class="kpi-card">
-            <div class="text-[10px] font-mono text-slate-400 uppercase">Min / Max (P10–P90)</div>
+            <div class="text-[10px] font-mono text-slate-400 uppercase">Экстремумы периода</div>
             <div class="flex items-baseline gap-1.5 mt-0.5 font-mono">
               <span id="periodSumAbsMax" class="text-base font-extrabold text-amber-300">--</span>
               <span class="text-slate-500">/</span>
               <span id="periodSumAbsMin" class="text-base font-extrabold text-cyan-300">--</span>
             </div>
-            <div id="periodSumCorridor" class="text-[10px] font-mono text-purple-300 truncate">Коридор P10..P90: --</div>
+            <div id="periodSumCorridor" class="text-[10px] font-mono text-purple-300">Диапазон ансамбля: —</div>
             <div id="periodSumAbsDates" class="text-[10px] font-mono text-slate-400 truncate">--</div>
           </div>
 
@@ -605,7 +611,7 @@
               <span class="text-slate-500">/</span>
               <span id="periodSumAvgNight" class="text-sm font-bold text-indigo-300">--</span>
             </div>
-            <div id="periodSumAnomaly" class="text-[10px] font-mono text-amber-300 truncate">К норме 1991–2020: --</div>
+            <div id="periodSumAnomaly" class="text-[10px] font-mono text-amber-300 truncate">К сезонной оценке: --</div>
             <div id="periodSumWindowAvg" class="text-[10px] font-mono text-sky-300 truncate">В окне: --</div>
           </div>
 
@@ -704,7 +710,7 @@
             <div id="diurnalWindowPressure" class="text-[10px] text-emerald-300">Давл.: --</div>
           </div>
           <div>
-            <span class="block text-[11px] text-slate-400">Осадки в этот час / окне:</span>
+            <span id="selectedHourPrecipLabel" class="block text-[11px] text-slate-400">Осадки за час</span>
             <strong id="diurnalWindowPrecip" class="text-sm text-cyan-300">--</strong>
             <div id="diurnalWindowSoil" class="text-[10px] text-amber-300">Почва 0см: --</div>
           </div>
@@ -741,8 +747,12 @@
               <p id="inspectorAstroSummary" class="text-xs font-mono text-amber-300" style="margin:0">Восход/закат: --</p>
             </div>
             <div class="mt-3 pt-2 flex items-center justify-between text-xs font-mono" style="border-top:1px solid rgba(30,41,59,0.85)">
-              <span class="text-slate-400">Осадки днём:</span>
+              <span class="text-slate-400">Осадки 08:00–20:00</span>
               <span id="inspectorDayPrecip" class="font-bold text-cyan-300">--</span>
+            </div>
+            <div class="flex items-center justify-between text-xs font-mono">
+              <span class="text-slate-400">За календарные сутки</span>
+              <span id="inspectorDailyPrecip" class="font-bold text-cyan-300">--</span>
             </div>
           </div>
 
@@ -764,7 +774,7 @@
               <p id="inspectorNightNote" class="text-xs font-mono text-slate-400" style="margin:0">Ночной сдвиг до 08:00 след. утра</p>
             </div>
             <div class="mt-3 pt-2 flex items-center justify-between text-xs font-mono" style="border-top:1px solid rgba(30,41,59,0.85)">
-              <span class="text-slate-400">Осадки ночью:</span>
+              <span class="text-slate-400">Осадки 20:00–08:00</span>
               <span id="inspectorNightPrecip" class="font-bold text-cyan-300">--</span>
             </div>
           </div>
@@ -801,8 +811,8 @@
 
       <!-- 4 Aban Field Operational Cards -->
       <div id="fieldOpsGrid" class="field-ops-grid">
-        <div id="opsRoadCard" class="ops-card ops-card--low">
-          <div class="text-[11px] font-mono uppercase text-sky-300 font-bold">🛣️ Трасса Р-255 / Гололедица и Метель</div>
+        <div id="opsRoadCard" class="ops-card">
+          <div class="text-[11px] font-mono uppercase text-sky-300 font-bold">🛣️ Дорожные условия около Абана</div>
           <div id="opsRoadLabel" class="text-sm font-extrabold text-white">--</div>
           <div id="opsRoadDetail" class="text-xs text-slate-300">--</div>
         </div>
@@ -829,14 +839,14 @@
       <div class="flex flex-wrap items-center justify-between gap-3 pb-3" style="border-bottom:1px solid rgba(30,41,59,0.9)">
         <div>
           <div class="flex items-center gap-2 flex-wrap">
-            <h2 class="text-base font-bold text-white" style="margin:0">📈 Метеограммы, веер P10–P90 и полевая таблица</h2>
+            <h2 class="text-base font-bold text-white" style="margin:0">📈 Метеограммы и полевая таблица</h2>
             <span id="analyticsPeriodBadge" class="badge-mono">10 сут.</span>
           </div>
           <p class="text-xs text-slate-400 mt-0.5" style="margin-bottom:0">Нажмите на любой день графика для инспектора суток • Горизонтальный свайп для 16–35+ дней</p>
         </div>
 
         <div class="tab-bar" role="tablist" aria-label="Разделы метеограмм">
-          <button id="tabBtn-temp" data-tab="temp" type="button" class="tab-btn is-active" role="tab" aria-selected="true" aria-controls="tabContent-temp">1. Температура и Веер P10–P90</button>
+          <button id="tabBtn-temp" data-tab="temp" type="button" class="tab-btn is-active" role="tab" aria-selected="true" aria-controls="tabContent-temp">1. Температура и диапазон</button>
           <button id="tabBtn-precip" data-tab="precip" type="button" class="tab-btn" role="tab" aria-selected="false" aria-controls="tabContent-precip" tabindex="-1">2. Осадки и Снежный покров</button>
           <button id="tabBtn-wind" data-tab="wind" type="button" class="tab-btn" role="tab" aria-selected="false" aria-controls="tabContent-wind" tabindex="-1">3. Ветер и Давление</button>
           <button id="tabBtn-ops" data-tab="ops" type="button" class="tab-btn" role="tab" aria-selected="false" aria-controls="tabContent-ops" tabindex="-1">4. Почва 0–54см и Полевая таблица</button>
@@ -853,7 +863,7 @@
         <div class="flex flex-wrap items-center justify-between gap-2 text-xs font-mono">
           <div class="flex flex-wrap items-center gap-2">
             <button id="toggleModelLinesBtn" type="button" class="toggle-chip" title="Линии показывают дневной максимум каждой модели">📈 Линии моделей (Max)</button>
-            <button id="toggleClimatologyBtn" type="button" class="toggle-chip">📊 Климат. норма (1991–2020)</button>
+            <button id="toggleClimatologyBtn" type="button" class="toggle-chip">📊 Сезонная оценка</button>
           </div>
           <span id="tempChartDynamicSummary" class="text-slate-400">Экстремумы и веер ансамбля</span>
         </div>

@@ -409,10 +409,10 @@ test('MET.no daily precipitation counts each 6-hourly block in full', () => {
       metNo: {
         properties: {
           timeseries: [
-            step('2026-11-24T18:00:00Z'),
-            step('2026-11-25T00:00:00Z'),
-            step('2026-11-25T06:00:00Z'),
-            step('2026-11-25T12:00:00Z'),
+            step('2026-11-24T17:00:00Z'),
+            step('2026-11-24T23:00:00Z'),
+            step('2026-11-25T05:00:00Z'),
+            step('2026-11-25T11:00:00Z'),
           ],
         },
       },

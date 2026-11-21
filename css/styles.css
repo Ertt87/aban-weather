@@ -3,6 +3,11 @@
    Zero external CDN dependencies (100% offline-first for GitHub Pages PWA)
    ============================================================================ */
 
+#sec-hourly[data-no-forecast] > :not(.panel-head),
+#sec-hourly[data-no-forecast] #inspectorZoneBadge,
+.kpi-grid[data-no-forecast] > :not(:first-child),
+#currentSummaryBody[hidden] { display: none; }
+
 :root {
   --bg-deep: #060911;
   --bg-panel: rgba(15, 23, 42, 0.84);
@@ -45,7 +50,7 @@
 html {
   scroll-behavior: smooth;
   color-scheme: dark;
-  font-size: 16px;
+  font-size: 100%;
 }
 
 body {
@@ -223,6 +228,8 @@ code {
   }
 }
 
+#refreshErrorText { overflow-wrap: anywhere; }
+
 .header-brand__meta {
   display: flex;
   align-items: center;
@@ -356,6 +363,11 @@ code {
     min-width: 0;
     flex-wrap: nowrap;
     line-height: 1.25;
+  }
+
+  #refreshErrorText {
+    flex: 0 0 100%;
+    order: 1;
   }
 
   /* Static coordinates are redundant on a phone; keep only the live sync line */
@@ -1752,3 +1764,34 @@ code {
   color: #fcd34d;
 }
 
+
+.upcoming-hours {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 8rem), 1fr));
+  gap: .5rem;
+  margin-top: .5rem;
+}
+.upcoming-hour {
+  display: grid;
+  gap: .15rem;
+  padding: .5rem;
+  color: #cbd5e1;
+  background: #101c30;
+  border: 1px solid #35465c;
+  border-radius: .5rem;
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+.upcoming-hour strong { color: #fff; }
+.upcoming-hour:focus-visible { outline: 2px solid #38bdf8; }
+
+@media (max-width: 480px) {
+  .app-main > *, .hero-grid > *, .hero-current-body > *, .control-grid > *, .modal-dialog { min-width: 0; }
+  .hero-grid, .hero-current-body { grid-template-columns: minmax(0, 1fr); }
+  .panel-pad, .modal-dialog { overflow-wrap: anywhere; }
+  .header-actions, .header-brand__title-row, .drawer-trigger { flex-wrap: wrap; max-width: 100%; }
+  .modal-dialog, .modal-dialog input { max-width: 100%; }
+  .modal-dialog .grid { grid-template-columns: repeat(auto-fit, minmax(min(100%, 7rem), 1fr)); }
+  .modal-dialog .btn-action { min-width: 0; white-space: normal; }
+  .hero-telemetry-grid { grid-template-columns: repeat(auto-fit, minmax(min(100%, 7rem), 1fr)); }
+}

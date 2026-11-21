@@ -155,10 +155,10 @@ export function blendWindVectors(samples) {
     );
     if (!valid.length) {
         return {
-            windMs: 0,
-            windMph: 0,
-            gustMs: 0,
-            gustMph: 0,
+            windMs: null,
+            windMph: null,
+            gustMs: null,
+            gustMph: null,
             windDeg: null,
             windDirShort: NO_DIRECTION.s,
             windDirFull: NO_DIRECTION.f
@@ -407,17 +407,26 @@ export function computeFieldOpsMetrics(day, prevDays = []) {
     const frostCrossZero = maxC > 0 && minC < 0;
     const hasFreezingRain =
         precipPhase === 'freezing_rain' ||
-        (Array.isArray(day?.hours) && day.hours.some((h) => h?.precipPhase === 'freezing_rain' && (h?.precipMm ?? 0) > 0));
-    const hasBlizzard = (snowMm >= 4 && gustMs >= 13) || (snowDepthCm >= 5 && gustMs >= 16);
+        (Array.isArray(day?.hours) && day.hours.some((h) => !h?.isSynthetic && h?.precipPhase === 'freezing_rain' && (h?.precipMm ?? 0) > 0));
+    const roadSnowDepth = day?.dataQuality?.snowEstimated ? 0 : snowDepthCm;
+    const hasBlizzard = (snowMm >= 4 && gustMs >= 13) || (roadSnowDepth >= 5 && gustMs >= 16);
 
     // 1. Road Risk (Р-255 Канск–Абан–Богучаны)
     let roadRisk;
-    if (hasFreezingRain) {
+    if (day?.dataQuality?.roadRiskInputsAvailable !== true ||
+        !['minC', 'maxC', 'windMs', 'gustMs', 'precipMm'].every(key => Number.isFinite(day[key]))) {
+        roadRisk = {
+            level: 'unknown',
+            code: 'insufficient_data',
+            labelRu: 'Недостаточно данных',
+            detailRu: 'Дорожный риск оценить нельзя без модельных данных о температуре, осадках, ветре и порывах за выбранные сутки.'
+        };
+    } else if (hasFreezingRain) {
         roadRisk = {
             level: 'severe',
             code: 'freezing_rain',
             labelRu: 'Опасно: Гололёд',
-            detailRu: 'Переохлаждённый дождь на промёрзшее полотно (Р-255 Канск–Абан): высокий риск ледяной корки.'
+            detailRu: 'При переохлаждённых осадках возможно образование ледяной корки.'
         };
     } else if (hasBlizzard) {
         roadRisk = {
@@ -426,14 +435,14 @@ export function computeFieldOpsMetrics(day, prevDays = []) {
             labelRu: 'Опасно: Метель / Заносы',
             detailRu: `Снег ${snowMm.toFixed(1)} мм при порывах до ${gustMs.toFixed(1)} м/с: перемёты и падение видимости на трассе.`
         };
-    } else if (frostCrossZero && (precipMm >= 0.3 || snowDepthCm >= 0.5 || humidity >= 78)) {
+    } else if (frostCrossZero && (precipMm >= 0.3 || roadSnowDepth >= 0.5 || (!day.dataQuality.humidityEstimated && humidity >= 78))) {
         roadRisk = {
             level: 'high',
             code: 'black_ice',
             labelRu: 'Высокий риск: Гололедица',
             detailRu: `Переход через 0°C (${formatSignedC(minC)}..${formatSignedC(maxC)}) при влажном покрытии — утренний чёрный лёд.`
         };
-    } else if (snowMm >= 2.5 || (gustMs >= 14 && snowDepthCm >= 3)) {
+    } else if (snowMm >= 2.5 || (gustMs >= 14 && roadSnowDepth >= 3)) {
         roadRisk = {
             level: 'high',
             code: 'snow_pack',
@@ -453,8 +462,8 @@ export function computeFieldOpsMetrics(day, prevDays = []) {
         roadRisk = {
             level: 'low',
             code: 'clear',
-            labelRu: 'Штатная обстановка',
-            detailRu: 'Опасных явлений на полотне Р-255 — Абан не ожидается.'
+            labelRu: 'Низкий расчётный риск',
+            detailRu: 'По модели для Абана пороги риска гололедицы, снега и сильного ветра за эти сутки не достигнуты.'
         };
     }
 
@@ -462,7 +471,9 @@ export function computeFieldOpsMetrics(day, prevDays = []) {
     const valleyMin = day?.inversion?.active ? toFiniteNumber(day.inversion.valleyMinC) : minC;
     const effMin = Math.min(minC, valleyMin ?? minC);
     let diesel;
-    if (effMin <= -32) {
+    if (toFiniteNumber(day?.minC) === null) {
+        diesel = { grade: 'Нет данных', cutoffC: null, noteRu: 'Для подбора топлива нужен ночной минимум.' };
+    } else if (effMin <= -32) {
         diesel = {
             grade: 'Арктическое (А-45)',
             cutoffC: -45,
@@ -510,7 +521,13 @@ export function computeFieldOpsMetrics(day, prevDays = []) {
         precipMm
     );
 
-    if (s54 <= 0) {
+    if (toFiniteNumber(day?.soil0C ?? day?.soilTempC) === null &&
+        (toFiniteNumber(day?.minC) === null || toFiniteNumber(day?.maxC) === null)) {
+        freezeDepthCm = null;
+        stateCode = 'unknown';
+        labelRu = 'Нет данных о грунте';
+        detailRu = 'Недостаточно температурных данных для оценки промерзания.';
+    } else if (s54 <= 0) {
         freezeDepthCm = Math.round(54 + clamp(Math.abs(s54) * 9, 0, 75));
         stateCode = 'frozen_solid';
         labelRu = `Грунт промёрз (${freezeDepthCm} см)`;

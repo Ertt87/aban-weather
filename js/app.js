@@ -1,10 +1,12 @@
-import { ABAN_COORDS, MODEL_META, TIME_WINDOWS, REFERENCE_DATASET, buildDynamicReferenceDataset } from './config.js';
+import { abanTimeText, calendarDaysAt, fallbackSnapshot, snapshotTimeText, upcomingForecastHours } from './snapshot.js';
+import { hourRangeLabel } from './precipitation.js';
+import { ABAN_COORDS, MODEL_META, TIME_WINDOWS, hasEnsembleRange, temperatureRangeLabel, REFERENCE_DATASET, buildDynamicReferenceDataset, getAbanNowParts } from './config.js';
 import { cToF, msToMph, formatSignedC, computeFieldOpsMetrics, toFiniteNumber } from './physics.js';
 import {
   buildUnifiedDataset,
   mergeArchiveDaysIntoDataset,
   computeDayWindowStats,
-  buildPentadSummary,
+  buildPentadSummary, hasDryWindow,
 } from './ensemble.js';
 import {
   loadPrefs,
@@ -16,9 +18,7 @@ import {
   clearDatasetCache,
   getCacheStats,
   exportDatasetJson,
-  importDatasetJsonFile,
-  saveArchiveSlice,
-  loadArchiveSlice,
+  readDatasetJsonFile,
 } from './storage.js';
 import {
   fetchAllWeatherSources,
@@ -47,15 +47,15 @@ const PRECIP_PHASE_LABELS = {
 
 const ZONE_BADGE_META = {
   archive: { short: 'Арх', label: 'Архив', cls: 'zone-pill--archive' },
-  deterministic: { short: 'Точн', label: 'Точный 10д', cls: 'zone-pill--deterministic' },
-  extended_ensemble: { short: 'Анс', label: 'Ансамбль 11–16д', cls: 'zone-pill--extended_ensemble' },
+  deterministic: { short: '1–10 дн.', label: 'Прогноз на 1–10 дней', cls: 'zone-pill--deterministic' },
+  extended_ensemble: { short: '11–16 дн.', label: 'Прогноз на 11–16 дней', cls: 'zone-pill--extended_ensemble' },
   subseasonal: { short: 'Тренд', label: 'Тренд 17–35д', cls: 'zone-pill--subseasonal' },
-  // Far-range day that no ensemble covers: the numbers are the 1991–2020 normal, not a forecast
-  climatology: { short: 'Норма', label: 'Клим. норма (нет ансамбля)', cls: 'zone-pill--subseasonal' },
+  // Far-range day that no ensemble covers: the numbers are a seasonal estimate, not a forecast
+  climatology: { short: 'Оценка', label: 'Сезонная оценка', cls: 'zone-pill--subseasonal' },
 };
 
 function isClimatologyOnlyDay(day) {
-  return day?.zone === 'subseasonal' && day?.dataQuality?.ensembleBacked === false;
+  return day?.zone === 'subseasonal' && day.hasForecast !== true && day.dataQuality?.ensembleBacked === false;
 }
 
 function getZoneMeta(day, fallbackKey = 'deterministic') {
@@ -83,17 +83,21 @@ const PRESET_LABELS = {
 
 const AUTO_REFRESH_MS = 30 * 60 * 1000;
 const AUTO_REFRESH_RETRY_MS = 3 * 60 * 1000;
-const AUTO_REFRESH_TICK_MS = 5 * 60 * 1000;
+const AUTO_REFRESH_TICK_MS = 60 * 1000;
 
-let refreshSeq = 0;
+let snapshotRequest;
+let archiveRequest;
+let readingSnapshot = false;
 
 const prefs = loadPrefs();
 
 const state = {
   dataset: null,
-  fromCache: false,
+  snapshotOrigin: 'reference',
+  clock: getAbanNowParts(),
+  lastRefreshError: null,
+  followCurrentHour: true,
   isLoading: false,
-  isArchiveLoading: false,
   apiKey: getApiKey(),
   unit: prefs.unit || 'metric',
   pressureMode: prefs.pressureMode || 'station',
@@ -113,7 +117,7 @@ const state = {
   startIso: null,
   endIso: null,
   selectedDayId: null,
-  selectedHourSlot: 12,
+  selectedHourSlot: null,
   drawerOpenMobile: false,
   radarCollapsed: false,
   radarLoaded: false,
@@ -151,33 +155,13 @@ function approxMark(isEstimated) {
 }
 
 function formatSnowCm(cm, isEstimated = false, decimals = 1) {
-  return `${approxMark(isEstimated)}${num(cm).toFixed(decimals)}`;
+  const value = toFiniteNumber(cm);
+  return value === null ? '—' : `${approxMark(isEstimated)}${value.toFixed(decimals)}`;
 }
 
 function formatSoilCompact(c, isEstimated = false) {
   const txt = formatTempCompact(c);
   return txt === '—' ? txt : `${approxMark(isEstimated)}${txt}`;
-}
-
-function getAbanNowParts() {
-  try {
-    const now = new Date();
-    const isoDate = new Intl.DateTimeFormat('en-CA', {
-      timeZone: ABAN_COORDS.tz || 'Asia/Krasnoyarsk',
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-    }).format(now);
-    const hourStr = new Intl.DateTimeFormat('en-GB', {
-      timeZone: ABAN_COORDS.tz || 'Asia/Krasnoyarsk',
-      hour: '2-digit',
-      hour12: false,
-    }).format(now);
-    return { isoDate, hour: Math.min(23, Math.max(0, Number(hourStr) || 12)) };
-  } catch (_) {
-    const d = new Date(Date.now() + 7 * 3600000);
-    return { isoDate: d.toISOString().slice(0, 10), hour: d.getUTCHours() };
-  }
 }
 
 function addDaysIso(isoDate, deltaDays) {
@@ -218,6 +202,26 @@ function formatTempSecondary(c, fOverride = null) {
   if (state.unit === 'imperial') return formatSignedC(numC);
   if (state.unit === 'dual') return '';
   return `${resolveImperial(fOverride, cToF, numC)}°F`;
+}
+
+function formatPrecip(mm, probability = null, phase = null) {
+  const parts = [];
+  if (Number.isFinite(probability)) parts.push(`${probability}%`);
+  if (Number.isFinite(mm)) {
+    const amount = mm > 0 && mm < 0.1 ? '<0.1' : mm.toFixed(1);
+    parts.push(`${amount} мм${phase ? ` (${phase})` : ''}`);
+  }
+  return parts.join(' • ') || '—';
+}
+
+function formatShiftPrecip(period) {
+  if (Number.isFinite(period?.mm)) return formatPrecip(period.mm);
+  if (period?.coveredHours > 0) return `Неполные данные · ${period.coveredHours} из ${period.hours} ч`;
+  return 'Нет данных за интервал';
+}
+
+function usePentads(days) {
+  return state.groupByPentad && days.length > 14 && days.every(d => d.hasForecast !== false);
 }
 
 function formatWind(ms, mphOverride = null) {
@@ -281,14 +285,20 @@ function showToast(message) {
 // ============================================================================
 // DATASET & DATE RANGE RESOLUTION
 // ============================================================================
+let calendarDataset;
+let calendarIso;
+let calendarDays = [];
 function getAllDays() {
-  return Array.isArray(state.dataset?.days) ? state.dataset.days : [];
+  if (calendarDataset !== state.dataset || calendarIso !== state.clock.isoDate) {
+    calendarDataset = state.dataset;
+    calendarIso = state.clock.isoDate;
+    calendarDays = calendarDaysAt(state.dataset, calendarIso);
+  }
+  return calendarDays;
 }
 
 function getTodayDay() {
-  const days = getAllDays();
-  if (!days.length) return null;
-  return days.find((d) => d.offsetFromToday === 0) || days.find((d) => !d.isArchive) || days[0];
+  return getAllDays().find(day => day.isoDate === state.clock.isoDate);
 }
 
 function getSelectedPeriodDays() {
@@ -317,13 +327,13 @@ function ensureSelectionConsistency() {
 
   const periodDays = getSelectedPeriodDays();
   if (periodDays.length && !periodDays.some((d) => d.id === state.selectedDayId)) {
-    const todayInRange = periodDays.find((d) => d.offsetFromToday === 0);
+    const todayInRange = periodDays.find((d) => d.isoDate === state.clock.isoDate);
     state.selectedDayId = (todayInRange || periodDays[0]).id;
   }
 }
 
 function findNearestWeekendIsoRange() {
-  const days = getAllDays().filter((d) => !d.isArchive);
+  const days = getAllDays().filter((d) => d.isoDate >= state.clock.isoDate);
   const weekends = days.filter((d) => d.dayShort === 'Сб' || d.dayShort === 'Вс');
   if (weekends.length >= 2) {
     for (let i = 0; i < weekends.length - 1; i++) {
@@ -340,6 +350,7 @@ function findNearestWeekendIsoRange() {
 }
 
 function applyPeriodPreset(presetKey, { silent = false } = {}) {
+  if (!silent) cancelArchiveRequest();
   const days = getAllDays();
   if (!days.length) return;
 
@@ -403,7 +414,19 @@ function hasMissingArchiveDates(startIso, endIso, todayIso) {
   return false;
 }
 
+function cancelArchiveRequest() {
+  if (!archiveRequest) return;
+  archiveRequest.abort();
+  archiveRequest = null;
+  const hint = $('archiveLoadHint');
+  if (hint) {
+    hint.textContent = 'ERA5-Land + Прогноз';
+    hint.className = 'text-[11px] font-mono text-slate-400';
+  }
+}
+
 async function handleCustomDateRangeChange(changedSide) {
+  cancelArchiveRequest();
   const startInput = $('inputStartDate');
   const endInput = $('inputEndDate');
   const hint = $('archiveLoadHint');
@@ -454,36 +477,26 @@ async function handleCustomDateRangeChange(changedSide) {
 
   if (startIso < todayIso && hasMissingArchiveDates(startIso, endIso, todayIso)) {
     const fetchEnd = endIso < todayIso ? endIso : addDaysIso(todayIso, -1);
-    const sliceKey = `${startIso}__${fetchEnd}`;
-    const recentCutoff = addDaysIso(todayIso, -13);
-    const ttlMs = fetchEnd >= recentCutoff ? 30 * 60 * 1000 : null;
-
-    let archiveResult = loadArchiveSlice(sliceKey, ttlMs);
-    if (!archiveResult) {
-      state.isArchiveLoading = true;
+    archiveRequest = new AbortController();
+    const { signal } = archiveRequest;
+    let archiveResult;
+    if (hint) {
+      hint.textContent = `⏳ Загрузка архива ERA5 (${startIso} .. ${fetchEnd})...`;
+      hint.className = 'text-[11px] font-mono text-sky-300';
+    }
+    try {
+      archiveResult = await fetchCustomArchiveRange(startIso, fetchEnd, { signal });
+      if (signal.aborted) return;
+    } catch (err) {
+      if (signal.aborted) return;
       if (hint) {
-        hint.textContent = `⏳ Загрузка архива ERA5 (${startIso} .. ${fetchEnd})...`;
-        hint.className = 'text-[11px] font-mono text-sky-300';
+        hint.textContent = `❌ Ошибка архива: ${err?.message || 'нет связи'}`;
+        hint.className = 'text-[11px] font-mono text-rose-300';
       }
-      try {
-        archiveResult = await fetchCustomArchiveRange(startIso, fetchEnd);
-        if (archiveResult?.days?.length) {
-          try {
-            if (JSON.stringify(archiveResult).length <= 350000) {
-              saveArchiveSlice(sliceKey, archiveResult);
-            }
-          } catch (_) {}
-        }
-      } catch (err) {
-        state.isArchiveLoading = false;
-        if (hint) {
-          hint.textContent = `❌ Ошибка архива: ${err?.message || 'нет связи'}`;
-          hint.className = 'text-[11px] font-mono text-rose-300';
-        }
-        showToast(`Не удалось загрузить архив ERA5: ${err?.message || 'офлайн'}`);
-        return;
-      }
-      state.isArchiveLoading = false;
+      showToast(`Не удалось загрузить архив ERA5: ${err?.message || 'офлайн'}`);
+      return;
+    } finally {
+      if (!signal.aborted) archiveRequest = null;
     }
 
     if (archiveResult?.days?.length) {
@@ -493,9 +506,9 @@ async function handleCustomDateRangeChange(changedSide) {
         hint.className = `text-[11px] font-mono ${notice?.cls === 'text-amber-300' ? 'text-amber-300' : 'text-emerald-300'}`;
       }
       showToast(`Архив ERA5-Land: добавлено ${archiveResult.days.length} сут.`);
-    } else if (hint && notice) {
-      hint.textContent = notice.text;
-      hint.className = `text-[11px] font-mono ${notice.cls}`;
+    } else if (hint) {
+      hint.textContent = notice?.text || 'Нет архивных данных за этот период';
+      hint.className = `text-[11px] font-mono ${notice?.cls || 'text-slate-400'}`;
     }
   } else if (hint) {
     hint.textContent = notice ? notice.text : 'ERA5-Land + Прогноз';
@@ -523,18 +536,36 @@ function setLoadingState(loading) {
   renderHeader();
 }
 
+function beginSnapshotSelection() {
+  snapshotRequest?.abort();
+  cancelArchiveRequest();
+  readingSnapshot = false;
+  snapshotRequest = new AbortController();
+  return snapshotRequest.signal;
+}
+
 async function refreshWeatherData(showNotice = true) {
+  const signal = beginSnapshotSelection();
   if (state.sourceMode === 'offline_cache') {
+    state.lastRefreshError = null;
+    setLoadingState(false);
     const cached = loadDatasetCache();
     if (cached) {
       state.dataset = cached;
-      state.fromCache = true;
-      ensureSelectionConsistency();
+      state.snapshotOrigin = 'disk';
+      state.clock = getAbanNowParts();
+      state.followCurrentHour = true;
+      state.selectedHourSlot = state.clock.hour;
+      if (state.activePreset === 'custom') ensureSelectionConsistency();
+      else {
+        state.selectedDayId = `day_${state.clock.isoDate}`;
+        applyPeriodPreset(state.activePreset, { silent: true });
+      }
       updateAllViews();
       if (showNotice) showToast('Загружен локальный офлайн-кэш');
     } else {
       state.dataset = buildDynamicReferenceDataset();
-      state.fromCache = false;
+      state.snapshotOrigin = 'reference';
       applyPeriodPreset('10d', { silent: true });
       updateAllViews();
       if (showNotice) showToast('Кэш пуст — показан сезонный эталон п. Абан');
@@ -543,6 +574,7 @@ async function refreshWeatherData(showNotice = true) {
   }
 
   if (state.sourceMode === 'google_wn3' && (!state.apiKey || state.apiKey.length <= 10)) {
+    setLoadingState(false);
     if (showNotice) {
       showToast('Для режима WeatherNext 3 введите ключ Google API в настройках');
       openSettingsModal();
@@ -551,20 +583,19 @@ async function refreshWeatherData(showNotice = true) {
   }
 
   // Only the newest refresh may touch the UI: a source/mode switch mid-flight starts a new one
-  const seq = ++refreshSeq;
   state.lastAttemptMs = Date.now();
   setLoadingState(true);
 
   // Applied twice at most: once for the fast partial slice (core forecast in ~1–2 s),
   // then for the complete bundle when the slow channels (soil / snow, 35-day ensemble) land.
   const applyBundle = (rawBundle) => {
-    if (seq !== refreshSeq) return null;
+    if (signal.aborted) return null;
 
-    const prevDays = getAllDays().filter((d) => d.isArchive);
+    const prevDays = (state.dataset?.days || []).filter((d) => d.isArchive && d.hasForecast !== false);
     const baseUnified = buildUnifiedDataset(rawBundle, {
       mosCache: state.dataset?.mos?.bestModelId ? state.dataset.mos : null,
     });
-    if (!baseUnified.days.length) {
+    if (!baseUnified.days.some(d => d.hasForecast !== false)) {
       if (rawBundle.isPartial) return null;
       throw new Error('метеосерверы вернули пустой прогноз');
     }
@@ -579,7 +610,8 @@ async function refreshWeatherData(showNotice = true) {
       : baseUnified;
 
     state.dataset = unified;
-    state.fromCache = false;
+    state.snapshotOrigin = 'live';
+    state.lastRefreshError = null;
     if (!rawBundle.isPartial) {
       // Persist the forecast slice only: custom archive ranges already live in the 5-slot LRU,
       // and multi-year ranges would blow the localStorage quota.
@@ -603,6 +635,7 @@ async function refreshWeatherData(showNotice = true) {
       preferredOmModel: state.preferredOmModel,
       forceRefresh: showNotice,
       onPartial: applyBundle,
+      signal,
     });
 
     const unified = applyBundle(rawBundle);
@@ -610,20 +643,15 @@ async function refreshWeatherData(showNotice = true) {
       showToast(`Обновлено: ${unified.sourceLabel} (${unified.latencyMs} мс)`);
     }
   } catch (err) {
-    if (seq !== refreshSeq) return;
-    const hasLiveData = Boolean(state.dataset?.days?.length) && state.dataset.sourceType !== 'reference_wn3';
-    const cached = hasLiveData ? null : loadDatasetCache();
-    if (cached) {
-      state.dataset = cached;
-      state.fromCache = true;
-      ensureSelectionConsistency();
-      updateAllViews();
-    }
-    if (showNotice) {
-      showToast(`Ошибка сети (${err?.message || 'таймаут'}) — активен кэш`);
-    }
+    if (signal.aborted) return;
+    const fallback = fallbackSnapshot(state.dataset, state.snapshotOrigin, loadDatasetCache());
+    state.dataset = fallback.dataset;
+    state.snapshotOrigin = fallback.origin;
+    state.lastRefreshError = { atMs: state.lastAttemptMs, message: err?.message || 'Нет ответа от сервера' };
+    updateAllViews();
+    if (showNotice) showToast(`Не удалось обновить прогноз. ${snapshotSourceText()}`);
   } finally {
-    if (seq === refreshSeq) setLoadingState(false);
+    if (!signal.aborted) setLoadingState(false);
   }
 }
 
@@ -631,12 +659,30 @@ async function refreshWeatherData(showNotice = true) {
  * Keeps an open dashboard (or a PWA resumed from the background) from silently showing
  * hours-old numbers: refresh when the tab becomes visible / the network returns / on a timer.
  */
+function updateLocalClock() {
+  const previous = state.clock;
+  state.clock = getAbanNowParts();
+  const dateChanged = previous.isoDate !== state.clock.isoDate;
+  const hourChanged = previous.hour !== state.clock.hour;
+  if (dateChanged && state.activePreset !== 'custom') {
+    if (state.selectedDayId === `day_${previous.isoDate}`) {
+      state.selectedDayId = `day_${state.clock.isoDate}`;
+      state.followCurrentHour = true;
+    }
+    applyPeriodPreset(state.activePreset, { silent: true });
+  }
+  if ((dateChanged || hourChanged) && state.followCurrentHour) state.selectedHourSlot = state.clock.hour;
+  if (dateChanged || hourChanged) updateAllViews();
+  else renderHeader();
+}
+
 function maybeAutoRefresh() {
-  if (state.sourceMode === 'offline_cache' || state.isLoading) return;
-  if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+  if (document.visibilityState === 'hidden') return;
+  updateLocalClock();
+  if (state.sourceMode === 'offline_cache' || state.snapshotOrigin === 'file' || readingSnapshot || archiveRequest || state.isLoading) return;
   if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
   const now = Date.now();
-  if (now - state.lastFetchMs < AUTO_REFRESH_MS) return;
+  if (state.snapshotOrigin === 'live' && now - state.lastFetchMs < AUTO_REFRESH_MS) return;
   if (now - state.lastAttemptMs < AUTO_REFRESH_RETRY_MS) return;
   refreshWeatherData(false);
 }
@@ -651,6 +697,12 @@ function setDataSourceMode(mode) {
 // ============================================================================
 // RENDERING: HEADER & SECTION 1 (CURRENT + CONTROL MILESTONE)
 // ============================================================================
+function snapshotSourceText() {
+  if (state.dataset?.sourceType === 'reference_wn3') return 'Показан сезонный пример';
+  return { disk: 'Показан локальный кэш', saved: 'Показан последний сохранённый прогноз',
+    memory: 'Показан последний прогноз из памяти', file: 'Показан импортированный снимок' }[state.snapshotOrigin] || '';
+}
+
 function renderHeader() {
   const ds = state.dataset || REFERENCE_DATASET;
   const pill = $('liveStatusPill');
@@ -661,16 +713,16 @@ function renderHeader() {
   let pillLabel = 'ЭТАЛОН';
   let pulse = false;
 
-  if (state.isLoading) {
+  if (state.isLoading && !['disk', 'saved', 'memory', 'file'].includes(state.snapshotOrigin)) {
     pillCls = 'status-pill status-pill--ensemble';
     pillLabel = 'ОБНОВЛ...';
     pulse = true;
   } else if (ds.sourceType === 'reference_wn3') {
     pillCls = 'status-pill status-pill--reference';
     pillLabel = 'ЭТАЛОН';
-  } else if (state.fromCache || state.sourceMode === 'offline_cache') {
+  } else if (['disk', 'saved', 'memory', 'file'].includes(state.snapshotOrigin)) {
     pillCls = 'status-pill status-pill--cache';
-    pillLabel = 'КЭШ';
+    pillLabel = state.snapshotOrigin === 'memory' ? 'ИЗ ПАМЯТИ' : state.snapshotOrigin === 'file' ? 'СНИМОК' : 'КЭШ';
   } else if (ds.sourceType === 'live_super_ensemble' || ds.sourceType === 'live_multi_ensemble' || (ds.activeModels?.length || 0) > 1) {
     pillCls = 'status-pill status-pill--ensemble';
     pillLabel = 'АНСАМБЛЬ';
@@ -705,8 +757,16 @@ function renderHeader() {
     const lat = ds.latencyMs ? ` • ${num(ds.latencyMs)} мс` : '';
     const pendTag = pendingCount > 0 ? ` • ⏳ ещё ${pendingCount} канал.` : '';
     const errTag = problemCount > 0 ? ` • ⚠️ ${problemCount} канал.` : '';
-    syncEl.textContent = `Синхр.: ${ds.syncedAt || '—'}${lat}${pendTag}${errTag}`;
+    syncEl.textContent = ds.sourceType === 'reference_wn3'
+      ? 'Сезонный пример • нет данных прогноза'
+      : `${snapshotTimeText(ds)}${state.snapshotOrigin === 'live' ? lat + pendTag + errTag : state.isLoading ? ' • Обновление…' : ''}`;
   }
+  const error = $('refreshErrorText');
+  error.hidden = !state.lastRefreshError;
+  error.textContent = state.lastRefreshError
+    ? `Сбой обновления ${abanTimeText(state.lastRefreshError.atMs)}. ${state.lastRefreshError.message}. ${snapshotSourceText()}.`
+    : '';
+  error.title = state.lastRefreshError?.message || '';
 
   const pressBtnText = $('pressureToggleText');
   if (pressBtnText) {
@@ -722,6 +782,8 @@ function renderHeader() {
   for (const [key, hId, mId] of unitPairs) {
     const hBtn = $(hId);
     const mBtn = $(mId);
+    hBtn?.setAttribute('aria-pressed', String(state.unit === key));
+    mBtn?.setAttribute('aria-pressed', String(state.unit === key));
     if (hBtn) hBtn.classList.toggle('is-active', state.unit === key);
     if (mBtn) {
       mBtn.className =
@@ -732,18 +794,35 @@ function renderHeader() {
   }
 }
 
+function hasCurrentWeather(cur) {
+  return cur && cur.hasMeasurements !== false && (
+    Boolean(cur.condRu) || ['tempC', 'humidity', 'windMs', 'gustMs', 'precipMm', 'cloudCoverPct',
+      'pressureStationMm', 'pressureMslMm', 'snowDepthCm', 'dewPointC', 'uv', 'feelsC', 'wetBulbC', 'soil0C']
+      .some(key => toFiniteNumber(cur[key]) !== null)
+  );
+}
+
 function renderCurrentConditions() {
   const ds = state.dataset || REFERENCE_DATASET;
-  const cur = ds.current || REFERENCE_DATASET.current;
-  const cp = ds.controlPoint || REFERENCE_DATASET.controlPoint;
-  const aq = ds.airQuality || REFERENCE_DATASET.airQuality;
+  const cur = ds.current || {};
+  const cp = ds.controlPoint || {};
+  const aq = ds.airQuality || {};
   const today = getTodayDay();
 
-  $('currentObsTimeBadge').textContent = cur.obsTimeLabel || 'UTC+7 • Абан';
-  $('currentWeatherIcon').innerHTML = getWeatherSvg(cur.iconType || 'sunny', 'w-14 h-14');
+  const estimateMs = Date.parse(cur.estimateAtIso || ds.receivedAtIso);
+  const previousDate = Number.isFinite(estimateMs) && getAbanNowParts(estimateMs).isoDate !== state.clock.isoDate;
+  const isSnapshot = ds.sourceType !== 'reference_wn3' && (state.snapshotOrigin !== 'live' || previousDate);
+  $('currentSummaryTitle').textContent = isSnapshot ? 'Оценка погоды из снимка' : 'Сейчас в п. Абан';
+  $('currentObsTimeBadge').textContent = ds.sourceType === 'reference_wn3'
+    ? 'Сезонный пример для Абана'
+    : ds.current?.obsTimeLabel || (Number.isFinite(Date.parse(ds.receivedAtIso)) ? abanTimeText(Date.parse(ds.receivedAtIso)) : ds.syncedAt || 'Время оценки неизвестно');
+  const hasCurrent = hasCurrentWeather(cur);
+  $('currentSummaryBody').hidden = !hasCurrent;
+  if (!hasCurrent) $('currentObsTimeBadge').textContent = 'Нет данных о текущей погоде';
+  $('currentWeatherIcon').innerHTML = cur.iconType ? getWeatherSvg(cur.iconType, 'w-14 h-14') : '';
 
   $('currentTempDisplay').textContent = formatTemp(cur.tempC, cur.tempF, state.unit === 'dual');
-  $('currentTempSecondary').textContent = state.unit === 'dual' ? '' : `(${formatTempSecondary(cur.tempC, cur.tempF)})`;
+  $('currentTempSecondary').textContent = state.unit === 'dual' || cur.tempC == null ? '' : `(${formatTempSecondary(cur.tempC, cur.tempF)})`;
   $('currentCondText').textContent = cur.condRu || '—';
   $('currentFeelsDisplay').textContent = formatTemp(cur.feelsC, cur.feelsF, true);
   $('currentWetBulbDisplay').textContent = formatTemp(cur.wetBulbC, null, false);
@@ -753,22 +832,23 @@ function renderCurrentConditions() {
   $('currentWindDisplay').textContent = formatWind(cur.windMs, cur.windMph);
   $('currentGustSub').textContent = `Порывы ${formatWind(cur.gustMs, cur.gustMph)}`;
 
-  const phaseRu = PRECIP_PHASE_LABELS[cur.precipPhase] || cur.precipPhase || 'Сухо';
+  const phaseRu = PRECIP_PHASE_LABELS[cur.precipPhase] || cur.precipPhase || '—';
   $('currentPrecipPhaseTag').textContent = phaseRu;
-  $('currentPrecipProbDisplay').textContent = `${cur.precipProb ?? 0}% • ${Number(cur.precipMm ?? 0).toFixed(1)} мм`;
+  $('currentPrecipPeriod').textContent = cur.precipPeriodLabel || 'Осадки и снег';
+  $('currentPrecipProbDisplay').textContent = formatPrecip(cur.precipMm, cur.precipProb);
   $('currentSnowDepthDisplay').textContent = cur.snowEstimated
-    ? `Покров: ${formatSnowCm(cur.snowDepthCm, true)} см (норма)`
+    ? `Покров: ${formatSnowCm(cur.snowDepthCm, true)} см (сезонная оценка)`
     : `Покров: ${formatSnowCm(cur.snowDepthCm)} см`;
 
-  $('currentHumidityDisplay').textContent = `${cur.humidity ?? 0}%`;
+  $('currentHumidityDisplay').textContent = cur.humidity == null ? '—' : `${cur.humidity}%`;
   $('currentHumidityBar').style.width = `${Math.min(100, Math.max(0, Number(cur.humidity ?? 0)))}%`;
   $('currentDewPointDisplay').textContent = `Td: ${formatTempCompact(cur.dewPointC)}`;
-  $('currentCloudDisplay').textContent = `Облачность: ${cur.cloudCoverPct ?? 0}%`;
+  $('currentCloudDisplay').textContent = `Облачность: ${cur.cloudCoverPct == null ? '—' : cur.cloudCoverPct + '%'}`;
 
   const pPair = getPressurePair(cur);
   $('currentPressureRefLabel').textContent = `Давление (${pPair.label})`;
   $('currentPressureDisplay').textContent = pPair.has ? `${pPair.mmText} (${pPair.hpaText})` : '— (нет данных)';
-  $('currentUvTag').textContent = `УФ: ${cur.uv ?? 0}`;
+  $('currentUvTag').textContent = `УФ: ${cur.uv ?? '—'}`;
 
   const dp3 = toFiniteNumber(cur.deltaP3hMm);
   const dp24 = toFiniteNumber(cur.deltaP24hMm);
@@ -792,7 +872,7 @@ function renderCurrentConditions() {
     const companionStatus = ds.channels?.openMeteoCompanion?.status;
     const parts = [];
     if (soilEst) parts.push('почва — оценка по воздуху');
-    if (cur.snowEstimated) parts.push('снег — клим. норма');
+    if (cur.snowEstimated) parts.push('снег — сезонная оценка');
     if (parts.length) {
       const reason =
         companionStatus === 'pending'
@@ -811,42 +891,44 @@ function renderCurrentConditions() {
   // Air quality badge
   const aqiEl = $('currentAqiBadge');
   const aqiVal = aq?.aqi !== null && aq?.aqi !== undefined ? aq.aqi : '—';
-  const pmVal = aq?.pm25 !== null && aq?.pm25 !== undefined ? `${aq.pm25} мкг` : '—';
-  aqiEl.textContent = `AQI ${aqiVal} • PM2.5 ${pmVal} (${aq?.statusRu || 'н/д'})`;
+  const pmVal = aq?.pm25 !== null && aq?.pm25 !== undefined ? `${aq.pm25} мкг/м³` : '—';
+  const hasAirQuality = aq.aqi != null || aq.pm25 != null;
+  aqiEl.textContent = hasAirQuality ? `AQI ${aqiVal} • PM2.5 ${pmVal} (${aq.statusRu || 'н/д'})` : 'Нет данных о качестве воздуха';
   aqiEl.className =
     aq?.smogRisk === 'high'
       ? 'font-bold text-rose-400'
       : aq?.smogRisk === 'moderate'
       ? 'font-bold text-amber-300'
-      : 'font-bold text-emerald-300';
+      : aq.aqi == null ? 'font-bold text-slate-400' : 'font-bold text-emerald-300';
 
   // Astronomy (Sunrise/Sunset/Daylight)
-  if (today?.astronomy) {
+  if (today?.astronomy?.sunriseStr && today.astronomy.sunsetStr && today.astronomy.daylightHours != null) {
     $('currentAstroText').textContent = `${today.astronomy.sunriseStr}–${today.astronomy.sunsetStr} (${today.astronomy.daylightHours} ч)`;
   } else {
     $('currentAstroText').textContent = '—';
   }
 
   // Dynamic Control Milestone (+3h & nearest 08:00/20:00 shift anchor)
-  $('controlTargetBadge').textContent = cp.targetLabel || 'Смена';
+  $('controlPointTitle').textContent = isSnapshot ? 'Контрольный репер снимка' : 'Контрольный репер';
+  $('controlTargetBadge').textContent = cp.targetLabel || (ds.controlPoint ? 'Смена' : 'Нет данных');
   $('controlCondBadge').textContent = cp.badgeRu || '—';
-  $('controlIcon').innerHTML = getWeatherSvg(cp.iconType || 'partly-sunny', 'w-9 h-9');
+  $('controlIcon').innerHTML = cp.tempC == null ? '' : getWeatherSvg(cp.iconType || 'partly-sunny', 'w-9 h-9');
   $('controlTemp').textContent = formatTemp(cp.tempC, cp.tempF, state.unit === 'dual');
   $('controlFeels').textContent = `Ощущ. ${formatTemp(cp.feelsC)}`;
   $('controlCondDesc').textContent = cp.condRu || '—';
-  $('controlPrecip').textContent = `${cp.precipProb ?? 0}%`;
+  $('controlPrecip').textContent = formatPrecip(null, cp.precipProb);
   $('controlWind').textContent = `${formatWind(cp.windMs, cp.windMph)} ${cp.windDirShort || ''}`;
   $('controlSoil0').textContent = formatSoilCompact(cp.soil0C, soilEst);
 
   $('controlNext3hLabel').textContent = cp.next3hLabel || 'Через 3 ч';
   $('controlNext3hTemp').textContent = formatTemp(cp.next3hTempC, null, state.unit === 'dual');
-  const diff3h = Number.isFinite(cp.next3hTempC) && Number.isFinite(cur.tempC) ? cp.next3hTempC - cur.tempC : 0;
+  const diff3h = Number.isFinite(cp.next3hTempC) && Number.isFinite(cur.tempC) ? cp.next3hTempC - cur.tempC : null;
   $('controlNext3hDetails').textContent =
-    Math.abs(diff3h) < 0.3 ? 'Без резкого сдвига' : `Тренд ${diff3h > 0 ? '+' : ''}${diff3h.toFixed(1)}°C`;
+    cp.next3hTempC == null ? 'Нет прогноза' : diff3h === null ? 'Нет текущей температуры для сравнения' : Math.abs(diff3h) < 0.3 ? 'Без резкого сдвига' : `Тренд ${diff3h > 0 ? '+' : ''}${diff3h.toFixed(1)}°C`;
 
   // Today extremes
   if (today) {
-    $('todayExtremesLabel').textContent = `Сегодня (${today.dateStr}):`;
+    $('todayExtremesLabel').textContent = today.hasForecast === false ? `Сегодня (${today.dateStr}) · нет прогноза` : `Сегодня (${today.dateStr}):`;
     $('todayMinBadge').textContent = formatTemp(today.minC, today.minF);
     $('todayMaxBadge').textContent = formatTemp(today.maxC, today.maxF);
   }
@@ -885,6 +967,7 @@ function renderFiltersAndKpis() {
   $('wn3ModeSubTag').textContent = hasKey ? '10д / 240ч LIVE' : 'Нужен ключ API';
   ['hybrid', 'google_wn3', 'open_meteo', 'offline_cache'].forEach((m) => {
     const btn = $(`srcBtn-${m}`);
+    btn?.setAttribute('aria-pressed', String(state.sourceMode === m));
     if (btn) btn.classList.toggle('source-btn-active', state.sourceMode === m);
   });
 
@@ -892,6 +975,7 @@ function renderFiltersAndKpis() {
   $('activePresetBadge').textContent = PRESET_LABELS[state.activePreset] || `${count} дн.`;
   ['archive7_7', '3d', '7d', '10d', '16d', '35d', 'weekend'].forEach((p) => {
     const btn = $(`presetBtn-${p}`);
+    btn?.setAttribute('aria-pressed', String(state.activePreset === p));
     if (btn) btn.classList.toggle('preset-btn-active', state.activePreset === p);
   });
 
@@ -907,7 +991,7 @@ function renderFiltersAndKpis() {
   }
 
   // Pentad toggle (>14 days)
-  const showPentadOption = count > 14;
+  const showPentadOption = count > 14 && periodDays.every(d => d.hasForecast !== false);
   $('pentadToggleWrap')?.classList.toggle('hidden', !showPentadOption);
   $('stripPentadToggleBtn')?.classList.toggle('hidden', !showPentadOption);
   $('tableViewModeToggle')?.classList.toggle('hidden', !showPentadOption);
@@ -930,7 +1014,7 @@ function renderFiltersAndKpis() {
         const isEdge = d.isoDate === state.startIso || d.isoDate === state.endIso;
         const isSelected = d.id === state.selectedDayId;
         const dayPart = d.dateStr ? d.dateStr.split(' ')[0] : d.isoDate.slice(8);
-        return `<button type="button" data-timeline-iso="${escapeHtml(d.isoDate)}" class="timeline-node timeline-node--${escapeHtml(d.zone || 'deterministic')} ${inRange ? 'in-range' : ''} ${isEdge ? 'is-edge' : ''} ${isSelected ? 'is-selected' : ''}" title="${escapeHtml(d.fullDateLabel || d.isoDate)} • ${num(d.confidencePct, 80)}%">
+        return `<button type="button" data-timeline-iso="${escapeHtml(d.isoDate)}" class="timeline-node timeline-node--${escapeHtml(d.zone || 'deterministic')} ${inRange ? 'in-range' : ''} ${isEdge ? 'is-edge' : ''} ${isSelected ? 'is-selected' : ''}" title="${escapeHtml(d.fullDateLabel || d.isoDate)} • ${d.hasForecast === false ? 'Нет прогноза' : escapeHtml(getZoneMeta(d).label)}">
           <div class="font-bold">${escapeHtml(dayPart)}</div>
           <div style="font-size:9px;opacity:0.85">${escapeHtml(d.dayShort || '')}</div>
         </button>`;
@@ -949,6 +1033,7 @@ function renderFiltersAndKpis() {
   });
 
   const activeDay = periodDays.find((d) => d.id === state.selectedDayId) || firstDay;
+  $('windowDaylightSpanHint').textContent = '—';
   if (activeDay?.astronomy) {
     $('windowDaylightSpanHint').textContent = `${activeDay.astronomy.sunriseStr}–${activeDay.astronomy.sunsetStr}`;
   }
@@ -957,12 +1042,26 @@ function renderFiltersAndKpis() {
 
   // Compute KPI summaries across periodDays
   if (!periodDays.length) return;
-  let maxDayObj = periodDays[0];
-  let minDayObj = periodDays[0];
-  let maxWindObj = periodDays[0];
+  const covered = periodDays.filter(d => d.hasForecast !== false);
+  $('periodSumDaysCount').textContent = `С прогнозом: ${covered.length} из ${count}`;
+  $('periodSumDateSpan').textContent = `${firstDay.dateStr} – ${lastDay.dateStr}`;
+  $('periodSumZones').closest('.kpi-grid').toggleAttribute('data-no-forecast', !covered.length);
+  $('drawerChipSource').textContent = SOURCE_MODE_LABELS[state.sourceMode];
+  $('drawerChipPeriod').textContent = `${firstDay.dateStr}–${lastDay.dateStr} (${count}д)`;
+  $('drawerChipWindow').textContent = winCfg.shortLabel;
+  if (!covered.length) {
+    $('periodSumZones').textContent = $('drawerChipExtremes').textContent = 'Нет прогноза';
+    return;
+  }
+  let maxDayObj = covered[0];
+  let minDayObj = covered[0];
+  let maxWindObj = covered[0];
+  let maxCount = 0;
+  let minCount = 0;
   let sumMaxC = 0;
   let sumMinC = 0;
   let sumWinC = 0;
+  let windowTempCount = 0;
   let sumAnom = 0;
   let anomCount = 0;
   let sumPrecipMm = 0;
@@ -972,20 +1071,24 @@ function renderFiltersAndKpis() {
 
   let minP10 = Infinity;
   let maxP90 = -Infinity;
-  let hasQuantiles = false;
+  let ensembleRangeDays = 0;
 
-  for (const d of periodDays) {
-    if (d.maxC > maxDayObj.maxC) maxDayObj = d;
-    if (d.minC < minDayObj.minC) minDayObj = d;
+  for (const d of covered) {
+    if (Number.isFinite(d.maxC) && (!Number.isFinite(maxDayObj.maxC) || d.maxC > maxDayObj.maxC)) maxDayObj = d;
+    if (Number.isFinite(d.minC) && (!Number.isFinite(minDayObj.minC) || d.minC < minDayObj.minC)) minDayObj = d;
     if ((d.gustMs ?? d.windMs) > (maxWindObj.gustMs ?? maxWindObj.windMs)) maxWindObj = d;
-    sumMaxC += d.maxC;
-    sumMinC += d.minC;
-    sumWinC += computeDayWindowStats(d, state.timeWindow).avgC;
+    if (Number.isFinite(d.maxC)) { sumMaxC += d.maxC; maxCount++; }
+    if (Number.isFinite(d.minC)) { sumMinC += d.minC; minCount++; }
+    const windowAvg = computeDayWindowStats(d, state.timeWindow).avgC;
+    if (Number.isFinite(windowAvg)) {
+      sumWinC += windowAvg;
+      windowTempCount++;
+    }
 
     if (Number.isFinite(d.climAnomalyC)) {
       sumAnom += d.climAnomalyC;
       anomCount++;
-    } else if (Number.isFinite(d.climMaxC) && Number.isFinite(d.climMinC)) {
+    } else if (Number.isFinite(d.maxC) && Number.isFinite(d.minC) && Number.isFinite(d.climMaxC) && Number.isFinite(d.climMinC)) {
       sumAnom += (d.maxC + d.minC) / 2 - (d.climMaxC + d.climMinC) / 2;
       anomCount++;
     }
@@ -995,53 +1098,48 @@ function renderFiltersAndKpis() {
       maxSnowCm = num(d.snowDepthCm);
       maxSnowEstimated = Boolean(d.dataQuality?.snowEstimated);
     }
-    if ((d.precipDay ?? 0) < 15 && (d.precipNight ?? 0) < 15 && (d.precipMm ?? 0) < 0.5) {
+    if (hasDryWindow(d)) {
       dryDays++;
     }
 
-    if (Number.isFinite(d.minP10C) && Number.isFinite(d.maxP90C)) {
-      hasQuantiles = true;
+    if (hasEnsembleRange(d)) {
+      ensembleRangeDays++;
       if (d.minP10C < minP10) minP10 = d.minP10C;
       if (d.maxP90C > maxP90) maxP90 = d.maxP90C;
     }
   }
 
-  const avgMaxC = +(sumMaxC / count).toFixed(1);
-  const avgMinC = +(sumMinC / count).toFixed(1);
-  const avgWinC = +(sumWinC / count).toFixed(1);
+  const avgMaxC = maxCount ? sumMaxC / maxCount : null;
+  const avgMinC = minCount ? sumMinC / minCount : null;
+  const avgWinC = windowTempCount ? sumWinC / windowTempCount : null;
   const avgAnomC = anomCount ? +(sumAnom / anomCount).toFixed(1) : null;
 
-  const zoneNames = [...new Set(periodDays.map((d) => ZONE_BADGE_META[d.zone]?.label || d.zone))];
+  const zoneNames = [...new Set(covered.map((d) => ZONE_BADGE_META[d.zone]?.label || d.zone))];
 
   // Drawer summary chips
-  $('drawerChipSource').textContent = SOURCE_MODE_LABELS[state.sourceMode] || '⚡ Супер-Ансамбль';
-  $('drawerChipPeriod').textContent = `${firstDay.dateStr}–${lastDay.dateStr} (${count}д)`;
-  $('drawerChipWindow').textContent = winCfg.shortLabel;
   $('drawerChipExtremes').textContent = `${formatTempCompact(minDayObj.minC, minDayObj.minF)}..${formatTempCompact(maxDayObj.maxC, maxDayObj.maxF)}`;
 
   // 5 KPI Cards
-  $('periodSumDaysCount').textContent = `${count} ${count === 1 ? 'сутки' : 'суток'}`;
-  $('periodSumDateSpan').textContent = `${firstDay.dateStr} – ${lastDay.dateStr}`;
   $('periodSumZones').textContent = zoneNames.join(' + ');
 
   $('periodSumAbsMax').textContent = formatTemp(maxDayObj.maxC, maxDayObj.maxF);
   $('periodSumAbsMin').textContent = formatTemp(minDayObj.minC, minDayObj.minF);
-  $('periodSumCorridor').textContent = hasQuantiles
-    ? `P10–P90: ${formatTempCompact(minP10)} .. ${formatTempCompact(maxP90)}`
-    : 'Коридор детерминированный';
+  $('periodSumCorridor').textContent = ensembleRangeDays
+    ? `Ансамбль за ${ensembleRangeDays} из ${count} дн. · P10–P90: ${formatTempCompact(minP10)} .. ${formatTempCompact(maxP90)}`
+    : 'Нет квантилей ансамбля';
   $('periodSumAbsDates').textContent = `Max: ${maxDayObj.dateStr} • Min: ${minDayObj.dateStr}`;
 
   $('periodSumAvgDay').textContent = formatTemp(avgMaxC);
   $('periodSumAvgNight').textContent = formatTemp(avgMinC);
   $('periodSumAnomaly').textContent =
     avgAnomC !== null
-      ? `К норме 1991–2020: ${avgAnomC > 0 ? '+' : ''}${avgAnomC.toFixed(1)}°C`
-      : 'К норме 1991–2020: —';
+      ? `К сезонной оценке: ${avgAnomC > 0 ? '+' : ''}${avgAnomC.toFixed(1)}°C`
+      : 'К сезонной оценке: —';
   $('periodSumWindowAvg').textContent = `Окно (${winCfg.shortLabel}): ${formatTemp(avgWinC)}`;
 
-  $('periodSumPrecipMm').textContent = `Σ ${sumPrecipMm.toFixed(1)} мм`;
-  $('periodSumSnowCm').textContent = `❄ до ${formatSnowCm(maxSnowCm, maxSnowEstimated)} см${maxSnowEstimated ? ' (норма)' : ''}`;
-  $('periodSumDryDays').textContent = `Сухих дней: ${dryDays} из ${count}`;
+  $('periodSumPrecipMm').textContent = covered.length === count && covered.every(d => Number.isFinite(d.precipMm)) ? `Σ ${formatPrecip(sumPrecipMm)}` : '—';
+  $('periodSumSnowCm').textContent = `❄ до ${formatSnowCm(maxSnowCm, maxSnowEstimated)} см${maxSnowEstimated ? ' (сезонная оценка)' : ''}`;
+  $('periodSumDryDays').textContent = `Сухих дней: ${dryDays} из ${covered.length}`;
 
   $('periodSumMaxWind').textContent = `${formatWind(maxWindObj.windMs, maxWindObj.windMph)} (пор. ${formatWind(maxWindObj.gustMs, maxWindObj.gustMph)})`;
   $('periodSumWindMeta').textContent = `Пик: ${maxWindObj.dateStr} (${maxWindObj.windDirShort || '—'})`;
@@ -1052,16 +1150,17 @@ function renderFiltersAndKpis() {
 // ============================================================================
 function matchesRiskFilter(day, filterKey, prevDays = []) {
   if (filterKey === 'all') return true;
+  if (day.hasForecast === false) return false;
   if (filterKey === 'frost') return day.minC < 0;
   if (filterKey === 'ice_blizzard') {
     const ops = computeFieldOpsMetrics(day, prevDays);
-    return ops.roadRisk.level !== 'low' || day.precipPhase === 'freezing_rain';
+    return ['moderate', 'high', 'severe'].includes(ops.roadRisk.level);
   }
   if (filterKey === 'precip') {
     return (day.precipDay ?? 0) >= 15 || (day.precipNight ?? 0) >= 15 || (day.precipMm ?? 0) >= 0.5;
   }
   if (filterKey === 'clear') {
-    return (day.precipDay ?? 0) < 15 && (day.precipNight ?? 0) < 15 && (day.precipMm ?? 0) < 0.5;
+    return hasDryWindow(day);
   }
   return true;
 }
@@ -1090,7 +1189,7 @@ function renderForecastStrip() {
     $(`filterBtn-${f}`)?.classList.toggle('is-active', state.filter === f);
   });
 
-  const usePentad = state.groupByPentad && days.length > 14;
+  const usePentad = usePentads(days);
   container.classList.toggle('forecast-strip--pentad', usePentad);
 
   if (usePentad) {
@@ -1100,11 +1199,11 @@ function renderForecastStrip() {
         const isSel = Array.isArray(p.dayIds) ? p.dayIds.includes(state.selectedDayId) : p.id === state.selectedDayId;
         const zMeta = ZONE_BADGE_META[p.zone] || ZONE_BADGE_META.subseasonal;
         const showSpread = p.zone === 'extended_ensemble' || p.zone === 'subseasonal';
-        const iconType = p.precipPhase === 'snow' ? 'snow' : p.precipPhase === 'sleet' ? 'sleet' : p.precipMm > 5 ? 'rain-cloudy' : 'partly-sunny';
+        const iconType = p.precipMm === null ? 'unknown' : p.precipPhase === 'snow' ? 'snow' : p.precipPhase === 'sleet' ? 'sleet' : p.precipMm > 5 ? 'rain-cloudy' : 'partly-sunny';
 
         return `<button type="button" data-day-id="${escapeHtml(p.id)}" class="glass-card day-card ${isSel ? 'day-card-active' : ''}">
           <div class="flex items-center justify-between gap-1">
-            <span class="zone-pill ${zMeta.cls}">${escapeHtml(zMeta.short)} ${num(p.confidencePct)}%</span>
+            <span class="zone-pill ${zMeta.cls}">${escapeHtml(zMeta.short)}</span>
             <span class="text-[10px] font-mono text-slate-400">${num(p.dayCount)} дн.</span>
           </div>
           <div class="mt-1">
@@ -1117,9 +1216,9 @@ function renderForecastStrip() {
               <span class="text-sm font-extrabold text-white">${formatTempCompact(p.maxC, p.maxF)}</span>
               <span class="text-xs font-bold ${p.minC < 0 ? 'text-cyan-300' : 'text-slate-400'}">${formatTempCompact(p.minC, p.minF)}</span>
             </div>
-            ${showSpread ? `<div class="text-[10px] font-mono text-purple-300">P25–75: ${formatTempCompact(p.minP25C)}..${formatTempCompact(p.maxP75C)}</div>` : ''}
+            ${showSpread && Number.isFinite(p.minP25C) && Number.isFinite(p.maxP75C) ? `<div title="${escapeHtml(temperatureRangeLabel(p))}" class="text-[10px] font-mono text-purple-300">${hasEnsembleRange(p) ? 'P25–P75' : 'Диапазон'}: ${formatTempCompact(p.minP25C)}..${formatTempCompact(p.maxP75C)}</div>` : ''}
             <div class="flex items-center justify-between text-[10px] font-mono pt-1" style="border-top:1px solid rgba(30,41,59,0.85)">
-              <span class="text-cyan-300">${num(p.precipMm).toFixed(1)}мм • ❄${formatSnowCm(p.snowDepthCm, p.dataQuality?.snowEstimated)}см</span>
+              <span class="text-cyan-300">${formatPrecip(p.precipMm)} • ❄${formatSnowCm(p.snowDepthCm, p.dataQuality?.snowEstimated)}см</span>
               <span class="text-slate-300 font-bold">${escapeHtml(p.windDirShort || '—')}</span>
             </div>
           </div>
@@ -1133,14 +1232,20 @@ function renderForecastStrip() {
     .map((day, idx) => {
       const isSelected = day.id === state.selectedDayId;
       const isMatch = matchesRiskFilter(day, state.filter, days.slice(0, idx));
+      if (day.hasForecast === false) {
+        return `<button type="button" data-day-id="${escapeHtml(day.id)}" class="glass-card day-card ${isSelected ? 'day-card-active' : ''} ${!isMatch ? 'day-card-dimmed' : ''}">
+          <span class="font-bold">${escapeHtml(day.dayShort)}, ${escapeHtml(day.dateStr)}</span>
+          <span class="text-xs text-slate-400">Нет прогноза</span></button>`;
+      }
       const zMeta = getZoneMeta(day);
       const showSpread = day.zone === 'extended_ensemble' || day.zone === 'subseasonal' || day.offsetFromToday >= 10;
-      const maxPrecip = Math.max(num(day.precipDay), num(day.precipNight));
+      const maxPrecip = Math.max(...[day.precipDay, day.precipNight].filter(Number.isFinite));
       const iconName = state.timeWindow === 'night' ? day.nightIconType : day.iconType;
+      const storm = iconName === 'thunderstorm' || iconName === 'thunder-hail';
 
       return `<button type="button" data-day-id="${escapeHtml(day.id)}" class="glass-card day-card ${isSelected ? 'day-card-active' : ''} ${!isMatch ? 'day-card-dimmed' : ''}">
         <div class="flex items-center justify-between gap-1">
-          <span class="zone-pill ${zMeta.cls}">${escapeHtml(zMeta.short)} ${num(day.confidencePct, 85)}%</span>
+          <span class="zone-pill ${zMeta.cls}">${escapeHtml(zMeta.short)}</span>
           ${num(day.snowDepthCm) > 0 ? `<span class="text-[10px] font-mono text-cyan-300">❄${formatSnowCm(day.snowDepthCm, day.dataQuality?.snowEstimated, 0)}см</span>` : ''}
         </div>
         <div class="mt-1">
@@ -1148,14 +1253,15 @@ function renderForecastStrip() {
           <div class="text-[10px] font-mono text-slate-400 truncate">${escapeHtml(day.label || '')}</div>
         </div>
         <div class="my-2 flex items-center justify-center">${getWeatherSvg(iconName || 'partly-sunny', 'w-11 h-11')}</div>
+        ${storm ? `<div class="text-xs text-amber-300">${escapeHtml(state.timeWindow === 'night' ? day.nightCond : day.dayCond)}</div>` : ''}
         <div class="flex flex-col gap-1">
           <div class="flex items-baseline justify-between font-mono">
             <span class="text-sm font-extrabold text-white">${formatTempCompact(day.maxC, day.maxF)}</span>
             <span class="text-xs font-bold ${day.minC < 0 ? 'text-cyan-300' : 'text-slate-400'}">${formatTempCompact(day.minC, day.minF)}</span>
           </div>
-          ${showSpread ? `<div class="text-[10px] font-mono text-purple-300 truncate">P25–75: ${formatTempCompact(day.minP25C)}..${formatTempCompact(day.maxP75C)}</div>` : ''}
+          ${showSpread && Number.isFinite(day.minP25C) && Number.isFinite(day.maxP75C) ? `<div title="${escapeHtml(temperatureRangeLabel(day))}" class="text-[10px] font-mono text-purple-300 truncate">${hasEnsembleRange(day) ? 'P25–P75' : 'Диапазон'}: ${formatTempCompact(day.minP25C)}..${formatTempCompact(day.maxP75C)}</div>` : ''}
           <div class="flex items-center justify-between text-[10px] font-mono pt-1" style="border-top:1px solid rgba(30,41,59,0.85)">
-            <span class="text-cyan-300">${maxPrecip}% • ${num(day.precipMm).toFixed(1)}мм</span>
+            <span class="text-cyan-300">${escapeHtml(formatPrecip(day.precipMm, maxPrecip))}</span>
             <span class="text-slate-300 font-bold">${escapeHtml(day.windDirShort || '—')}</span>
           </div>
         </div>
@@ -1171,29 +1277,31 @@ function updateSelectedHourBar(day) {
   const winCfg = TIME_WINDOWS[state.timeWindow] || TIME_WINDOWS.full;
   const winStats = computeDayWindowStats(day, state.timeWindow);
   const hours = winStats.hours || [];
-  const selPt = hours.find((p) => p.hour === state.selectedHourSlot) || hours[12] || hours[0];
+  const selPt = hours.find(p => p.hour === state.selectedHourSlot);
 
   $('inspectorWindowLabel').textContent = `Окно: ${winCfg.shortLabel}`;
   $('diurnalWindowAvgTemp').textContent = formatTemp(winStats.avgC, winStats.avgF);
   $('diurnalWindowMinMax').textContent = `Min/Max: ${formatTempCompact(winStats.minC)} .. ${formatTempCompact(winStats.maxC)}`;
 
+  $('selectedHourPrecipLabel').textContent = selPt ? `Осадки ${hourRangeLabel(selPt.hour)}` : 'Осадки за час';
   if (selPt) {
     const pPair = getPressurePair(selPt);
-    const phaseRu = PRECIP_PHASE_LABELS[selPt.precipPhase] || selPt.precipPhase || 'Сухо';
+    const phaseRu = PRECIP_PHASE_LABELS[selPt.precipPhase] || selPt.precipPhase;
     $('selectedHourTitle').textContent = `Час (${selPt.hourStr}):`;
     $('selectedHourTemp').textContent = `${formatTemp(selPt.tempC, selPt.tempF)} (Ощущ. ${formatTemp(selPt.feelsC)})`;
     $('selectedHourWetBulb').textContent = `Tw: ${formatTempCompact(selPt.wetBulbC)} • Td: ${formatTempCompact(selPt.dewPointC)}`;
     $('diurnalWindowWind').textContent = `${formatWind(selPt.windMs, selPt.windMph)} (пор. ${formatWind(selPt.gustMs)}) ${selPt.windDirShort || ''}`;
     $('diurnalWindowPressure').textContent = pPair.has ? `Давл.: ${pPair.mmText} (${pPair.label})` : 'Давл.: — (нет данных)';
-    $('diurnalWindowPrecip').textContent = `${selPt.precipProb ?? 0}% • ${Number(selPt.precipMm ?? 0).toFixed(1)} мм (${phaseRu})`;
+    const condition = selPt.weather?.ru ? ` • ${selPt.weather.ru}` : '';
+    $('diurnalWindowPrecip').textContent = formatPrecip(selPt.precipMm, selPt.precipProb, phaseRu) + condition;
     $('diurnalWindowSoil').textContent = `Почва 0см: ${formatSoilCompact(selPt.soil0C, day.dataQuality?.soilEstimated)}`;
   } else {
-    $('selectedHourTitle').textContent = 'Диапазон суток:';
+    $('selectedHourTitle').textContent = hours.length ? `Нет данных на ${hourRangeLabel(state.selectedHourSlot)}` : 'Диапазон суток:';
     $('selectedHourTemp').textContent = `${formatTemp(day.minC, day.minF)} .. ${formatTemp(day.maxC, day.maxF)}`;
     $('selectedHourWetBulb').textContent = 'Без почасовой сетки';
     $('diurnalWindowWind').textContent = `${formatWind(day.windMs, day.windMph)} ${day.windDirShort || ''}`;
     $('diurnalWindowPressure').textContent = `Давл.: ${getPressurePair(day).mmText}`;
-    $('diurnalWindowPrecip').textContent = `${day.precipDay ?? 0}% • ${Number(day.precipMm ?? 0).toFixed(1)} мм`;
+    $('diurnalWindowPrecip').textContent = '—';
     $('diurnalWindowSoil').textContent = `Почва 0см: ${formatSoilCompact(day.soil0C, day.dataQuality?.soilEstimated)}`;
   }
 }
@@ -1211,13 +1319,42 @@ function getUiChartState() {
   };
 }
 
+function renderUpcomingHours() {
+  const slots = upcomingForecastHours(getAllDays(), state.clock);
+  $('upcomingHours').innerHTML = slots.map(slot => {
+    const time = String(slot.hour).padStart(2, '0') + ':00';
+    return `<button type="button" class="upcoming-hour" data-forecast-date="${slot.isoDate}" data-forecast-hour="${slot.hour}"
+      aria-label="${slot.label} ${time}, ${formatTemp(slot.tempC)}, осадки ${formatPrecip(slot.precipMm, slot.precipProb)}. Открыть суточный график">
+      <span>${slot.label} ${time}</span><strong>${formatTemp(slot.tempC)}</strong>
+      <span>Осадки ${formatPrecip(slot.precipMm, slot.precipProb)}</span>${slot.condition ? '<span>' + escapeHtml(slot.condition) + '</span>' : ''}</button>`;
+  }).join('') || 'На ближайшие 6 часов почасовых данных нет';
+}
+
+function revealSelectedHour(focus = false) {
+  const chart = $('diurnalChartContainer');
+  const node = chart.querySelector(`[data-hour="${state.selectedHourSlot}"][tabindex]`);
+  if (!node) return;
+  const wrap = chart.closest('.chart-scroll-wrap');
+  const region = wrap.getBoundingClientRect();
+  const rect = node.getBoundingClientRect();
+  if (rect.left < region.left || rect.right > region.right) {
+    wrap.scrollTo({ left: wrap.scrollLeft + rect.left - region.left - (wrap.clientWidth - rect.width) / 2, behavior: 'instant' });
+  }
+  if (focus) {
+    node.focus({ preventScroll: true });
+    wrap.scrollIntoView({ block: 'center' });
+  }
+}
+
 function handleSelectHour(hour) {
+  state.followCurrentHour = false;
   state.selectedHourSlot = hour;
   const days = getSelectedPeriodDays();
   const day = days.find((d) => d.id === state.selectedDayId) || days[0];
-  if (!day) return;
+  if (!day || day.hasForecast === false) return;
   updateSelectedHourBar(day);
   renderDiurnalChart($('diurnalChartContainer'), day, getUiChartState(), handleSelectHour);
+  revealSelectedHour();
 }
 
 function renderDayInspector() {
@@ -1229,19 +1366,26 @@ function renderDayInspector() {
     state.selectedDayId = days[0].id;
   }
   const day = days[dayIndex];
+  $('inspectorDateBadge').textContent = `${day.dayShort}, ${day.dateStr} (${day.label || day.isoDate})`;
+  $('inspectorIndexCounter').textContent = `День ${dayIndex + 1} / ${days.length}`;
+  $('sec-hourly').toggleAttribute('data-no-forecast', day.hasForecast === false);
+  if (day.hasForecast === false) {
+    $('inspectorTitle').textContent = 'Нет прогноза';
+    $('inspectorRiskBadges').replaceChildren();
+    $('diurnalChartContainer').replaceChildren();
+    return;
+  }
   const allDays = getAllDays();
   const globalIdx = allDays.findIndex((d) => d.id === day.id);
   const prevDays = globalIdx > 0 ? allDays.slice(Math.max(0, globalIdx - 4), globalIdx) : [];
   const ops = computeFieldOpsMetrics(day, prevDays);
 
-  $('inspectorDateBadge').textContent = `${day.dayShort}, ${day.dateStr} (${day.label || day.isoDate})`;
   const zMeta = getZoneMeta(day);
   const zBadge = $('inspectorZoneBadge');
   zBadge.className = `zone-pill ${zMeta.cls}`;
-  zBadge.textContent = `${zMeta.label} • ${num(day.confidencePct, 85)}%`;
+  zBadge.textContent = zMeta.label;
 
-  $('inspectorTitle').textContent = `${day.dayCond || '—'} днём • ${day.nightCond || '—'} ночью`;
-  $('inspectorIndexCounter').textContent = `День ${dayIndex + 1} / ${days.length}`;
+  $('inspectorTitle').textContent = `${day.dayCond || '—'}${day.dayConditionIsDaily ? '' : ' днём'} • ${day.nightCond || '—'} ночью`;
 
   // Risk Badges
   const badges = [];
@@ -1268,11 +1412,15 @@ function renderDayInspector() {
   // Diurnal Chart & Honesty Notice
   const honestyEl = $('diurnalHonestyNotice');
   if (honestyEl) {
-    if (isClimatologyOnlyDay(day)) {
-      honestyEl.textContent = 'Ансамбли не покрывают эту дату: показана климатическая норма 1991–2020, это не прогноз';
+    if (Number.isFinite(day.precipMm) && !day.hours?.some(h => Number.isFinite(h.precipMm))) {
+      const rangeNote = day.zone === 'subseasonal' ? 'Температура по ансамблю. ' : '';
+      honestyEl.textContent = `${rangeNote}${formatPrecip(day.precipMm)} за сутки. Распределение осадков по часам неизвестно.`;
+      honestyEl.classList.remove('hidden');
+    } else if (isClimatologyOnlyDay(day)) {
+      honestyEl.textContent = 'Ансамбли не покрывают эту дату: показана сезонная оценка, это не прогноз';
       honestyEl.classList.remove('hidden');
     } else if (day.zone === 'subseasonal') {
-      honestyEl.textContent = '17–35д: сглаженный суточный ход из квантилей P10–P90';
+      honestyEl.textContent = `17–35 дн. · ${temperatureRangeLabel(day)}`;
       honestyEl.classList.remove('hidden');
     } else {
       honestyEl.classList.add('hidden');
@@ -1280,9 +1428,13 @@ function renderDayInspector() {
   }
   updateSelectedHourBar(day);
   renderDiurnalChart($('diurnalChartContainer'), day, getUiChartState(), handleSelectHour);
+  revealSelectedHour();
 
   // Advisory line
-  $('inspectorAdvisoryText').textContent = `${ops.roadRisk.labelRu}: ${ops.roadRisk.detailRu}`;
+  const roadArea = `Абан • ${day.dateStr || day.isoDate} • по модели`;
+  $('inspectorAdvisoryText').textContent = ops.roadRisk.level === 'unknown'
+    ? ops.roadRisk.detailRu
+    : `${roadArea}. ${ops.roadRisk.labelRu}: ${ops.roadRisk.detailRu}`;
 
   // Day Card
   $('inspectorDayIcon').innerHTML = getWeatherSvg(day.iconType || 'partly-sunny', 'w-11 h-11');
@@ -1292,14 +1444,12 @@ function renderDayInspector() {
   $('inspectorAstroSummary').textContent = day.astronomy
     ? `Восход ${day.astronomy.sunriseStr} • Закат ${day.astronomy.sunsetStr} • День ${day.astronomy.daylightHours} ч`
     : 'Астрономия п. Абан';
-  $('inspectorDayPrecip').textContent = `${day.precipDay ?? 0}% • ${Number(day.precipMm ?? 0).toFixed(1)} мм (${day.precipDayType || 'сухо'})`;
+  $('inspectorDayPrecip').textContent = formatShiftPrecip(day.dayShiftPrecip);
+  $('inspectorDailyPrecip').textContent = formatPrecip(day.precipMm);
 
   // Night Card (Explicitly Next-Night 20–08h!)
-  const nMinC = day.nextNightMinC ?? day.minC;
-  const nMinF = day.nextNightMinF ?? day.minF;
-  const nProb = day.nextNightPrecipProb ?? day.precipNight ?? 0;
-  const nMm = day.nextNightPrecipMm ?? 0;
-  const nType = day.nextNightPrecipType || day.precipNightType || 'сухо';
+  const nMinC = day.nextNightComplete === false ? null : day.nextNightMinC ?? day.minC;
+  const nMinF = day.nextNightComplete === false ? null : day.nextNightMinF ?? day.minF;
   const nCond = day.nextNightCond || day.nightCond || '—';
   const nWindMs = day.nextNightWindMs ?? day.windMs;
   const nWindDir = day.nextNightWindDirShort || day.windDirShort;
@@ -1308,8 +1458,8 @@ function renderDayInspector() {
   $('inspectorNightTemp').textContent = formatTemp(nMinC, nMinF, state.unit === 'dual');
   $('inspectorNightTempSub').textContent = formatTempSecondary(nMinC, nMinF);
   $('inspectorNightCond').textContent = nCond;
-  $('inspectorNightNote').textContent = `Ветер 20–08ч: ${formatWind(nWindMs)} ${nWindDir || ''} • Охл. до ${formatTempCompact(nMinC)}`;
-  $('inspectorNightPrecip').textContent = `${nProb}% • ${Number(nMm).toFixed(1)} мм (${nType})`;
+  $('inspectorNightNote').textContent = day.nextNightComplete === false ? 'Нет полного прогноза на ночь 20:00–08:00' : `Ветер 20–08ч: ${formatWind(nWindMs)} ${nWindDir || ''} • Охл. до ${formatTempCompact(nMinC)}`;
+  $('inspectorNightPrecip').textContent = formatShiftPrecip(day.nextNightPrecip);
 
   // Vector Wind Compass
   // No direction for far-range trend days (ensembles give speed only): show «—», hide the arrow
@@ -1328,11 +1478,13 @@ function renderDayInspector() {
     : 'Направление: нет данных на этом горизонте';
 
   // 4 Aban Field Operational Cards
-  $('opsRoadCard').className = `ops-card ops-card--${ops.roadRisk.level || 'low'}`;
+  $('opsRoadCard').className = `ops-card ops-card--${ops.roadRisk.level}`;
   $('opsRoadLabel').textContent = ops.roadRisk.labelRu;
-  $('opsRoadDetail').textContent = ops.roadRisk.detailRu;
+  $('opsRoadDetail').textContent = ops.roadRisk.level === 'unknown'
+    ? ops.roadRisk.detailRu
+    : `${roadArea}. ${ops.roadRisk.detailRu}`;
 
-  $('opsDieselGrade').textContent = `${ops.diesel.grade} (ПТФ ${ops.diesel.cutoffC}°C)`;
+  $('opsDieselGrade').textContent = ops.diesel.cutoffC === null ? ops.diesel.grade : `${ops.diesel.grade} (ПТФ ${ops.diesel.cutoffC}°C)`;
   $('opsDieselDetail').textContent = ops.diesel.noteRu;
 
   // Ground card: an air-temperature heuristic must not pose as a measured freeze depth
@@ -1355,62 +1507,91 @@ function renderDayInspector() {
 // RENDERING: SECTION 4 (LAZY-RENDERED ANALYTICS TABS & FIELD MATRIX)
 // ============================================================================
 function renderAnalyticsTab(tabKey) {
-  const days = getSelectedPeriodDays();
-  if (!days.length) return;
+  const calendar = getSelectedPeriodDays();
+  const days = calendar.filter(d => d.hasForecast !== false);
+  if (!calendar.length) return;
 
   const uiState = getUiChartState();
-  const usePentad = state.groupByPentad && days.length > 14;
-  const pentads = usePentad ? buildPentadSummary(days) : null;
-  const chartItems = usePentad ? pentads : days;
+  const usePentad = usePentads(calendar);
+  const pentads = usePentad ? buildPentadSummary(calendar) : null;
+  function drawChart(container, render) {
+    if (usePentad || days.length === calendar.length) {
+      render(container, usePentad ? pentads : days, uiState, selectDay);
+      return;
+    }
+    container.replaceChildren();
+    // Each contiguous run gets its own plot so lines cannot cross an uncovered date.
+    for (let i = 0; i < calendar.length;) {
+      const start = i++;
+      const missing = calendar[start].hasForecast === false;
+      while (i < calendar.length && (calendar[i].hasForecast === false) === missing) i++;
+      const panel = document.createElement('div');
+      container.append(panel);
+      if (missing) {
+        const range = i - start > 1 ? `${calendar[start].dateStr} – ${calendar[i - 1].dateStr}` : calendar[start].dateStr;
+        panel.textContent = `${range} • Нет прогноза`;
+      } else {
+        render(panel, calendar.slice(start, i), uiState, selectDay);
+      }
+    }
+  }
 
   let maxDay = days[0];
   let minDay = days[0];
   let peakWind = days[0];
   let sumMm = 0;
   for (const d of days) {
-    if (d.maxC > maxDay.maxC) maxDay = d;
-    if (d.minC < minDay.minC) minDay = d;
+    if (Number.isFinite(d.maxC) && (!Number.isFinite(maxDay.maxC) || d.maxC > maxDay.maxC)) maxDay = d;
+    if (Number.isFinite(d.minC) && (!Number.isFinite(minDay.minC) || d.minC < minDay.minC)) minDay = d;
     if ((d.gustMs ?? d.windMs) > (peakWind.gustMs ?? peakWind.windMs)) peakWind = d;
     sumMm += Number(d.precipMm ?? 0);
   }
 
   if (tabKey === 'temp') {
-    $('tempChartDynamicSummary').textContent = `Max: ${maxDay.dateStr} (${formatTemp(maxDay.maxC, maxDay.maxF)}) • Min: ${minDay.dateStr} (${formatTemp(minDay.minC, minDay.minF)})`;
+    $('tempChartDynamicSummary').textContent = !days.length ? 'Нет прогноза' : `Max: ${maxDay.dateStr} (${formatTemp(maxDay.maxC, maxDay.maxF)}) • Min: ${minDay.dateStr} (${formatTemp(minDay.minC, minDay.minF)})`;
     // Same items as the other tabs and the table: pentads come from buildPentadSummary only
-    renderTempEnsembleChart($('tempChartWrapper'), chartItems, uiState, selectDay);
+    drawChart($('tempChartWrapper'), renderTempEnsembleChart);
   } else if (tabKey === 'precip') {
-    $('precipChartDynamicSummary').textContent = `Сумма осадков: ${sumMm.toFixed(1)} мм • Пик снега: ${Math.max(...days.map((d) => d.snowDepthCm ?? 0)).toFixed(1)} см`;
-    renderPrecipSnowChart($('precipChartWrapper'), chartItems, uiState, selectDay);
+    $('precipChartDynamicSummary').textContent = !days.length ? 'Нет прогноза' : `Сумма осадков: ${days.length === calendar.length && days.every(d => Number.isFinite(d.precipMm)) ? formatPrecip(sumMm) : '—'} • Пик снега: ${Math.max(...days.map((d) => d.snowDepthCm ?? 0)).toFixed(1)} см`;
+    drawChart($('precipChartWrapper'), renderPrecipSnowChart);
   } else if (tabKey === 'wind') {
-    $('windChartDynamicSummary').textContent = `Пик: ${peakWind.dateStr} — ${formatWind(peakWind.windMs)} (пор. ${formatWind(peakWind.gustMs)})`;
-    renderWindPressureChart($('windChartWrapper'), chartItems, uiState, selectDay);
+    $('windChartDynamicSummary').textContent = !days.length ? 'Нет прогноза' : `Пик: ${peakWind.dateStr} — ${formatWind(peakWind.windMs)} (пор. ${formatWind(peakWind.gustMs)})`;
+    drawChart($('windChartWrapper'), renderWindPressureChart);
   } else if (tabKey === 'ops') {
-    renderSoilProfileChart($('soilChartWrapper'), chartItems, uiState, selectDay);
+    drawChart($('soilChartWrapper'), renderSoilProfileChart);
 
     const frostDays = days.filter((d) => d.minC < 0);
-    const soilFreezeDays = days.filter((d) => (d.soil0C ?? 0) <= 0.2);
-    const dryDays = days.filter((d) => (d.precipDay ?? 0) < 15 && (d.precipNight ?? 0) < 15 && (d.precipMm ?? 0) < 0.5);
-    const iceDays = days.filter((d, i) => matchesRiskFilter(d, 'ice_blizzard', days.slice(0, i)));
+    const soilFreezeDays = days.filter((d) => Number.isFinite(d.soil0C) && d.soil0C <= 0.2);
+    const dryDays = days.filter((d) => hasDryWindow(d));
+    const opsByDay = new Map();
+    calendar.forEach((day, i) => {
+      if (day.hasForecast !== false) opsByDay.set(day, computeFieldOpsMetrics(day, calendar.slice(Math.max(0, i - 3), i)));
+    });
+    const iceDays = days.filter(d => ['moderate', 'high', 'severe'].includes(opsByDay.get(d).roadRisk.level));
+    const unknownRoadDays = [...opsByDay.values()].filter(ops => ops.roadRisk.level === 'unknown').length;
     const soilAnyEstimated = days.some((d) => d.dataQuality?.soilEstimated);
     // Every dataset string is escaped before it reaches innerHTML (dataset may come from a file)
     const listDates = (list) => list.slice(0, 4).map((d) => escapeHtml(d.dateStr)).join(', ');
+    const roadSummary = [];
+    if (iceDays.length) roadSummary.push(listDates(iceDays));
+    if (unknownRoadDays) roadSummary.push(`Недостаточно данных: ${unknownRoadDays} дн.`);
 
-    $('opsSummaryCardsGrid').innerHTML = `
+    $('opsSummaryCardsGrid').innerHTML = !days.length ? 'Нет прогноза' : `
       <div class="ops-card">
         <div class="text-[11px] font-mono text-cyan-400 font-bold">❄️ ЗАМОРОЗКИ (${frostDays.length}/${days.length})</div>
-        <div class="text-xs font-bold text-white">${frostDays.length ? listDates(frostDays) : 'Без заморозков'}</div>
+        <div class="text-xs font-bold text-white">${frostDays.length ? listDates(frostDays) : days.every(d => Number.isFinite(d.minC)) ? 'Без заморозков' : 'Недостаточно данных'}</div>
       </div>
       <div class="ops-card">
         <div class="text-[11px] font-mono text-rose-400 font-bold">🛣️ ГОЛОЛЁД / МЕТЕЛЬ (${iceDays.length})</div>
-        <div class="text-xs font-bold text-white">${iceDays.length ? listDates(iceDays) : 'Трасса чистая'}</div>
+        <div class="text-xs font-bold text-white">${roadSummary.join(' • ') || 'Повышенного риска по модели нет'}</div>
       </div>
       <div class="ops-card">
         <div class="text-[11px] font-mono text-amber-400 font-bold">🌱 ПОЧВА ≤0°C (${soilFreezeDays.length})${soilAnyEstimated ? ' • ≈ оценка' : ''}</div>
-        <div class="text-xs font-bold text-white">${soilFreezeDays.length ? listDates(soilFreezeDays) : 'Почва талая'}</div>
+        <div class="text-xs font-bold text-white">${soilFreezeDays.length ? listDates(soilFreezeDays) : days.every(d => Number.isFinite(d.soil0C)) ? 'Почва талая' : 'Недостаточно данных'}</div>
       </div>
       <div class="ops-card">
         <div class="text-[11px] font-mono text-emerald-400 font-bold">☀️ СУХИЕ ОКНА (${dryDays.length})</div>
-        <div class="text-xs font-bold text-white">${dryDays.length ? listDates(dryDays) : 'Влажный период'}</div>
+        <div class="text-xs font-bold text-white">${dryDays.length ? listDates(dryDays) : 'Сухие окна не подтверждены'}</div>
       </div>
     `;
 
@@ -1431,16 +1612,16 @@ function renderAnalyticsTab(tabKey) {
         .map((p) => {
           const isSel = Array.isArray(p.dayIds) ? p.dayIds.includes(state.selectedDayId) : p.id === state.selectedDayId;
           const pPair = getPressurePair(p);
-          const anom = num(p.climAnomalyC);
+          const anom = p.climAnomalyC;
           const pSoilEst = Boolean(p.dataQuality?.soilEstimated);
           return `<tr data-day-id="${escapeHtml(p.id)}" tabindex="0" aria-selected="${isSel ? 'true' : 'false'}" class="${isSel ? 'is-selected' : ''}">
             <td class="font-bold text-white">${escapeHtml(p.label)} (${num(p.dayCount)}д)</td>
-            <td><span class="zone-pill ${ZONE_BADGE_META[p.zone]?.cls || ''}">${escapeHtml(ZONE_BADGE_META[p.zone]?.short || p.zone)} ${num(p.confidencePct)}%</span></td>
+            <td><span class="zone-pill ${ZONE_BADGE_META[p.zone]?.cls || ''}">${escapeHtml(ZONE_BADGE_META[p.zone]?.short || p.zone)}</span></td>
             <td><span class="text-amber-300 font-bold">${formatTemp(p.maxC)}</span> / <span class="text-cyan-300">${formatTemp(p.minC)}</span> <span class="text-slate-400">(${formatTempCompact(p.absMinC)}..${formatTempCompact(p.absMaxC)})</span></td>
-            <td class="text-cyan-300">${num(p.precipMm).toFixed(1)} мм • ❄${formatSnowCm(p.snowDepthCm, p.dataQuality?.snowEstimated)}см</td>
+            <td class="text-cyan-300">${formatPrecip(p.precipMm)} • ❄${formatSnowCm(p.snowDepthCm, p.dataQuality?.snowEstimated)}см</td>
             <td class="text-slate-200">${formatWind(p.windMs)} (пор. ${formatWind(p.gustMs)}) ${escapeHtml(p.windDirShort || '')}</td>
             <td class="text-amber-300">${formatSoilCompact(p.soil0C, pSoilEst)} / ${formatSoilCompact(p.soil54C, pSoilEst)} • ${pPair.mmText}</td>
-            <td class="${anom >= 0 ? 'text-amber-300' : 'text-cyan-300'}">${anom > 0 ? '+' : ''}${anom.toFixed(1)}°C</td>
+            <td class="${anom >= 0 ? 'text-amber-300' : 'text-cyan-300'}">${formatSignedC(anom)}</td>
           </tr>`;
         })
         .join('');
@@ -1452,13 +1633,14 @@ function renderAnalyticsTab(tabKey) {
         <th>Осадки / Снег</th>
         <th>Ветер (пор.)</th>
         <th>Почва 0/54см • Давл.</th>
-        <th>Риск Р-255</th>
+        <th>Дорожный риск около Абана</th>
       </tr>`;
 
-      tbody.innerHTML = days
-        .map((d, idx) => {
+      tbody.innerHTML = calendar
+        .map((d) => {
+          if (d.hasForecast === false) return `<tr data-day-id="${escapeHtml(d.id)}" tabindex="0"><td>${escapeHtml(d.dateStr)}</td><td colspan="6">Нет прогноза</td></tr>`;
           const winStats = computeDayWindowStats(d, state.timeWindow);
-          const ops = computeFieldOpsMetrics(d, days.slice(Math.max(0, idx - 3), idx));
+          const ops = opsByDay.get(d);
           const pPair = getPressurePair(d);
           const zMeta = getZoneMeta(d);
           const riskCls =
@@ -1468,12 +1650,12 @@ function renderAnalyticsTab(tabKey) {
               ? 'text-amber-300 font-bold'
               : ops.roadRisk.level === 'moderate'
               ? 'text-sky-300'
-              : 'text-emerald-300';
+              : ops.roadRisk.level === 'low' ? 'text-emerald-300' : 'text-slate-400';
 
           return `<tr data-day-id="${escapeHtml(d.id)}" tabindex="0" aria-selected="${d.id === state.selectedDayId ? 'true' : 'false'}" class="${d.id === state.selectedDayId ? 'is-selected' : ''}">
             <td class="font-bold text-white">${escapeHtml(d.dayShort)}, ${escapeHtml(d.dateStr)}</td>
             <td class="font-sans text-slate-300">
-              <span class="zone-pill ${zMeta.cls}">${escapeHtml(zMeta.short)} ${num(d.confidencePct, 85)}%</span>
+              <span class="zone-pill ${zMeta.cls}">${escapeHtml(zMeta.short)}</span>
               <span style="margin-left:4px">${escapeHtml(d.dayCond || '—')}</span>
             </td>
             <td>
@@ -1481,7 +1663,7 @@ function renderAnalyticsTab(tabKey) {
               <span class="text-cyan-300">${formatTemp(d.minC, d.minF)}</span>
               <span class="text-sky-400">(${formatTempCompact(winStats.avgC, winStats.avgF)})</span>
             </td>
-            <td class="text-cyan-300">${num(d.precipMm).toFixed(1)} мм (${num(d.precipDay)}%) • ❄${formatSnowCm(d.snowDepthCm, d.dataQuality?.snowEstimated, 0)}см</td>
+            <td class="text-cyan-300">${escapeHtml(formatPrecip(d.precipMm, d.precipDay))} • ❄${formatSnowCm(d.snowDepthCm, d.dataQuality?.snowEstimated, 0)}см</td>
             <td class="text-slate-200">${formatWind(d.windMs, d.windMph)} (пор. ${formatWind(d.gustMs, d.gustMph)}) ${escapeHtml(d.windDirShort || '')}</td>
             <td class="text-amber-300">${formatSoilCompact(d.soil0C, d.dataQuality?.soilEstimated)} / ${formatSoilCompact(d.soil54C, d.dataQuality?.soilEstimated)} • ${pPair.mmText}</td>
             <td class="${riskCls}">${escapeHtml(ops.roadRisk.labelRu)}</td>
@@ -1501,7 +1683,7 @@ function renderAnalyticsAndTable() {
   const firstDay = days[0];
   const lastDay = days[days.length - 1];
   const winCfg = TIME_WINDOWS[state.timeWindow] || TIME_WINDOWS.full;
-  const usePentad = state.groupByPentad && days.length > 14;
+  const usePentad = usePentads(days);
 
   $('analyticsPeriodBadge').textContent = `${firstDay.dateStr} – ${lastDay.dateStr} (${days.length} сут.${usePentad ? ' • 5-дневки' : ''} • ${winCfg.shortLabel})`;
   $('toggleModelLinesBtn')?.classList.toggle('is-active', state.showModelLines);
@@ -1526,22 +1708,27 @@ function renderChartSelectionSummary() {
     return;
   }
 
-  const usePentad = state.groupByPentad && days.length > 14;
+  if (day.hasForecast === false) {
+    el.textContent = `${day.dateStr} • Нет прогноза`;
+    return;
+  }
+  const usePentad = usePentads(days);
   const pentad = usePentad ? buildPentadSummary(days).find((p) => p.dayIds.includes(day.id)) : null;
   const item = pentad || day;
   const head = pentad ? `${pentad.label} (${pentad.dayCount} дн., средние)` : `${day.dayShort}, ${day.dateStr}`;
   const dq = item.dataQuality || {};
+  const rangeLabel = temperatureRangeLabel(item);
   const band = (lo, hi) =>
     toFiniteNumber(lo) !== null && toFiniteNumber(hi) !== null
-      ? ` (P10–P90: ${formatTempCompact(lo)}…${formatTempCompact(hi)})`
+      ? ` (${hasEnsembleRange(item) ? 'P10–P90 ' : ''}${formatTempCompact(lo)}…${formatTempCompact(hi)})`
       : '';
 
   let body;
   if (state.activeTab === 'precip') {
     const p75 = toFiniteNumber(item.precipP75Mm);
     body = [
-      `осадки ${num(item.precipMm).toFixed(1)} мм${p75 !== null ? ` (P75 ${p75.toFixed(1)} мм)` : ''}`,
-      `снег ${formatSnowCm(item.snowDepthCm, dq.snowEstimated)} см${dq.snowEstimated ? ' (норма)' : ''}`,
+      `осадки ${formatPrecip(item.precipMm)}${p75 !== null ? ` (P75 ${p75.toFixed(1)} мм)` : ''}`,
+      `снег ${formatSnowCm(item.snowDepthCm, dq.snowEstimated)} см${dq.snowEstimated ? ' (сезонная оценка)' : ''}`,
       `влажность ${dq.humidityEstimated ? '—' : `${Math.round(num(item.humidity))}%`}`,
     ].join(' • ');
   } else if (state.activeTab === 'wind') {
@@ -1561,10 +1748,11 @@ function renderChartSelectionSummary() {
     ].join(' • ');
   } else {
     body = [
+      Number.isFinite(item.maxP10C) || Number.isFinite(item.minP10C) ? rangeLabel : '',
       `Max ${formatTemp(item.maxC, item.maxF)}${band(item.maxP10C, item.maxP90C)}`,
       `Min ${formatTemp(item.minC, item.minF)}${band(item.minP10C, item.minP90C)}`,
-      `норма ${formatTempCompact(item.climMinC)}…${formatTempCompact(item.climMaxC)}`,
-    ].join(' • ');
+      `сезонная оценка ${formatTempCompact(item.climMinC)}…${formatTempCompact(item.climMaxC)}`,
+    ].filter(Boolean).join(' • ');
   }
   el.textContent = `${head} • ${body}`;
   el.title = el.textContent;
@@ -1704,7 +1892,10 @@ function renderSettingsModal() {
     }
   }
 
-  // Offline Cache Manager Stats
+  renderCacheStats();
+}
+
+function renderCacheStats() {
   const stats = getCacheStats();
   $('modalCacheSizeBadge').textContent = `Кэш: ${stats.totalKb} КБ (архивов: ${stats.archiveSlicesCount}/5)`;
   $('modalCacheMetaInfo').textContent = stats.hasCache
@@ -1864,7 +2055,12 @@ function selectDayKeepingFocus(dayId, containerId) {
 
 function buildTelegramSummaryText() {
   const ds = state.dataset || REFERENCE_DATASET;
-  const cur = ds.current || REFERENCE_DATASET.current;
+  const cur = ds.current || {};
+  const hasCurrent = hasCurrentWeather(cur);
+  const wind = value => {
+    const speed = toFiniteNumber(value);
+    return speed === null ? '—' : `${speed.toFixed(1)} м/с`;
+  };
   const periodDays = getSelectedPeriodDays();
   const firstDay = periodDays[0];
   const lastDay = periodDays[periodDays.length - 1];
@@ -1873,14 +2069,14 @@ function buildTelegramSummaryText() {
 
   const lines = [
     `🌦️ *п. Абан • ВМО ${ABAN_COORDS.wmoId}* (${ABAN_COORDS.lat}°N, ${ABAN_COORDS.lon}°E, 246 м)`,
-    `📡 Источник: ${ds.sourceLabel} | ${ds.syncedAt}`,
+    `📡 Источник: ${ds.sourceLabel || 'Снимок прогноза'} | ${snapshotTimeText(ds)}`,
     ds.mos?.summaryRu ? `🎯 ${ds.mos.summaryRu}` : null,
-    `🌡️ Сейчас: *${formatSignedC(cur.tempC)}* (ощущ. ${formatSignedC(cur.feelsC)}, Tw ${formatSignedC(cur.wetBulbC)}), ${cur.condRu}`,
-    `💨 Ветер: ${cur.windMs.toFixed(1)} м/с (пор. ${cur.gustMs.toFixed(1)}) ${cur.windDirShort} | 🧭 Давл. (${pPair.label}): ${pPair.mmText} (Δ24ч ${formatSignedInt(cur.deltaP24hMm)})`,
-    `🌱 Почва 0/6/18/54см${cur.soilEstimated ? ' (≈ оценка)' : ''}: ${formatSignedC(cur.soil0C)} / ${formatSignedC(cur.soil6C)} / ${formatSignedC(cur.soil18C)} / ${formatSignedC(cur.soil54C)} | ❄️ Снег: ${formatSnowCm(cur.snowDepthCm, cur.snowEstimated)} см${cur.snowEstimated ? ' (норма)' : ''}`,
+    hasCurrent ? `🌡️ Сейчас: *${formatSignedC(cur.tempC)}* (ощущ. ${formatSignedC(cur.feelsC)}, Tw ${formatSignedC(cur.wetBulbC)}), ${cur.condRu || '—'}` : 'Нет данных о текущей погоде',
+    hasCurrent ? `💨 Ветер: ${wind(cur.windMs)} (пор. ${wind(cur.gustMs)}) ${cur.windDirShort || ''} | 🧭 Давл. (${pPair.label}): ${pPair.mmText} (Δ24ч ${formatSignedInt(cur.deltaP24hMm)})` : null,
+    hasCurrent ? `🌱 Почва 0/6/18/54см${cur.soilEstimated ? ' (≈ оценка)' : ''}: ${formatSignedC(cur.soil0C)} / ${formatSignedC(cur.soil6C)} / ${formatSignedC(cur.soil18C)} / ${formatSignedC(cur.soil54C)} | ❄️ Снег: ${formatSnowCm(cur.snowDepthCm, cur.snowEstimated)} см${cur.snowEstimated ? ' (сезонная оценка)' : ''}` : null,
     `📅 Период (${firstDay.dateStr}–${lastDay.dateStr}, ${periodDays.length} сут., ${winCfg.shortLabel}):`,
-    ...periodDays.slice(0, 10).map((d) =>
-      `• ${d.dayShort} ${d.dateStr}: ${formatSignedC(d.maxC)} / ${formatSignedC(d.minC)} | ${Number(d.precipMm ?? 0).toFixed(1)}мм | ${d.windMs.toFixed(1)} м/с ${d.windDirShort}`
+    ...periodDays.slice(0, 10).map((d) => d.hasForecast === false ? `• ${d.dayShort} ${d.dateStr}: Нет прогноза` :
+      `• ${d.dayShort} ${d.dateStr}: ${formatSignedC(d.maxC)} / ${formatSignedC(d.minC)} | ${formatPrecip(d.precipMm)} | ${wind(d.windMs)} ${d.windDirShort || ''}`
     ),
   ].filter(Boolean);
 
@@ -1997,6 +2193,7 @@ function updateAllViews() {
   markAllAnalyticsTabsDirty();
   renderHeader();
   renderCurrentConditions();
+  renderUpcomingHours();
   renderFiltersAndKpis();
   renderForecastStrip();
   renderDayInspector();
@@ -2007,6 +2204,19 @@ function updateAllViews() {
 }
 
 function bindEventListeners() {
+  $('upcomingHours').addEventListener('click', event => {
+    const button = event.target.closest('[data-forecast-date]');
+    if (!button) return;
+    const date = button.dataset.forecastDate;
+    if (date < state.startIso || date > state.endIso) applyPeriodPreset('3d', { silent: true });
+    cancelArchiveRequest();
+    state.selectedDayId = 'day_' + date;
+    state.selectedHourSlot = Number(button.dataset.forecastHour);
+    state.followCurrentHour = false;
+    state.timeWindow = 'full';
+    updateAllViews();
+    revealSelectedHour(true);
+  });
   // PWA Update Notification Banner
   $('btnApplyPwaUpdate')?.addEventListener('click', () => {
     if (state.waitingSw) {
@@ -2046,6 +2256,19 @@ function bindEventListeners() {
 
   // Auto-refresh: tab shown again, network back, or the 30-minute freshness window elapsed
   document.addEventListener('visibilitychange', maybeAutoRefresh);
+  window.addEventListener('pageshow', maybeAutoRefresh);
+  window.addEventListener('offline', () => {
+    if (readingSnapshot || (!state.isLoading && state.snapshotOrigin !== 'live')) return;
+    beginSnapshotSelection();
+    if (state.isLoading) {
+      state.lastRefreshError = { atMs: state.lastAttemptMs, message: 'Нет подключения к сети' };
+    }
+    const fallback = fallbackSnapshot(state.dataset, state.snapshotOrigin, loadDatasetCache());
+    state.dataset = fallback.dataset;
+    state.snapshotOrigin = fallback.origin;
+    setLoadingState(false);
+    updateAllViews();
+  });
   window.addEventListener('online', maybeAutoRefresh);
   setInterval(maybeAutoRefresh, AUTO_REFRESH_TICK_MS);
 
@@ -2125,20 +2348,35 @@ function bindEventListeners() {
   $('inputImportJson')?.addEventListener('change', async (e) => {
     const file = e.target?.files?.[0];
     if (!file) return;
+    e.target.value = '';
+    const signal = beginSnapshotSelection();
+    readingSnapshot = true;
+    setLoadingState(false);
     try {
-      const imported = await importDatasetJsonFile(file);
-      state.dataset = imported;
-      state.fromCache = true;
-      state.activePreset = 'custom';
-      state.startIso = imported.days[0].isoDate;
-      state.endIso = imported.days[imported.days.length - 1].isoDate;
-      ensureSelectionConsistency();
-      updateAllViews();
+      const imported = await readDatasetJsonFile(file);
+      if (signal.aborted) return;
+      cancelArchiveRequest();
+      // Rendering also checks the currently open inspector, chart and settings panel.
+      // Keep the previous selection recoverable until both rendering and storage succeed.
+      const previous = { ...state };
+      try {
+        Object.assign(state, {
+          dataset: imported, snapshotOrigin: 'file', lastRefreshError: null, activePreset: 'custom',
+          startIso: imported.days[0].isoDate, endIso: imported.days[imported.days.length - 1].isoDate,
+        });
+        updateAllViews();
+        if (!saveDatasetCache(imported).ok) throw new Error('Не удалось сохранить JSON-снимок в кэш');
+      } catch (err) {
+        Object.assign(state, previous);
+        updateAllViews();
+        throw err;
+      }
+      if (isSettingsModalOpen()) renderCacheStats();
       showToast(`Импортировано ${imported.days.length} сут. из JSON`);
     } catch (err) {
-      showToast(err?.message || 'Ошибка импорта JSON');
+      if (!signal.aborted) showToast(`Ошибка импорта JSON. ${err?.message || 'Не удалось прочитать снимок'}. Текущий прогноз сохранён.`);
     } finally {
-      e.target.value = '';
+      if (!signal.aborted) readingSnapshot = false;
     }
   });
 
@@ -2192,6 +2430,7 @@ function bindEventListeners() {
   $('confidenceTimelineTrack')?.addEventListener('click', (e) => {
     const btn = e.target?.closest?.('[data-timeline-iso]');
     if (!btn) return;
+    cancelArchiveRequest();
     const iso = btn.dataset.timelineIso;
     if (!iso) return;
     if (iso < state.startIso) state.startIso = iso;
@@ -2353,13 +2592,14 @@ function initApp() {
   const cached = loadDatasetCache();
   if (cached && Array.isArray(cached.days) && cached.days.length) {
     state.dataset = cached;
-    state.fromCache = true;
+    state.snapshotOrigin = 'disk';
   } else {
     state.dataset = buildDynamicReferenceDataset();
-    state.fromCache = false;
+    state.snapshotOrigin = 'reference';
   }
 
-  state.selectedHourSlot = getAbanNowParts().hour;
+  state.clock = getAbanNowParts();
+  state.selectedHourSlot = state.clock.hour;
   applyPeriodPreset(state.activePreset, { silent: true });
   bindEventListeners();
   updateAllViews();

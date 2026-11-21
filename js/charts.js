@@ -1,4 +1,4 @@
-import { MODEL_META, TIME_WINDOWS } from './config.js';
+import { MODEL_META, TIME_WINDOWS, hasEnsembleRange, temperatureRangeLabel } from './config.js';
 import { cToF, msToMph, formatSignedC } from './physics.js';
 
 const CHART_PALETTE = {
@@ -28,8 +28,8 @@ const PHASE_COLORS = {
 
 const ZONE_META = {
     archive: { label: 'Архив', short: 'Арх.', color: '#94a3b8', bg: 'rgba(148, 163, 184, 0.05)' },
-    deterministic: { label: 'Точный 10д', short: 'Точн.', color: '#38bdf8', bg: 'rgba(56, 189, 248, 0.045)' },
-    extended_ensemble: { label: 'Ансамбль 11–16д', short: 'Анс.', color: '#22d3ee', bg: 'rgba(34, 211, 238, 0.055)' },
+    deterministic: { label: 'Прогноз на 1–10 дней', short: '1–10 дн.', color: '#38bdf8', bg: 'rgba(56, 189, 248, 0.045)' },
+    extended_ensemble: { label: 'Прогноз на 11–16 дней', short: '11–16 дн.', color: '#22d3ee', bg: 'rgba(34, 211, 238, 0.055)' },
     subseasonal: { label: 'Тренд 17–35д', short: 'Тренд', color: '#a78bfa', bg: 'rgba(167, 139, 250, 0.06)' }
 };
 
@@ -519,6 +519,8 @@ export function getWeatherSvg(iconType, sizeClass = 'w-10 h-10') {
     const type = String(iconType || 'cloudy').toLowerCase().trim();
 
     switch (type) {
+        case 'unknown':
+            return `<svg xmlns="http://www.w3.org/2000/svg" class="${safeClass}" viewBox="0 0 64 64" aria-hidden="true"><path d="M18 32h28" stroke="#94a3b8" stroke-width="4" stroke-linecap="round"/></svg>`;
         case 'sunny':
             return `<svg xmlns="http://www.w3.org/2000/svg" class="${safeClass}" viewBox="0 0 64 64" fill="none" aria-hidden="true">
                 <circle cx="32" cy="32" r="13" fill="#fbbf24" stroke="#f59e0b" stroke-width="2"/>
@@ -552,6 +554,14 @@ export function getWeatherSvg(iconType, sizeClass = 'w-10 h-10') {
             return `<svg xmlns="http://www.w3.org/2000/svg" class="${safeClass}" viewBox="0 0 64 64" fill="none" aria-hidden="true">
                 <path d="M26 36H48C52.5 36 56 32.5 56 28.5C56 24.5 52.8 21.2 48.8 20.8C47.5 15 42.2 11 36 11C29.8 11 24.6 15.2 24 21.2C20.2 21.8 17.5 25 17.5 28.8C17.5 32.8 21 36 26 36Z" fill="#475569" stroke="#64748b" stroke-width="1.3"/>
                 <path d="M18 48H45C50 48 54 44.2 54 39.5C54 35.2 50.5 31.6 46 31.1C44.5 24.2 38.5 19.5 31.5 19.5C24.2 19.5 18.5 24.8 18 32C13.5 32.8 10 36.2 10 40.5C10 44.8 13.5 48 18 48Z" fill="#64748b" stroke="#94a3b8" stroke-width="1.5"/>
+            </svg>`;
+
+        case 'thunderstorm':
+        case 'thunder-hail':
+            return `<svg xmlns="http://www.w3.org/2000/svg" class="${safeClass}" viewBox="0 0 64 64" fill="none" aria-hidden="true">
+                <path d="M18 39H45a10 10 0 0 0 0-20 16 16 0 0 0-30 3 9 9 0 0 0 3 17Z" fill="#64748b" stroke="#cbd5e1" stroke-width="2"/>
+                <path d="M31 31l-9 15h9l-4 13 18-23h-11l4-5Z" fill="#fbbf24"/>
+                ${type === 'thunder-hail' ? '<g fill="#e0f2fe"><circle cx="14" cy="45" r="3"/><circle cx="46" cy="49" r="3"/><circle cx="18" cy="55" r="3"/></g>' : ''}
             </svg>`;
 
         case 'rain-cloudy':
@@ -679,14 +689,13 @@ function renderSubseasonalDailyRangeCard(containerEl, day, uiState) {
     const maxP75X = mapX(p75Max ?? bounds.max);
     const maxMedX = mapX(maxV ?? bounds.max);
 
-    const confPct = toNum(day?.confidencePct, 42);
     const title = `${day?.dayShort || ''} ${day?.dateStr || ''} • Субсезонный диапазон P25–P75 (без почасовой детализации)`;
 
     const html = `
         <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${w} ${h}" class="diurnal-svg-mobile" style="min-width:680px;height:${h}px" role="img" aria-label="${escapeHtml(title)}">
             <rect x="0" y="0" width="${w}" height="${h}" rx="12" fill="rgba(15,23,42,0.55)"/>
             <text x="20" y="28" fill="#a78bfa" font-size="13" font-family="JetBrains Mono, monospace" font-weight="700">${escapeHtml(title)}</text>
-            <text x="${w - 20}" y="28" text-anchor="end" fill="#94a3b8" font-size="12" font-family="JetBrains Mono, monospace">Уверенность: ${Math.round(confPct)}%</text>
+            <text x="${w - 20}" y="46" text-anchor="end" fill="#94a3b8" font-size="12" font-family="JetBrains Mono, monospace">${escapeHtml(temperatureRangeLabel(day))}</text>
 
             ${showZero ? `
                 <line x1="${zeroX.toFixed(1)}" y1="46" x2="${zeroX.toFixed(1)}" y2="188" stroke="#fb7185" stroke-width="1.6" stroke-dasharray="4 4"/>
@@ -710,7 +719,7 @@ function renderSubseasonalDailyRangeCard(containerEl, day, uiState) {
             <text x="${(Math.min(minP25X, minP75X) + Math.abs(minP75X - minP25X) / 2).toFixed(1)}" y="170" text-anchor="middle" fill="#cbd5e1" font-size="11" font-family="JetBrains Mono, monospace">P25–P75: ${escapeHtml(fmtTempCompact(day?.minP25C, null, unit))} .. ${escapeHtml(fmtTempCompact(day?.minP75C, null, unit))}</text>
 
             ${climMax !== null && climMin !== null ? `
-                <text x="${w - 20}" y="220" text-anchor="end" fill="#94a3b8" font-size="11.5" font-family="JetBrains Mono, monospace">Климат. норма Абана (1991–2020): ${escapeHtml(fmtTempCompact(day?.climMinC, null, unit))} .. ${escapeHtml(fmtTempCompact(day?.climMaxC, null, unit))}</text>
+                <text x="${w - 20}" y="220" text-anchor="end" fill="#94a3b8" font-size="11.5" font-family="JetBrains Mono, monospace">Сезонная оценка для Абана: ${escapeHtml(fmtTempCompact(day?.climMinC, null, unit))} .. ${escapeHtml(fmtTempCompact(day?.climMaxC, null, unit))}</text>
             ` : ''}
         </svg>
     `;
@@ -721,13 +730,14 @@ function renderSubseasonalDailyRangeCard(containerEl, day, uiState) {
 export function renderDiurnalChart(containerEl, day, uiState = {}, onSelectHour = null) {
     if (!containerEl) return '';
     if (!day) return renderEmptySvg(containerEl, 'Выберите сутки для почасового профиля');
+    if (day.hasForecast === false) return renderEmptySvg(containerEl, 'Нет прогноза');
 
     const hours = Array.isArray(day.hours) ? day.hours : [];
-    if (day.zone === 'subseasonal' && hours.length < 2) {
+    if (day.zone === 'subseasonal' && hours.length < 2 && hasEnsembleRange(day)) {
         return renderSubseasonalDailyRangeCard(containerEl, day, uiState);
     }
     if (!hours.length) {
-        return renderSubseasonalDailyRangeCard(containerEl, day, uiState);
+        return renderEmptySvg(containerEl, 'Нет почасовых данных');
     }
 
     const unit = uiState?.unit || 'metric';
@@ -767,7 +777,7 @@ export function renderDiurnalChart(containerEl, day, uiState = {}, onSelectHour 
 
     const selectedHour = toNum(uiState?.selectedHourSlot);
     let activeIdx = hours.findIndex(s => toNum(s.hour) === selectedHour);
-    if (activeIdx === -1) activeIdx = Math.min(Math.floor(count / 2), count - 1);
+    if (selectedHour === null) activeIdx = Math.floor(count / 2);
 
     // Find extreme indices so their temp labels always show clearly
     let minIdx = 0;
@@ -783,8 +793,7 @@ export function renderDiurnalChart(containerEl, day, uiState = {}, onSelectHour 
         const t = tempVal(slot.tempC, slot.tempF, unit);
         const feels = tempVal(slot.feelsC, null, unit);
         const wb = tempVal(slot.wetBulbC, null, unit);
-        const pMm = Math.max(0, toNum(slot.precipMm, 0));
-        const pProb = clamp(toNum(slot.precipProb, 0), 0, 100);
+        const pMm = toNum(slot.precipMm);
         const phase = resolvePrecipPhase(slot);
         const active = typeof winCfg?.isHourActive === 'function' ? Boolean(winCfg.isHourActive(hr, day)) : true;
 
@@ -792,13 +801,13 @@ export function renderDiurnalChart(containerEl, day, uiState = {}, onSelectHour 
             index: i,
             hour: hr,
             hourStr: slot.hourStr || `${String(hr).padStart(2, '0')}:00`,
+            condition: slot.weather?.ru || '',
             x,
             yTemp: t !== null ? getY(t) : null,
             yFeels: feels !== null ? getY(feels) : null,
             yWetBulb: wb !== null ? getY(wb) : null,
             tempLabel: fmtTempCompact(slot.tempC, slot.tempF, unit),
             precipMm: pMm,
-            precipProb: pProb,
             phaseColor: PHASE_COLORS[phase] || PHASE_COLORS.rain,
             active
         };
@@ -897,22 +906,22 @@ export function renderDiurnalChart(containerEl, day, uiState = {}, onSelectHour 
 
             <!-- Hourly precipitation mini-bars & interactive temperature nodes -->
             ${slots.map((s, i) => {
-                const isPicked = s.hour === selSlot.hour;
+                const isPicked = s.hour === selSlot?.hour;
                 const showTempLabel = isPicked || i === minIdx || i === maxIdx || count <= 12 || i % 2 === 0;
                 const barH = s.precipMm > 0
                     ? Math.max(4, (s.precipMm / precipScaleMax) * precipTrackH)
-                    : (s.precipProb >= 15 ? 2.5 : 0);
+                    : 0;
                 const barY = plotBottom - barH;
                 const opacityAttr = s.active ? '1' : '0.32';
 
                 return `
-                <g class="cursor-pointer" data-hour="${s.hour}" tabindex="0" role="button" aria-label="Час ${escapeHtml(s.hourStr)}, температура ${escapeHtml(s.tempLabel)}" opacity="${opacityAttr}">
+                <g class="cursor-pointer" data-hour="${s.hour}" tabindex="0" role="button" aria-label="Час ${escapeHtml(s.hourStr)}, температура ${escapeHtml(s.tempLabel)}, ${s.precipMm === null ? 'осадки за час неизвестны' : s.precipMm + ' мм за час'}${s.condition ? ', ' + escapeHtml(s.condition) : ''}" opacity="${opacityAttr}">
                     <rect x="${(s.x - colW / 2).toFixed(1)}" y="${padT - 8}" width="${colW.toFixed(1)}" height="${(plotBottom - padT + 8).toFixed(1)}" fill="transparent"/>
 
                     ${isPicked ? `<line x1="${s.x.toFixed(1)}" y1="${padT - 6}" x2="${s.x.toFixed(1)}" y2="${plotBottom}" stroke="#fbbf24" stroke-width="1.8" stroke-dasharray="3 3"/>` : ''}
 
                     ${barH > 0 ? `
-                        <rect x="${(s.x - barW / 2).toFixed(1)}" y="${barY.toFixed(1)}" width="${barW.toFixed(1)}" height="${barH.toFixed(1)}" rx="2.5" fill="${s.phaseColor}" fill-opacity="${s.precipMm > 0 ? '0.82' : '0.4'}"/>
+                        <rect x="${(s.x - barW / 2).toFixed(1)}" y="${barY.toFixed(1)}" width="${barW.toFixed(1)}" height="${barH.toFixed(1)}" rx="2.5" fill="${s.phaseColor}" fill-opacity="0.82"/>
                         ${s.precipMm >= 0.1 ? `<text x="${s.x.toFixed(1)}" y="${(barY - 3).toFixed(1)}" text-anchor="middle" fill="${s.phaseColor}" font-size="9.5" font-family="JetBrains Mono, monospace" font-weight="700">${s.precipMm.toFixed(1)}</text>` : ''}
                     ` : ''}
 
@@ -927,9 +936,9 @@ export function renderDiurnalChart(containerEl, day, uiState = {}, onSelectHour 
             <g data-scrub-track="true" style="touch-action:none;cursor:ew-resize;">
                 <rect x="${(padL - colW / 2).toFixed(1)}" y="${(plotBottom + 2).toFixed(1)}" width="${(w - padL - padR + colW).toFixed(1)}" height="${(padB - 4).toFixed(1)}" rx="8" fill="rgba(15, 23, 42, 0.85)" stroke="rgba(56, 189, 248, 0.22)"/>
                 <line x1="${padL}" y1="${(plotBottom + 13).toFixed(1)}" x2="${w - padR}" y2="${(plotBottom + 13).toFixed(1)}" stroke="rgba(148,163,184,0.28)" stroke-width="3" stroke-linecap="round"/>
-                <circle cx="${selSlot.x.toFixed(1)}" cy="${(plotBottom + 13).toFixed(1)}" r="7" fill="#fbbf24" stroke="#060911" stroke-width="2"/>
+                ${selSlot ? `<circle cx="${selSlot.x.toFixed(1)}" cy="${(plotBottom + 13).toFixed(1)}" r="7" fill="#fbbf24" stroke="#060911" stroke-width="2"/>` : ''}
                 ${slots.map((s, i) => {
-                    const isPicked = s.hour === selSlot.hour;
+                    const isPicked = s.hour === selSlot?.hour;
                     const showLabel = isPicked || count <= 12 || i % 2 === 0;
                     const shortHour = s.hourStr.slice(0, 2);
                     return `
@@ -1011,10 +1020,7 @@ export function renderTempEnsembleChart(containerEl, days, uiState = {}, onSelec
         }
     }
 
-    const hasFanZone = items.some((d) => {
-        const z = resolveDayZone(d);
-        return z === 'extended_ensemble' || z === 'subseasonal';
-    });
+    const hasFanZone = items.some(hasEnsembleRange);
 
     const step = count <= 12 ? 82 : (count <= 24 ? 64 : 48);
     const w = Math.max(740, count * step + 106);
@@ -1028,14 +1034,12 @@ export function renderTempEnsembleChart(containerEl, days, uiState = {}, onSelec
     // The scale follows the data (no forced -6..+7 °C window that squashed deep-winter periods).
     const allVals = [];
     for (const d of items) {
-        const zone = resolveDayZone(d);
-        const isFanZone = zone === 'extended_ensemble' || zone === 'subseasonal';
         const mx = tempVal(d.maxC, d.maxF, unit);
         const mn = tempVal(d.minC, d.minF, unit);
         if (mx !== null) allVals.push(mx);
         if (mn !== null) allVals.push(mn);
 
-        if (isFanZone) {
+        if (hasEnsembleRange(d)) {
             [d.maxP10C, d.maxP90C, d.minP10C, d.minP90C, d.maxP25C, d.maxP75C, d.minP25C, d.minP75C].forEach(q => {
                 const v = tempVal(q, null, unit);
                 if (v !== null) allVals.push(v);
@@ -1080,7 +1084,7 @@ export function renderTempEnsembleChart(containerEl, days, uiState = {}, onSelec
     });
 
     // Build uncertainty fan upper/lower arrays for extended_ensemble & subseasonal
-    // Anchor 1 deterministic predecessor point smoothly into the fan if available
+    // A missing member distribution breaks the fan at this date.
     const maxP90Pts = [];
     const maxP10Pts = [];
     const maxP75Pts = [];
@@ -1092,23 +1096,16 @@ export function renderTempEnsembleChart(containerEl, days, uiState = {}, onSelec
 
     for (let i = 0; i < count; i++) {
         const d = items[i];
-        const zone = resolveDayZone(d);
-        const nextZone = i + 1 < count ? resolveDayZone(items[i + 1]) : null;
-        const inFan = zone === 'extended_ensemble' || zone === 'subseasonal';
-        const isFanAnchor = !inFan && (nextZone === 'extended_ensemble' || nextZone === 'subseasonal');
-
-        if (inFan) {
-            const mx = tempVal(d.maxC, d.maxF, unit);
-            const mn = tempVal(d.minC, d.minF, unit);
+        if (hasEnsembleRange(d)) {
             const x = xCoords[i];
-            const mx90 = tempVal(d.maxP90C, null, unit) ?? mx;
-            const mx10 = tempVal(d.maxP10C, null, unit) ?? mx;
-            const mx75 = tempVal(d.maxP75C, null, unit) ?? mx;
-            const mx25 = tempVal(d.maxP25C, null, unit) ?? mx;
-            const mn90 = tempVal(d.minP90C, null, unit) ?? mn;
-            const mn10 = tempVal(d.minP10C, null, unit) ?? mn;
-            const mn75 = tempVal(d.minP75C, null, unit) ?? mn;
-            const mn25 = tempVal(d.minP25C, null, unit) ?? mn;
+            const mx90 = tempVal(d.maxP90C, null, unit);
+            const mx10 = tempVal(d.maxP10C, null, unit);
+            const mx75 = tempVal(d.maxP75C, null, unit);
+            const mx25 = tempVal(d.maxP25C, null, unit);
+            const mn90 = tempVal(d.minP90C, null, unit);
+            const mn10 = tempVal(d.minP10C, null, unit);
+            const mn75 = tempVal(d.minP75C, null, unit);
+            const mn25 = tempVal(d.minP25C, null, unit);
 
             maxP90Pts.push(mx90 !== null ? { x, y: getY(mx90) } : null);
             maxP10Pts.push(mx10 !== null ? { x, y: getY(mx10) } : null);
@@ -1118,15 +1115,6 @@ export function renderTempEnsembleChart(containerEl, days, uiState = {}, onSelec
             minP10Pts.push(mn10 !== null ? { x, y: getY(mn10) } : null);
             minP75Pts.push(mn75 !== null ? { x, y: getY(mn75) } : null);
             minP25Pts.push(mn25 !== null ? { x, y: getY(mn25) } : null);
-        } else if (isFanAnchor) {
-            maxP90Pts.push(maxPts[i]);
-            maxP10Pts.push(maxPts[i]);
-            maxP75Pts.push(maxPts[i]);
-            maxP25Pts.push(maxPts[i]);
-            minP90Pts.push(minPts[i]);
-            minP10Pts.push(minPts[i]);
-            minP75Pts.push(minPts[i]);
-            minP25Pts.push(minPts[i]);
         } else {
             maxP90Pts.push(null);
             maxP10Pts.push(null);
@@ -1177,11 +1165,11 @@ export function renderTempEnsembleChart(containerEl, days, uiState = {}, onSelec
     // Build top legend items
     const legendChips = [];
     if (showClim) {
-        legendChips.push({ color: '#fb923c', label: 'Норма Max (1991–2020)', dashed: true });
-        legendChips.push({ color: '#60a5fa', label: 'Норма Min', dashed: true });
+        legendChips.push({ color: '#fb923c', label: 'Сезонная оценка Max', dashed: true });
+        legendChips.push({ color: '#60a5fa', label: 'Сезонная оценка Min', dashed: true });
     }
     if (hasFanZone) {
-        legendChips.push({ color: '#fbbf24', label: 'Веер P10–P90', band: 0.18 });
+        legendChips.push({ color: '#fbbf24', label: isPentad ? 'Среднее суточных P10–P90' : 'Веер P10–P90', band: 0.18 });
         legendChips.push({ color: '#fbbf24', label: 'P25–P75', band: 0.4 });
     }
     for (const m of modelLines) {
@@ -1209,7 +1197,7 @@ export function renderTempEnsembleChart(containerEl, days, uiState = {}, onSelec
     const showZero = zeroY >= padT - 10 && zeroY <= h - padB + 10;
 
     const html = `
-        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${w} ${h}" class="chart-svg-mobile" style="min-width:${w}px;height:${h}px" role="img" aria-label="Температурный профиль и ансамблевый веер P10-P90">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${w} ${h}" class="chart-svg-mobile" style="min-width:${w}px;height:${h}px" role="img" aria-label="${hasFanZone ? 'Температура и квантили ансамбля P10–P90' : 'Температурный профиль'}">
             <defs>
                 <linearGradient id="aban-ens-band-grad" x1="0" y1="0" x2="0" y2="1">
                     <stop offset="0%" stop-color="#fbbf24" stop-opacity="0.22"/>
@@ -1286,10 +1274,10 @@ export function renderTempEnsembleChart(containerEl, days, uiState = {}, onSelec
                 const isSel = isItemSelected(d, uiState?.selectedDayId);
                 const showValLabels = isSel || i === absMaxIdx || i === absMinIdx || count <= 14 || i % 2 === 0;
                 const showDateLabel = isSel || count <= 18 || i % 2 === 0 || i === count - 1;
-                const zone = resolveDayZone(d);
-                const inFan = zone === 'extended_ensemble' || zone === 'subseasonal';
+                const inFan = hasEnsembleRange(d);
 
-                // Single-day quantile whisker fallback when fan polygons cannot form
+                // A lone distribution also needs a band when its neighbours have only point forecasts.
+                const isolated = inFan && !hasEnsembleRange(items[i - 1]) && !hasEnsembleRange(items[i + 1]);
                 const q90Max = inFan && maxP90Pts[i] ? maxP90Pts[i].y : null;
                 const q10Max = inFan && maxP10Pts[i] ? maxP10Pts[i].y : null;
                 const q75Max = inFan && maxP75Pts[i] ? maxP75Pts[i].y : null;
@@ -1307,13 +1295,13 @@ export function renderTempEnsembleChart(containerEl, days, uiState = {}, onSelec
                     <rect x="${(x - hitW / 2).toFixed(1)}" y="${padT - 12}" width="${hitW.toFixed(1)}" height="${(h - padT - padB + 20).toFixed(1)}" fill="transparent"/>
                     ${isSel ? `<rect x="${(x - Math.min(34, hitW / 2)).toFixed(1)}" y="${padT - 14}" width="${Math.min(68, hitW).toFixed(1)}" height="${(h - padT - padB + 22).toFixed(1)}" rx="10" fill="rgba(56,189,248,0.14)" stroke="rgba(56,189,248,0.45)"/>` : ''}
 
-                    ${count === 1 && q90Max !== null && q10Max !== null ? `
-                        <rect x="${(x - 10).toFixed(1)}" y="${Math.min(q90Max, q10Max).toFixed(1)}" width="20" height="${Math.max(4, Math.abs(q10Max - q90Max)).toFixed(1)}" rx="4" fill="#fbbf24" fill-opacity="0.20"/>
+                    ${isolated && q90Max !== null && q10Max !== null ? `
+                        <rect data-fan-band="max" x="${(x - 10).toFixed(1)}" y="${Math.min(q90Max, q10Max).toFixed(1)}" width="20" height="${Math.max(4, Math.abs(q10Max - q90Max)).toFixed(1)}" rx="4" fill="#fbbf24" fill-opacity="0.20"/>
                     ` : ''}
-                    ${count === 1 && q75Max !== null && q25Max !== null ? `
+                    ${isolated && q75Max !== null && q25Max !== null ? `
                         <rect x="${(x - 6).toFixed(1)}" y="${Math.min(q75Max, q25Max).toFixed(1)}" width="12" height="${Math.max(3, Math.abs(q25Max - q75Max)).toFixed(1)}" rx="3" fill="#fbbf24" fill-opacity="0.38"/>
                     ` : ''}
-                    ${count === 1 && q90Min !== null && q10Min !== null ? `
+                    ${isolated && q90Min !== null && q10Min !== null ? `
                         <rect x="${(x - 10).toFixed(1)}" y="${Math.min(q90Min, q10Min).toFixed(1)}" width="20" height="${Math.max(4, Math.abs(q10Min - q90Min)).toFixed(1)}" rx="4" fill="#22d3ee" fill-opacity="0.20"/>
                     ` : ''}
 
@@ -1437,7 +1425,7 @@ export function renderPrecipSnowChart(containerEl, days, uiState = {}, onSelectD
                 <line x1="${padL + 306}" y1="14.5" x2="${padL + 322}" y2="14.5" stroke="#a78bfa" stroke-width="2.2"/><text x="${padL + 327}" y="18" fill="#cbd5e1">Влажн.%</text>
                 <line x1="${padL + 392}" y1="14.5" x2="${padL + 408}" y2="14.5" stroke="#38bdf8" stroke-width="2.4"/><text x="${padL + 413}" y="18" fill="#cbd5e1">Покров, см</text>
                 <line x1="${padL + 494}" y1="9" x2="${padL + 494}" y2="20" stroke="#e2e8f0" stroke-width="1.6"/><line x1="${padL + 489}" y1="9" x2="${padL + 499}" y2="9" stroke="#e2e8f0" stroke-width="1.8" stroke-linecap="round"/><text x="${padL + 505}" y="18" fill="#cbd5e1">P75 осадков</text>
-                ${hasSnowEstimate ? `<line x1="${padL + 590}" y1="14.5" x2="${padL + 606}" y2="14.5" stroke="#38bdf8" stroke-opacity="0.7" stroke-width="2" stroke-dasharray="4 3"/><text x="${padL + 611}" y="18" fill="#fcd34d">≈ норма</text>` : ''}
+                ${hasSnowEstimate ? `<line x1="${padL + 590}" y1="14.5" x2="${padL + 606}" y2="14.5" stroke="#38bdf8" stroke-opacity="0.7" stroke-width="2" stroke-dasharray="4 3"/><text x="${padL + 611}" y="18" fill="#fcd34d">≈ сезонная оценка</text>` : ''}
             </g>
 
             <!-- Zone separators -->
@@ -1471,7 +1459,7 @@ export function renderPrecipSnowChart(containerEl, days, uiState = {}, onSelectD
             <!-- Day Bars, P75 Whiskers & Nodes -->
             ${days.map((d, i) => {
                 const x = xCoords[i];
-                const mm = Math.max(0, toNum(d.precipMm, 0));
+                const mm = toNum(d.precipMm);
                 const p75 = toNum(d.precipP75Mm);
                 const phase = resolvePrecipPhase(d);
                 const barColor = PHASE_COLORS[phase] || PHASE_COLORS.rain;
@@ -1490,12 +1478,12 @@ export function renderPrecipSnowChart(containerEl, days, uiState = {}, onSelectD
                 const dateShortText = count > 20 ? String(d.dateStr || d.isoDate || '') : `${d.dayShort || ''}, ${d.dateStr || ''}`.replace(/^,\s*/, '');
 
                 return `
-                <g class="cursor-pointer" data-day-id="${escapeHtml(d.id)}" tabindex="0" role="button" aria-label="${escapeHtml(dateShortText)} осадки ${mm.toFixed(1)} мм">
+                <g class="cursor-pointer" data-day-id="${escapeHtml(d.id)}" tabindex="0" role="button" aria-label="${escapeHtml(dateShortText)} осадки ${mm === null ? 'неизвестны' : mm.toFixed(1) + ' мм'}">
                     <rect x="${(x - hitW / 2).toFixed(1)}" y="${padT - 8}" width="${hitW.toFixed(1)}" height="${(h - padT - 12).toFixed(1)}" fill="transparent"/>
                     ${isSel ? `<rect x="${(x - Math.min(32, hitW / 2)).toFixed(1)}" y="${padT - 8}" width="${Math.min(64, hitW).toFixed(1)}" height="${(snowBottom - padT + 14).toFixed(1)}" rx="8" fill="rgba(56,189,248,0.10)" stroke="rgba(56,189,248,0.4)"/>` : ''}
 
                     <!-- Precip Bar -->
-                    <rect x="${(x - barW / 2).toFixed(1)}" y="${yBarDraw.toFixed(1)}" width="${barW}" height="${hBar.toFixed(1)}" rx="3.5" fill="${barColor}" fill-opacity="${mm > 0 ? '0.86' : '0.28'}"/>
+                    ${mm !== null ? `<rect x="${(x - barW / 2).toFixed(1)}" y="${yBarDraw.toFixed(1)}" width="${barW}" height="${hBar.toFixed(1)}" rx="3.5" fill="${barColor}" fill-opacity="${mm > 0 ? '0.86' : '0.28'}"/>` : `<text x="${x}" y="${mainBottom}" text-anchor="middle" fill="#94a3b8">—</text>`}
                     ${mm >= 0.1 && (showLabel || mm >= 2) ? `<text x="${x.toFixed(1)}" y="${((hasWhisker ? yP75 : yBarDraw) - 5).toFixed(1)}" text-anchor="middle" fill="${barColor}" font-size="11" font-family="JetBrains Mono, monospace" font-weight="700">${mm.toFixed(1)}</text>` : ''}
 
                     <!-- P75 Upper Whisker -->

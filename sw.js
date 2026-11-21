@@ -1,4 +1,6 @@
-const CACHE_NAME = 'aban-weather-v4-shell-v6';
+const SHELL_VERSION = 14;
+const CACHE_PREFIX = 'aban-weather-v4-shell:' + encodeURIComponent(self.registration.scope) + ':v';
+const CACHE_NAME = CACHE_PREFIX + SHELL_VERSION;
 
 const PRECACHE_ASSETS = [
   './',
@@ -8,8 +10,10 @@ const PRECACHE_ASSETS = [
   './js/config.js',
   './js/physics.js',
   './js/ensemble.js',
+  './js/precipitation.js',
   './js/api.js',
   './js/storage.js',
+  './js/snapshot.js',
   './js/charts.js',
   './manifest.webmanifest',
   './assets/icon.svg',
@@ -37,16 +41,27 @@ self.addEventListener('install', (event) => {
   // Controlled update: wait for client SKIP_WAITING message when an active controller exists
 });
 
+async function removeOldShells() {
+  const ownedUrls = new Set(PRECACHE_ASSETS.map(path => new URL(path, self.registration.scope).href));
+  for (const key of await caches.keys()) {
+    if (key.startsWith(CACHE_PREFIX)) {
+      const version = key.slice(CACHE_PREFIX.length);
+      if (/^\d+$/.test(version) && Number(version) < SHELL_VERSION) await caches.delete(key);
+      continue;
+    }
+    // Earlier v4 installations shared a name across scopes. Only migrate unambiguous shells.
+    const legacy = /^aban-weather-v4-shell-v(\d+)$/.exec(key);
+    if (!legacy || Number(legacy[1]) >= SHELL_VERSION) continue;
+    const requests = await (await caches.open(key)).keys();
+    const index = new URL('index.html', self.registration.scope).href;
+    if (requests.some(req => req.url === index) && requests.every(req => ownedUrls.has(req.url))) {
+      await caches.delete(key);
+    }
+  }
+}
+
 self.addEventListener('activate', (event) => {
-  event.waitUntil(
-    caches.keys().then((keys) =>
-      Promise.all(
-        keys
-          .filter((key) => key !== CACHE_NAME)
-          .map((oldKey) => caches.delete(oldKey))
-      )
-    ).then(() => self.clients.claim())
-  );
+  event.waitUntil(removeOldShells().then(() => self.clients.claim()));
 });
 
 self.addEventListener('message', (event) => {

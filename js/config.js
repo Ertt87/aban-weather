@@ -3,6 +3,35 @@
 // Station: п. Абан, Красноярский край (WMO 29485, 56.68°N, 96.07°E, 246m)
 // ============================================================================
 
+export const TEMP_QUANTILE_FIELDS = [
+    'maxP10C', 'maxP25C', 'maxP75C', 'maxP90C', 'minP10C', 'minP25C', 'minP75C', 'minP90C'
+];
+
+export function hasEnsembleRange(day) {
+    return day?.temperatureRange?.kind === 'ensemble' && TEMP_QUANTILE_FIELDS.every(key => Number.isFinite(day[key]));
+}
+
+export function temperatureRangeLabel(day) {
+    if (hasEnsembleRange(day)) {
+        const names = { ecmwf_ifs025_ensemble: 'ECMWF IFS', gfs_seamless_ensemble: 'GEFS', ecmwf_seasonal: 'ECMWF Seasonal' };
+        const sources = Array.isArray(day.temperatureRange.sources) ? day.temperatureRange.sources : [];
+        const labels = sources.filter(id => typeof id === 'string' && Object.hasOwn(names, id)).map(id => names[id]);
+        const label = day.pentadId ? 'Средние суточные квантили ансамбля' : 'Квантили ансамбля';
+        return labels.length ? label + ' · ' + labels.join(', ') : label;
+    }
+    if (day?.temperatureRange?.kind === 'estimate') return 'Расчётный диапазон';
+    if (day?.temperatureRange?.kind === 'mixed') return 'Средние границы из разных источников';
+    return 'Источник диапазона не указан';
+}
+
+export function missingForecastDay({ isoDate, idx, offsetFromToday, dayShort, dateStr, fullDateLabel, label, zone, isArchive }) {
+    return {
+        id: `day_${isoDate}`, idx, isoDate, offsetFromToday, dayShort, dateStr, fullDateLabel, label, zone, isArchive,
+        hasForecast: false, confidencePct: null, maxC: null, minC: null, precipMm: null, hours: [],
+        dataQuality: { roadRiskInputsAvailable: false, ensembleBacked: false }, modelBreakdown: {}
+    };
+}
+
 export const ABAN_COORDS = {
     name: 'п. Абан',
     region: 'Красноярский край',
@@ -69,10 +98,13 @@ export const MODEL_META = {
     }
 };
 
+export const SHIFT_START = 8;
+export const SHIFT_END = 20;
+
 export const TIME_WINDOWS = {
     full: {
         id: 'full',
-        label: '24 часа (00:00–23:00)',
+        label: '24 часа (00:00–24:00)',
         shortLabel: '00–24ч',
         isHourActive: () => true
     },
@@ -82,7 +114,7 @@ export const TIME_WINDOWS = {
         shortLabel: '08–20ч',
         // Half-open [08, 20): together with the night window this covers the day exactly once.
         // With both ends included, 08:00 and 20:00 were counted in the day AND the night window.
-        isHourActive: (h) => h >= 8 && h < 20
+        isHourActive: (h) => h >= SHIFT_START && h < SHIFT_END
     },
     daylight: {
         id: 'daylight',
@@ -98,13 +130,13 @@ export const TIME_WINDOWS = {
         id: 'night',
         label: 'Ночь (20:00–08:00)',
         shortLabel: '20–08ч',
-        isHourActive: (h) => h >= 20 || h < 8
+        isHourActive: (h) => h >= SHIFT_END || h < SHIFT_START
     }
 };
 
 // ============================================================================
-// WMO 29485 ABAN (1991–2020) 2-HARMONIC SMOOTH CLIMATOLOGY
-// Fitted to normals: Jan -15.2/-24.5, Apr +6.8/-4.8, Jul +25.6/+12.4,
+// ABAN SEASONAL ESTIMATE (two harmonics, observation period unverified)
+// Seasonal anchors: Jan -15.2/-24.5, Apr +6.8/-4.8, Jul +25.6/+12.4,
 //                    Oct +4.8/-4.2, Nov -6.5/-14.5
 // ============================================================================
 const OMEGA = (2 * Math.PI) / 365;
@@ -131,7 +163,7 @@ function getDayOfYear(dateIso) {
 }
 
 /**
- * Smooth 2-harmonic daily climatological normals for п. Абан (WMO 29485, 1991–2020).
+ * Smooth 2-harmonic daily seasonal estimates for п. Абан.
  * @param {string|Date} dateIso - Date in 'YYYY-MM-DD' format
  * @returns {{ climMaxC: number, climMinC: number, climMeanC: number, climPrecipMm: number, climSnowDepthCm: number }}
  */
@@ -176,25 +208,9 @@ const REF_DIR_MAP = {
 const REF_WEEKDAYS = ['Вс', 'Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб'];
 const REF_MONTHS = ['янв', 'фев', 'мар', 'апр', 'мая', 'июн', 'июл', 'авг', 'сен', 'окт', 'ноя', 'дек'];
 
-function getAbanNowIsoAndHour() {
-    try {
-        const now = new Date();
-        const isoDate = new Intl.DateTimeFormat('en-CA', {
-            timeZone: ABAN_COORDS.tz || 'Asia/Krasnoyarsk',
-            year: 'numeric',
-            month: '2-digit',
-            day: '2-digit'
-        }).format(now);
-        const hourStr = new Intl.DateTimeFormat('en-GB', {
-            timeZone: ABAN_COORDS.tz || 'Asia/Krasnoyarsk',
-            hour: '2-digit',
-            hour12: false
-        }).format(now);
-        return { isoDate, hour: Math.min(23, Math.max(0, Number(hourStr === '24' ? 0 : hourStr) || 12)) };
-    } catch (_) {
-        const d = new Date(Date.now() + ABAN_COORDS.utcOffsetHours * 3600000);
-        return { isoDate: d.toISOString().slice(0, 10), hour: d.getUTCHours() };
-    }
+export function getAbanNowParts(atMs = Date.now()) {
+    const local = new Date(atMs + ABAN_COORDS.utcOffsetHours * 3600000);
+    return { isoDate: local.toISOString().slice(0, 10), hour: local.getUTCHours() };
 }
 
 function addDaysIsoUtc(isoDate, deltaDays) {
@@ -239,7 +255,7 @@ function computeAbanRefAstronomy(isoDate) {
 }
 
 export function buildDynamicReferenceDataset(baseIsoDate = null) {
-    const nowParts = getAbanNowIsoAndHour();
+    const nowParts = getAbanNowParts();
     const todayIso = baseIsoDate || nowParts.isoDate;
     const curHour = nowParts.hour;
 
@@ -334,8 +350,6 @@ export function buildDynamicReferenceDataset(baseIsoDate = null) {
                 : tempC - 0.8).toFixed(1);
             const hum = Math.round(Math.min(96, Math.max(38, humidity + (1 - w) * 12 - w * 10)));
             const isDay = h >= astronomy.sunriseHour && h <= astronomy.sunsetHour;
-            const slotPrecipMm = precipMm > 0 && isWetDay && h >= 10 && h <= 18 ? +(precipMm / 9).toFixed(2) : 0;
-            const phase = slotPrecipMm <= 0 ? 'dry' : (tempC <= 0.5 ? 'snow' : 'rain');
             return {
                 hour: h,
                 hourStr: `${String(h).padStart(2, '0')}:00`,
@@ -345,9 +359,9 @@ export function buildDynamicReferenceDataset(baseIsoDate = null) {
                 wetBulbC: +(tempC - (100 - hum) * 0.07).toFixed(1),
                 dewPointC,
                 humidity: hum,
-                precipMm: slotPrecipMm,
-                precipProb: isDay ? precipDay : precipNight,
-                precipPhase: phase,
+                precipMm: null,
+                precipProb: null,
+                precipPhase: null,
                 windMs: hWind,
                 windMph: toMph(hWind),
                 gustMs: hGust,
@@ -375,7 +389,7 @@ export function buildDynamicReferenceDataset(baseIsoDate = null) {
             fullDateLabel: `${dayShort}, ${dateStr} ${year}${isArchive ? ' (Архив)' : offset === 0 ? ' (Сегодня)' : ''}`,
             label,
             zone: isArchive ? 'archive' : 'deterministic',
-            confidencePct: isArchive ? 99 : Math.round(93 - offset * 1.6),
+            confidencePct: null,
             isArchive,
             dayCond,
             dayCondEn: dayCond,
@@ -443,7 +457,7 @@ export function buildDynamicReferenceDataset(baseIsoDate = null) {
             nextNightMaxC: +(minC + 2.5).toFixed(1),
             nextNightMaxF: toF(minC + 2.5),
             nextNightPrecipProb: precipNight,
-            nextNightPrecipMm: +(precipMm * 0.4).toFixed(1),
+            nextNightPrecipMm: null,
             nextNightPrecipType: precipTypeRu,
             nextNightWindMs: +(windMs * 0.85).toFixed(1),
             nextNightGustMs: +(gustMs * 0.85).toFixed(1),
@@ -453,7 +467,7 @@ export function buildDynamicReferenceDataset(baseIsoDate = null) {
             probFrostBelowMinus20: minC <= -20 ? 85 : 0,
             probSnowOver5mm: snowMm >= 5 ? 70 : (snowMm >= 1.5 ? 18 : 2),
             // The whole offline reference is climatology-derived: soil and snow are estimates
-            dataQuality: { soilEstimated: true, snowEstimated: true, ensembleBacked: false },
+            dataQuality: { soilEstimated: true, snowEstimated: true, ensembleBacked: false, roadRiskInputsAvailable: false },
             modelBreakdown: {},
             hours
         });

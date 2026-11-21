@@ -1,7 +1,8 @@
 // ============================================================================
 // ABAN METEO v4 — MULTI-MODEL ENSEMBLE, ROLLING MOS & 35-DAY ENGINE
 // ============================================================================
-import { ABAN_COORDS, MODEL_META, TIME_WINDOWS, getAbanClimatology } from './config.js';
+import { hourRangeLabel, localHourStart, localParts, openMeteoHourSlots, precipInterval, reportedInterval, sumPrecipIntervals, weatherTimeMs } from './precipitation.js';
+import { ABAN_COORDS, MODEL_META, TIME_WINDOWS, SHIFT_START, SHIFT_END, TEMP_QUANTILE_FIELDS, hasEnsembleRange, getAbanClimatology, missingForecastDay } from './config.js';
 import {
     cToF,
     msToMph,
@@ -130,14 +131,36 @@ function windSpeedOnly(windMs, gustMs) {
     };
 }
 
+function roundOne(value) {
+    const n = toNum(value);
+    return n === null ? null : +n.toFixed(1);
+}
+
+function ensembleWind(row) {
+    const speed = toNum(row?.windP50Ms);
+    return windSpeedOnly(speed, speed === null ? null : roundOne(Math.max(speed * 1.5, row.windP90Ms ?? speed * 1.8)));
+}
+
 function diffOrNull(a, b) {
     const x = toNum(a);
     const y = toNum(b);
     return x !== null && y !== null ? x - y : null;
 }
 
+const STORMS = new Map([
+    [95, 'Гроза'],
+    [96, 'Гроза с небольшим градом'],
+    [97, 'Сильная гроза'],
+    [99, 'Гроза с сильным градом']
+]);
+const UNKNOWN_CONDITION = { ru: 'Нет данных о погодном явлении', en: 'Unknown', icon: 'unknown' };
+
 function wmoCodeToWeather(code, tempC = 0, isNight = false) {
     const c = toNum(code);
+    if (STORMS.has(c)) {
+        const hail = c === 96 || c === 99;
+        return { ru: STORMS.get(c), en: hail ? 'Thunderstorm with hail' : 'Thunderstorm', icon: hail ? 'thunder-hail' : 'thunderstorm' };
+    }
     if (c === 0) return { ru: isNight ? 'Ясно' : 'Ясно', en: 'Clear', icon: isNight ? 'clear-night' : 'sunny' };
     if (c === 1) return { ru: 'Преимущественно ясно', en: 'Mostly clear', icon: isNight ? 'partly-cloudy-night' : 'mostly-sunny' };
     if (c === 2) return { ru: 'Малооблачно', en: 'Partly cloudy', icon: isNight ? 'partly-cloudy-night' : 'partly-sunny' };
@@ -146,7 +169,7 @@ function wmoCodeToWeather(code, tempC = 0, isNight = false) {
     if (c === 56 || c === 57 || c === 66 || c === 67) {
         return { ru: 'Ледяной дождь / гололёд', en: 'Freezing rain', icon: 'freezing-rain' };
     }
-    if ((c >= 51 && c <= 55) || (c >= 61 && c <= 65) || (c >= 80 && c <= 82) || c >= 95) {
+    if ((c >= 51 && c <= 55) || (c >= 61 && c <= 65) || (c >= 80 && c <= 82)) {
         if (tempC <= -1.0) return { ru: 'Осадки / снег', en: 'Snow / mixed', icon: 'cloudy-snow' };
         return { ru: c === 65 || c === 82 ? 'Дождь' : 'Небольшой дождь', en: 'Rain', icon: 'rain-cloudy' };
     }
@@ -159,6 +182,10 @@ function wmoCodeToWeather(code, tempC = 0, isNight = false) {
 function googleCondToMeta(condObj, tempC = 0, isNight = false) {
     const type = String(condObj?.type || '').toUpperCase();
     const text = condObj?.description?.text || null;
+    if (type.includes('THUNDER')) {
+        const hail = type.includes('HAIL');
+        return { icon: hail ? 'thunder-hail' : 'thunderstorm', ru: text || (hail ? 'Гроза с градом' : 'Гроза'), en: type.toLowerCase() };
+    }
     if (type.includes('FREEZING') || type.includes('ICE')) {
         return { icon: 'freezing-rain', ru: text || 'Ледяной дождь', en: type.toLowerCase() };
     }
@@ -168,7 +195,7 @@ function googleCondToMeta(condObj, tempC = 0, isNight = false) {
     if (type.includes('SNOW') || type.includes('FLURRIES') || type.includes('BLIZZARD')) {
         return { icon: type.includes('CLOUDY') ? 'cloudy-snow' : 'snow', ru: text || 'Снег', en: type.toLowerCase() };
     }
-    if (type.includes('RAIN') || type.includes('DRIZZLE') || type.includes('SHOWER') || type.includes('THUNDER')) {
+    if (type.includes('RAIN') || type.includes('DRIZZLE') || type.includes('SHOWER')) {
         return { icon: tempC <= -1 ? 'cloudy-snow' : 'rain-cloudy', ru: text || 'Дождь', en: type.toLowerCase() };
     }
     if (type.includes('FOG') || type.includes('MIST') || type.includes('HAZE')) {
@@ -188,6 +215,38 @@ function googleCondToMeta(condObj, tempC = 0, isNight = false) {
         ru: text || 'Переменная облачность',
         en: type ? type.toLowerCase() : 'partly cloudy'
     };
+}
+
+function reportedWeather(code, source, tempC, isNight) {
+    if (toNum(code) === null) return null;
+    return { ...wmoCodeToWeather(code, tempC, isNight), code: Number(code), source };
+}
+
+function stormPriority(weather) {
+    if (weather?.icon === 'thunder-hail') return weather.code === 99 ? 4 : 3;
+    if (weather?.icon === 'thunderstorm') return weather.code === 97 ? 2 : 1;
+    return 0;
+}
+
+// Inputs are in order of preference. Keep an explicit storm/hail signal even
+// when a higher-weight model predicts rain for the same period.
+function chooseWeather(candidates) {
+    return candidates.reduce((best, item) =>
+        item && (!best || stormPriority(item) > stormPriority(best)) ? item : best, null);
+}
+
+function weatherLabel(weather) {
+    const source = MODEL_META[weather.source]?.shortName || weather.source;
+    return stormPriority(weather) && source ? `${weather.ru} (${source}${weather.dailyOnly ? ', за сутки' : ''})` : weather.ru;
+}
+
+// Check provider values before interpolation, climate normals and gust estimates.
+// A complete daily report or 24 actual hours can support a daily road assessment.
+function coversRoadRisk({ modelId, dailyRec, hourlyMap }) {
+    const fields = ['precipMm', 'windMs', 'gustMs'];
+    const hasFields = (record, keys) => keys.every(key => Number.isFinite(record?.[key]));
+    if (modelId !== 'met_no' && modelId !== 'google_wn3' && hasFields(dailyRec, ['maxC', 'minC', ...fields])) return true;
+    return hourlyMap?.size === 24 && [...hourlyMap.values()].every(h => hasFields(h, ['tempC', ...fields]));
 }
 
 function getModelWeight(modelId, offset, mosModels) {
@@ -243,6 +302,7 @@ function weightedTrimmedMean(entries, trimFrac = 0.2) {
 }
 
 function enforceQuantiles(central, p10, p25, p75, p90, fallbackHalfSpread = 1.5) {
+    if (central == null) return { p10: null, p25: null, p75: null, p90: null };
     const c = Number(central);
     let q25 = toNum(p25);
     let q10 = toNum(p10);
@@ -416,14 +476,15 @@ function parseOpenMeteoMulti(payload) {
 
         if (hourly && Array.isArray(hourly.time)) {
             const tArr = hVar('temperature_2m');
-            if (tArr) {
+            const wmoArr = hVar('weather_code');
+            if (tArr || wmoArr || hVar('precipitation') || hVar('precipitation_probability')) {
                 const appArr = hVar('apparent_temperature');
                 const rhArr = hVar('relative_humidity_2m');
                 const dewArr = hVar('dew_point_2m');
                 const pArr = hVar('precipitation');
+                const probArr = hVar('precipitation_probability');
                 const rArr = hVar('rain');
                 const sArr = hVar('snowfall');
-                const wmoArr = hVar('weather_code');
                 const pmslArr = hVar('pressure_msl');
                 const psurfArr = hVar('surface_pressure');
                 const cldArr = hVar('cloud_cover');
@@ -431,20 +492,20 @@ function parseOpenMeteoMulti(payload) {
                 const wdArr = hVar('wind_direction_10m');
                 const wgArr = hVar('wind_gusts_10m');
 
-                for (let i = 0; i < hourly.time.length; i++) {
-                    const parts = utcIsoToAbanParts(hourly.time[i]);
-                    if (!parts) continue;
-                    const tempC = toNum(tArr[i]);
-                    if (tempC === null) continue;
+                for (const parts of openMeteoHourSlots(hourly.time)) {
+                    const { instantIndex: i, precipIndex: p } = parts;
+                    const tempC = toNum(tArr?.[i]);
+                    if ([tempC, wmoArr?.[i], pArr?.[p], probArr?.[p]].every(v => toNum(v) === null)) continue;
                     if (!hMap.has(parts.isoDate)) hMap.set(parts.isoDate, new Map());
                     hMap.get(parts.isoDate).set(parts.hour, {
                         tempC,
                         feelsC: toNum(appArr?.[i]),
+                        precipProb: toNum(probArr?.[p]),
                         humidity: toNum(rhArr?.[i]),
                         dewPointC: toNum(dewArr?.[i]),
-                        precipMm: toNum(pArr?.[i]),
-                        rainMm: toNum(rArr?.[i]),
-                        snowfallCm: toNum(sArr?.[i]),
+                        precipMm: toNum(pArr?.[p]),
+                        rainMm: toNum(rArr?.[p]),
+                        snowfallCm: toNum(sArr?.[p]),
                         weatherCode: toNum(wmoArr?.[i]),
                         pressureMslHpa: toNum(pmslArr?.[i]),
                         surfacePressureHpa: toNum(psurfArr?.[i]),
@@ -460,8 +521,8 @@ function parseOpenMeteoMulti(payload) {
         if (daily && Array.isArray(daily.time)) {
             const maxArr = dVar('temperature_2m_max');
             const minArr = dVar('temperature_2m_min');
-            if (maxArr && minArr) {
-                const wmoArr = dVar('weather_code');
+            const wmoArr = dVar('weather_code');
+            if (maxArr || minArr || wmoArr || dVar('precipitation_sum') || dVar('wind_speed_10m_max')) {
                 const pArr = dVar('precipitation_sum');
                 const rArr = dVar('rain_sum');
                 const sArr = dVar('snowfall_sum');
@@ -471,9 +532,9 @@ function parseOpenMeteoMulti(payload) {
 
                 for (let i = 0; i < daily.time.length; i++) {
                     const isoDate = String(daily.time[i]).slice(0, 10);
-                    const maxC = toNum(maxArr[i]);
-                    const minC = toNum(minArr[i]);
-                    if (maxC === null && minC === null) continue;
+                    const maxC = toNum(maxArr?.[i]);
+                    const minC = toNum(minArr?.[i]);
+                    if ([maxC, minC, wmoArr?.[i], pArr?.[i], wsArr?.[i]].every(v => toNum(v) === null)) continue;
                     dMap.set(isoDate, {
                         maxC,
                         minC,
@@ -515,12 +576,11 @@ function parseOpenMeteoCompanion(payload) {
     const snowUnit = payload.hourly_units?.snow_depth;
     const h = payload.hourly;
     if (h && Array.isArray(h.time)) {
-        for (let i = 0; i < h.time.length; i++) {
-            const parts = utcIsoToAbanParts(h.time[i]);
-            if (!parts) continue;
+        for (const parts of openMeteoHourSlots(h.time)) {
+            const { instantIndex: i, precipIndex: p } = parts;
             if (!hourlyByDate.has(parts.isoDate)) hourlyByDate.set(parts.isoDate, new Map());
             hourlyByDate.get(parts.isoDate).set(parts.hour, {
-                precipProb: toNum(h.precipitation_probability?.[i]),
+                precipProb: toNum(h.precipitation_probability?.[p]),
                 snowDepthCm: snowDepthToCm(h.snow_depth?.[i], snowUnit),
                 soil0C: toNum(h.soil_temperature_0cm?.[i] ?? h.soil_temperature_0_to_7cm?.[i]),
                 soil6C: toNum(h.soil_temperature_6cm?.[i]),
@@ -560,12 +620,13 @@ function parseGoogleSpeedMs(speedObj) {
 function parseGoogleWeather(google) {
     const hourlyByDate = new Map();
     const dailyByDate = new Map();
-    if (!google) return { hourlyByDate, dailyByDate, current: null };
+    const precipBlocks = [];
+    if (!google) return { hourlyByDate, dailyByDate, precipBlocks, current: null };
 
     const ingestHours = (arr) => {
         if (!Array.isArray(arr)) return;
         for (const gh of arr) {
-            const isoStr = gh?.interval?.startTime || gh?.displayDateTime?.utcOffset || gh?.time;
+            const isoStr = gh?.interval?.startTime || gh?.time;
             let parts = isoStr ? utcIsoToAbanParts(isoStr) : null;
             if (!parts && gh?.displayDateTime?.year) {
                 const dt = gh.displayDateTime;
@@ -576,7 +637,13 @@ function parseGoogleWeather(google) {
             }
             if (!parts) continue;
             const tempC = toNum(gh.temperature?.degrees);
-            if (tempC === null) continue;
+            const interval = gh.interval?.startTime ? gh.interval : { startTime: new Date(localHourStart(parts.isoDate, parts.hour)).toISOString() };
+            // Google's ForecastHour/HistoryHour represents one explicit interval.
+            const bounds = reportedInterval(interval, 0, 1);
+            const oneHour = bounds?.durationHours === 1;
+            const amount = oneHour ? toNum(gh.precipitation?.qpf?.quantity) : null;
+            const probability = oneHour ? toNum(gh.precipitation?.probability?.percent) : null;
+            if (tempC === null && amount === null && probability === null && !gh.weatherCondition) continue;
             if (!hourlyByDate.has(parts.isoDate)) hourlyByDate.set(parts.isoDate, new Map());
             const ws = parseGoogleSpeedMs(gh.wind?.speed);
             const wg = parseGoogleSpeedMs(gh.wind?.gust);
@@ -586,8 +653,8 @@ function parseGoogleWeather(google) {
                 feelsC: toNum(gh.feelsLikeTemperature?.degrees),
                 humidity: toNum(gh.relativeHumidity),
                 dewPointC: toNum(gh.dewPoint?.degrees),
-                precipProb: toNum(gh.precipitation?.probability?.percent),
-                precipMm: toNum(gh.precipitation?.qpf?.quantity),
+                precipProb: probability,
+                precipMm: amount,
                 cloudCoverPct: toNum(gh.cloudCover),
                 pressureMslHpa: toNum(gh.airPressure?.meanSeaLevelMillibars),
                 windMs: ws,
@@ -595,6 +662,7 @@ function parseGoogleWeather(google) {
                 windDeg: toNum(gh.wind?.direction?.degrees),
                 uv: toNum(gh.uvIndex),
                 condRu: meta.ru,
+                weather: gh.weatherCondition ? { ...meta, source: 'google_wn3' } : null,
                 iconType: meta.icon
             });
         }
@@ -619,21 +687,20 @@ function parseGoogleWeather(google) {
             const minC = toNum(gd.minTemperature?.degrees);
             const dayMeta = googleCondToMeta(dayF.weatherCondition, maxC ?? 0, false);
             const nightMeta = googleCondToMeta(nightF.weatherCondition, minC ?? 0, true);
-            const qpfDay = toNum(dayF.precipitation?.qpf?.quantity) ?? 0;
-            const qpfNight = toNum(nightF.precipitation?.qpf?.quantity) ?? 0;
+            const qpfDay = toNum(dayF.precipitation?.qpf?.quantity);
+            const qpfNight = toNum(nightF.precipitation?.qpf?.quantity);
+            if ([maxC, minC, qpfDay, qpfNight].every(v => v === null) && !dayF.weatherCondition && !nightF.weatherCondition) continue;
 
+            const parts = [reportedInterval(dayF.interval, qpfDay), reportedInterval(nightF.interval, qpfNight)].filter(Boolean);
+            precipBlocks.push(...parts);
             dailyByDate.set(isoDate, {
                 maxC,
                 minC,
-                dayCond: dayMeta.ru,
-                dayCondEn: dayMeta.en,
-                nightCond: nightMeta.ru,
-                nightCondEn: nightMeta.en,
-                iconType: dayMeta.icon,
-                nightIconType: nightMeta.icon,
+                dayWeather: dayF.weatherCondition ? { ...dayMeta, source: 'google_wn3' } : null,
+                nightWeather: nightF.weatherCondition ? { ...nightMeta, source: 'google_wn3' } : null,
                 precipDay: toNum(dayF.precipitation?.probability?.percent),
                 precipNight: toNum(nightF.precipitation?.probability?.percent),
-                precipMm: +(qpfDay + qpfNight).toFixed(1),
+                precipMm: null, // Filled below only if the reports cover this local calendar day.
                 humidity: toNum(dayF.relativeHumidity ?? nightF.relativeHumidity),
                 uv: toNum(dayF.uvIndex),
                 windMs: parseGoogleSpeedMs(dayF.wind?.speed ?? nightF.wind?.speed),
@@ -644,12 +711,16 @@ function parseGoogleWeather(google) {
         }
     }
 
-    return { hourlyByDate, dailyByDate, current: google.current || null };
+    for (const [isoDate, day] of dailyByDate) {
+        day.precipMm = sumPrecipIntervals(precipBlocks, localHourStart(isoDate, 0), 24).mm;
+    }
+    return { hourlyByDate, dailyByDate, precipBlocks, current: google.current || null };
 }
 
 function parseMetNo(metNo) {
     const hourlyByDate = new Map();
     const dailyByDate = new Map();
+    const precipBlocks = [];
     const series = metNo?.properties?.timeseries;
     if (!Array.isArray(series)) return { hourlyByDate, dailyByDate };
 
@@ -658,15 +729,15 @@ function parseMetNo(metNo) {
         if (!parts) continue;
         const det = item.data?.instant?.details || {};
         const tempC = toNum(det.air_temperature);
-        if (tempC === null) continue;
         const next1 = item.data?.next_1_hours?.details || {};
         const next6 = item.data?.next_6_hours?.details || {};
         const p1 = toNum(next1.precipitation_amount);
         const p6 = toNum(next6.precipitation_amount);
-        // Hourly RATE for the blended hour slot: beyond ~60 h MET.no is 6-hourly, so spread the block
-        const precipMm = p1 ?? (p6 !== null ? p6 / 6 : null);
-        // Contribution to the DAILY total: a 6-hourly step stands for its whole 6 h block
-        const precipBlockMm = p1 ?? p6;
+        const startMs = weatherTimeMs(item.time);
+        const block = precipInterval(startMs, 6, p6);
+        if (block) precipBlocks.push(block);
+        const hourly = precipInterval(startMs, 1, p1);
+        if (tempC === null && !hourly && !block) continue;
 
         if (!hourlyByDate.has(parts.isoDate)) hourlyByDate.set(parts.isoDate, new Map());
         hourlyByDate.get(parts.isoDate).set(parts.hour, {
@@ -678,30 +749,32 @@ function parseMetNo(metNo) {
             windDeg: toNum(det.wind_from_direction),
             pressureMslHpa: toNum(det.air_pressure_at_sea_level),
             cloudCoverPct: toNum(det.cloud_area_fraction),
-            precipMm,
-            precipBlockMm
+            precipMm: hourly?.mm ?? null
         });
     }
 
     for (const [isoDate, hMap] of hourlyByDate.entries()) {
         if (hMap.size < 4) continue;
         const vals = [...hMap.values()];
-        const temps = vals.map((v) => v.tempC);
+        const temps = vals.map((v) => v.tempC).filter(Number.isFinite);
+        if (!temps.length) continue;
         const winds = vals.map((v) => v.windMs).filter((v) => v !== null);
         const gusts = vals.map((v) => v.gustMs).filter((v) => v !== null);
-        const precips = vals.map((v) => v.precipBlockMm).filter((v) => v !== null);
+        const midnight = localHourStart(isoDate, 0);
+        const hourly = [...hMap].map(([hour, h]) => precipInterval(localHourStart(isoDate, hour), 1, h.precipMm));
+        const dailyPrecip = sumPrecipIntervals([...hourly, ...precipBlocks], midnight, 24);
         const wAvg = blendWindVectors(vals.filter((v) => v.windMs !== null).map((v) => ({ speedMs: v.windMs, gustMs: v.gustMs, dirDeg: v.windDeg ?? 0, weight: 1 })));
         dailyByDate.set(isoDate, {
             maxC: +Math.max(...temps).toFixed(1),
             minC: +Math.min(...temps).toFixed(1),
-            precipMm: precips.length ? +precips.reduce((a, b) => a + b, 0).toFixed(1) : null,
+            precipMm: dailyPrecip.mm,
             windMs: winds.length ? +Math.max(...winds).toFixed(1) : null,
             gustMs: gusts.length ? +Math.max(...gusts).toFixed(1) : null,
             windDeg: wAvg.windDeg
         });
     }
 
-    return { hourlyByDate, dailyByDate };
+    return { hourlyByDate, dailyByDate, precipBlocks };
 }
 
 function quantileSorted(sorted, q) {
@@ -721,8 +794,9 @@ function parseEnsemble35(ensemble35) {
 
     if (Array.isArray(ensemble35.dailyQuantiles)) {
         for (const row of ensemble35.dailyQuantiles) {
-            if (!row?.isoDate) continue;
-            qMap.set(String(row.isoDate).slice(0, 10), row);
+            if (!row?.isoDate || [row.maxP50C, row.minP50C, row.precipP50Mm, row.windP50Ms].every(v => toNum(v) === null)) continue;
+            const sources = row.sources ?? (ensemble35.sources?.length === 1 ? ensemble35.sources : []);
+            qMap.set(String(row.isoDate).slice(0, 10), { ...row, sources });
         }
         return qMap;
     }
@@ -743,17 +817,18 @@ function parseEnsemble35(ensemble35) {
             const pMembers = precipKeys.map((k) => toNum(daily[k]?.[i])).filter((v) => v !== null).sort((a, b) => a - b);
             const wMembers = windKeys.map((k) => toNum(daily[k]?.[i])).filter((v) => v !== null).sort((a, b) => a - b);
 
-            if (!maxMembers.length && !minMembers.length) continue;
+            if (!maxMembers.length && !minMembers.length && !pMembers.length && !wMembers.length) continue;
 
             const belowMinus20 = minMembers.length
                 ? Math.round((minMembers.filter((v) => v <= -20).length / minMembers.length) * 100)
-                : 0;
+                : null;
             const precipOver5 = pMembers.length
                 ? Math.round((pMembers.filter((v) => v >= 5).length / pMembers.length) * 100)
-                : 0;
+                : null;
 
             qMap.set(isoDate, {
                 isoDate,
+                temperatureMemberCount: Math.min(maxMembers.length, minMembers.length),
                 maxP10C: quantileSorted(maxMembers, 0.1),
                 maxP25C: quantileSorted(maxMembers, 0.25),
                 maxP50C: quantileSorted(maxMembers, 0.5),
@@ -781,7 +856,7 @@ function parseEnsemble35(ensemble35) {
 // ============================================================================
 // SYNTHETIC DIURNAL FALLBACK (ONLY FOR SPARSE SUBSEASONAL / ERA5 DAYS)
 // ============================================================================
-function buildSyntheticHours({ maxC, minC, humidity, precipMm, precipProb, windMs, gustMs, windDeg, pressureStationMm, pressureMslMm, cloudCoverPct, soil0C, astronomy, dayIcon, nightIcon }) {
+function buildSyntheticHours({ maxC, minC, humidity, windMs, gustMs, windDeg, pressureStationMm, pressureMslMm, cloudCoverPct, soil0C, astronomy, dayIcon, nightIcon }) {
     const comp = toNum(windDeg) !== null ? degToCompass(windDeg) : NO_DIRECTION;
     const sr = astronomy?.sunriseHour ?? 7;
     const ss = astronomy?.sunsetHour ?? 18;
@@ -792,15 +867,13 @@ function buildSyntheticHours({ maxC, minC, humidity, precipMm, precipProb, windM
         const shiftedIdx = (h - (minHour - 5) + 24) % 24;
         const w = DEFAULT_DIURNAL[shiftedIdx];
         const tempC = +(minC + w * (maxC - minC)).toFixed(1);
-        const hWind = +(windMs * (0.76 + 0.34 * w)).toFixed(1);
-        const hGust = +Math.max(hWind, gustMs * (0.76 + 0.34 * w)).toFixed(1);
+        const hWind = windMs === null ? null : +(windMs * (0.76 + 0.34 * w)).toFixed(1);
+        const hGust = gustMs === null ? null : +Math.max(hWind, gustMs * (0.76 + 0.34 * w)).toFixed(1);
         const hHum = Math.round(clamp(humidity + (1 - w) * 12 - w * 10, 30, 98));
         const wetBulbC = computeWetBulbC(tempC, hHum);
         const feelsC = computeApparentTempC(tempC, hWind, hHum);
         const dewPointC = +(tempC - (100 - hHum) / 5).toFixed(1);
         const hSoil0 = +(soil0C + (w - 0.5) * 0.7).toFixed(1);
-        const hPrecipMm = precipMm > 0 ? +(precipMm / 24).toFixed(2) : 0;
-        const phaseObj = classifyPrecipPhase(tempC, hHum, hPrecipMm, hSoil0);
         const isDay = h >= sr && h <= ss;
 
         return {
@@ -812,9 +885,9 @@ function buildSyntheticHours({ maxC, minC, humidity, precipMm, precipProb, windM
             wetBulbC,
             dewPointC,
             humidity: hHum,
-            precipMm: hPrecipMm,
-            precipProb: Math.round(precipProb ?? (hPrecipMm > 0 ? 45 : 10)),
-            precipPhase: phaseObj.phase,
+            precipMm: null,
+            precipProb: null,
+            precipPhase: null,
             windMs: hWind,
             windMph: msToMph(hWind),
             gustMs: hGust,
@@ -851,22 +924,24 @@ function buildZoneDayRecord({
     const astronomy = computeAstronomy(isoDate, ABAN_COORDS.lat, ABAN_COORDS.lon, ABAN_COORDS.utcOffsetHours);
 
     let zone;
-    let confidencePct;
     if (offsetFromToday < 0) {
         zone = 'archive';
-        confidencePct = 99;
     } else if (offsetFromToday <= 9) {
         zone = 'deterministic';
-        confidencePct = Math.round(93 - (offsetFromToday * 15) / 9);
     } else if (offsetFromToday <= 15) {
         zone = 'extended_ensemble';
-        confidencePct = Math.round(74 - ((offsetFromToday - 10) * 18) / 5);
     } else {
         zone = 'subseasonal';
-        confidencePct = Math.round(Math.max(35, 52 - ((offsetFromToday - 16) * 17) / 18));
     }
 
     const isArchive = zone === 'archive';
+    const identity = {
+        id: `day_${isoDate}`, idx: 0, isoDate, offsetFromToday, zone, isArchive,
+        dayShort: dateMeta.dayShort, dateStr: dateMeta.dateStr,
+        fullDateLabel: `${dateMeta.dayShort}, ${dateMeta.dateStr} ${dateMeta.year}${isArchive ? ' (Архив)' : offsetFromToday === 0 ? ' (Сегодня)' : ''}`,
+        label: offsetFromToday === -1 ? 'Вчера (Архив)' : isArchive ? 'Архив' : offsetFromToday === 0 ? 'Сегодня' :
+            offsetFromToday === 1 ? 'Завтра' : dateMeta.isWeekend ? `${dateMeta.dayShort} (Вых.)` : dateMeta.dayShort
+    };
     const damping = isArchive ? 0 : Math.exp(-Math.max(0, offsetFromToday) / 4);
 
     // Collect model weights for this day
@@ -885,8 +960,8 @@ function buildZoneDayRecord({
             modelBreakdown[modelId] = {
                 maxC: +dailyRec.maxC.toFixed(1),
                 minC: +dailyRec.minC.toFixed(1),
-                precipMm: +(dailyRec.precipMm ?? 0).toFixed(1),
-                windMs: +(dailyRec.windMs ?? 0).toFixed(1)
+                precipMm: dailyRec.precipMm ?? null,
+                windMs: roundOne(dailyRec.windMs)
             };
         } else if (hourlyMap && hourlyMap.size >= 6) {
             const temps = [...hourlyMap.values()].map((x) => x.tempC).filter((v) => v !== null);
@@ -896,8 +971,8 @@ function buildZoneDayRecord({
                 modelBreakdown[modelId] = {
                     maxC: +Math.max(...temps).toFixed(1),
                     minC: +Math.min(...temps).toFixed(1),
-                    precipMm: +(precs.length ? precs.reduce((a, b) => a + b, 0) : 0).toFixed(1),
-                    windMs: +(winds.length ? Math.max(...winds) : 0).toFixed(1)
+                    precipMm: precs.length === 24 ? +precs.reduce((a, b) => a + b, 0).toFixed(2) : null,
+                    windMs: winds.length ? roundOne(Math.max(...winds)) : null
                 };
             }
         }
@@ -915,6 +990,10 @@ function buildZoneDayRecord({
         addModelSource('met_no', metNoData.dailyByDate.get(isoDate), metNoData.hourlyByDate.get(isoDate));
     }
 
+    if (!modelSourcesForDay.length && !ensQ && ![rawArchiveDay?.maxC, rawArchiveDay?.minC, rawArchiveDay?.weatherCode].some(v => toNum(v) !== null) && !rawArchiveDay?.hourlyRaw?.length) {
+        return missingForecastDay(identity);
+    }
+
     const compHours = companionData?.hourlyByDate?.get(isoDate) || null;
     const compDaily = companionData?.dailyByDate?.get(isoDate) || null;
 
@@ -922,10 +1001,12 @@ function buildZoneDayRecord({
     // Build real 24h hours[0..23] when hourly observations/forecasts exist
     // ------------------------------------------------------------------------
     const realHours = [];
+    const reportsByHour = new Map();
+    const precipByHour = new Map();
     let hoursWithHumidity = 0;
-    const hasAnyHourly = modelSourcesForDay.some((m) => m.hourlyMap && m.hourlyMap.size >= 4) || (Array.isArray(rawArchiveDay?.hourlyRaw) && rawArchiveDay.hourlyRaw.length >= 6);
+    const hasAnyHourly = modelSourcesForDay.some((m) => m.hourlyMap?.size) || rawArchiveDay?.hourlyRaw?.length;
 
-    if (hasAnyHourly && zone !== 'subseasonal') {
+    if ((hasAnyHourly || compHours?.size) && zone !== 'subseasonal') {
         const archiveHourLookup = new Map();
         if (Array.isArray(rawArchiveDay?.hourlyRaw)) {
             for (const hr of rawArchiveDay.hourlyRaw) {
@@ -946,7 +1027,8 @@ function buildZoneDayRecord({
             const pMslEntries = [];
             const pSurfEntries = [];
             const soilEntries = [];
-            const wmoCodes = [];
+            const weatherReports = [];
+            const isNightHour = h < astronomy.sunriseHour || h > astronomy.sunsetHour;
 
             for (const ms of modelSourcesForDay) {
                 const hr = ms.hourlyMap?.get(h);
@@ -971,7 +1053,8 @@ function buildZoneDayRecord({
                         weight: ms.weight
                     });
                 }
-                if (hr.weatherCode !== null && hr.weatherCode !== undefined) wmoCodes.push({ code: hr.weatherCode, weight: ms.weight });
+                const weather = hr.weather || reportedWeather(hr.weatherCode, ms.modelId, hr.tempC, isNightHour);
+                if (weather) weatherReports.push({ weather, weight: ms.weight });
             }
 
             const aHr = archiveHourLookup.get(h);
@@ -992,7 +1075,8 @@ function buildZoneDayRecord({
                         weight: 1.0
                     });
                 }
-                if (toNum(aHr.weatherCode) !== null) wmoCodes.push({ code: toNum(aHr.weatherCode), weight: 1.0 });
+                const weather = !aHr.weatherCodeFromDay && reportedWeather(aHr.weatherCode, 'Архив', aHr.tempC, isNightHour);
+                if (weather) weatherReports.push({ weather, weight: 1 });
             }
 
             const cHr = compHours?.get(h);
@@ -1003,6 +1087,13 @@ function buildZoneDayRecord({
                 if (cHr.soil0C !== null) soilEntries.push({ value: cHr.soil0C, weight: 1.0 });
             }
 
+            const weather = chooseWeather(weatherReports.sort((a, b) => b.weight - a.weight).map(r => r.weather));
+            if (weather) reportsByHour.set(h, weather);
+            const mm = weightedMean(precipEntries);
+            const prob = weightedMean(probEntries);
+            const precipMm = mm === null ? null : +Math.max(0, mm).toFixed(2);
+            const precipProb = prob === null ? null : Math.round(clamp(prob, 0, 100));
+            precipByHour.set(h, { precipMm, precipProb });
             const rawTemp = weightedTrimmedMean(tempEntries);
             if (rawTemp === null) continue;
 
@@ -1012,8 +1103,6 @@ function buildZoneDayRecord({
             if (humEntries.length) hoursWithHumidity++;
             const humidity = Math.round(clamp(weightedMean(humEntries) ?? 72, 10, 100));
             const dewPointC = +(weightedMean(dewEntries) ?? (tempC - (100 - humidity) / 5)).toFixed(1);
-            const precipMm = +(Math.max(0, weightedMean(precipEntries) ?? 0)).toFixed(2);
-            const precipProb = Math.round(clamp(weightedMean(probEntries) ?? (precipMm > 0.1 ? Math.min(95, 25 + precipMm * 20) : 5), 0, 100));
             const cloudCoverPct = Math.round(clamp(weightedMean(cloudEntries) ?? 50, 0, 100));
             const wind = blendWindVectors(windSamples);
             const soil0C = +(weightedMean(soilEntries) ?? (tempC * 0.45)).toFixed(1);
@@ -1022,12 +1111,8 @@ function buildZoneDayRecord({
             const wetBulbC = computeWetBulbC(tempC, humidity);
             const feelsC = computeApparentTempC(tempC, wind.windMs, humidity);
             const phaseObj = classifyPrecipPhase(tempC, humidity, precipMm, soil0C);
-            const isNightHour = h < astronomy.sunriseHour || h > astronomy.sunsetHour;
-
-            const topCode = wmoCodes.length
-                ? wmoCodes.sort((a, b) => b.weight - a.weight)[0].code
-                : (precipMm > 0.2 ? (phaseObj.phase === 'snow' ? 71 : 61) : cloudCoverPct > 75 ? 3 : cloudCoverPct > 35 ? 2 : 0);
-            const wMeta = wmoCodeToWeather(topCode, tempC, isNightHour);
+            const inferredCode = precipMm > 0.2 ? (phaseObj.phase === 'snow' ? 71 : 61) : cloudCoverPct > 75 ? 3 : cloudCoverPct > 35 ? 2 : 0;
+            const wMeta = weather || wmoCodeToWeather(inferredCode, tempC, isNightHour);
 
             realHours.push({
                 hour: h,
@@ -1040,7 +1125,7 @@ function buildZoneDayRecord({
                 humidity,
                 precipMm,
                 precipProb,
-                precipPhase: phaseObj.phase,
+                precipPhase: precipMm === null ? null : phaseObj.phase,
                 windMs: wind.windMs,
                 windMph: wind.windMph,
                 gustMs: wind.gustMs,
@@ -1051,7 +1136,8 @@ function buildZoneDayRecord({
                 pressureMslHpa: pObj.mslHpa,
                 cloudCoverPct,
                 soil0C,
-                iconType: phaseObj.phase === 'freezing_rain' ? 'freezing-rain' : phaseObj.phase === 'sleet' ? 'sleet' : wMeta.icon
+                weather,
+                iconType: weather ? weather.icon : precipMm > 0 && phaseObj.phase === 'freezing_rain' ? 'freezing-rain' : precipMm > 0 && phaseObj.phase === 'sleet' ? 'sleet' : wMeta.icon
             });
         }
     }
@@ -1073,6 +1159,11 @@ function buildZoneDayRecord({
             }
             hoursByIdx.set(h, {
                 ...nearest,
+                weather: null,
+                iconType: UNKNOWN_CONDITION.icon,
+                precipMm: null,
+                precipProb: null,
+                precipPhase: null,
                 hour: h,
                 hourStr: `${String(h).padStart(2, '0')}:00`,
                 isSynthetic: true
@@ -1161,12 +1252,12 @@ function buildZoneDayRecord({
     if (zone === 'subseasonal') {
         const t = clamp((offsetFromToday - 16) / 18, 0, 1);
         const alpha = 0.82 - t * (0.82 - 0.38); // 0.82 -> 0.38
-        const rawP50Max = toNum(ensQ?.maxP50C) ?? detMaxC ?? clim.climMaxC;
-        const rawP50Min = toNum(ensQ?.minP50C) ?? detMinC ?? clim.climMinC;
+        const rawP50Max = toNum(ensQ?.maxP50C) ?? detMaxC;
+        const rawP50Min = toNum(ensQ?.minP50C) ?? detMinC;
 
-        maxC = +(alpha * rawP50Max + (1 - alpha) * clim.climMaxC).toFixed(1);
-        minC = +(alpha * rawP50Min + (1 - alpha) * clim.climMinC).toFixed(1);
-        if (minC > maxC) {
+        maxC = rawP50Max === null ? null : +(alpha * rawP50Max + (1 - alpha) * clim.climMaxC).toFixed(1);
+        minC = rawP50Min === null ? null : +(alpha * rawP50Min + (1 - alpha) * clim.climMinC).toFixed(1);
+        if (minC !== null && maxC !== null && minC > maxC) {
             const mid = +((maxC + minC) / 2).toFixed(1);
             maxC = +(mid + 0.5).toFixed(1);
             minC = +(mid - 0.5).toFixed(1);
@@ -1195,13 +1286,10 @@ function buildZoneDayRecord({
             halfSpread + 0.5
         );
 
-        const rawPrecip = toNum(ensQ?.precipP50Mm) ?? clim.climPrecipMm;
-        precipMm = +(Math.max(0, alpha * rawPrecip + (1 - alpha) * clim.climPrecipMm)).toFixed(1);
-        precipP75Mm = +(Math.max(precipMm, toNum(ensQ?.precipP75Mm) ?? precipMm * 1.6)).toFixed(1);
-        const wSpeed = +(toNum(ensQ?.windP50Ms) ?? 3.8).toFixed(1);
-        const wGust = +(Math.max(wSpeed * 1.5, toNum(ensQ?.windP90Ms) ?? wSpeed * 1.8)).toFixed(1);
-        // Ensemble quantiles carry speed only — there is no bearing at this range
-        windObj = windSpeedOnly(wSpeed, wGust);
+        const rawPrecip = toNum(ensQ?.precipP50Mm) ?? weightedMean(precipEntries);
+        precipMm = rawPrecip === null ? null : +(Math.max(0, alpha * rawPrecip + (1 - alpha) * clim.climPrecipMm)).toFixed(1);
+        precipP75Mm = precipMm === null ? toNum(ensQ?.precipP75Mm) : +(Math.max(precipMm, toNum(ensQ?.precipP75Mm) ?? precipMm * 1.6)).toFixed(1);
+        windObj = windDaySamples.length ? blendWindVectors(windDaySamples) : ensembleWind(ensQ);
     } else if (zone === 'extended_ensemble') {
         const t = clamp((offsetFromToday - 10) / 5, 0, 1);
         const wDet = 0.65 - 0.25 * t; // 0.65 -> 0.40 deterministic 16d weight
@@ -1211,14 +1299,14 @@ function buildZoneDayRecord({
         if (detMaxC !== null && ensMax !== null) {
             maxC = +(wDet * detMaxC + (1 - wDet) * ensMax).toFixed(1);
         } else {
-            maxC = +(detMaxC ?? ensMax ?? clim.climMaxC).toFixed(1);
+            maxC = roundOne(detMaxC ?? ensMax);
         }
         if (detMinC !== null && ensMin !== null) {
             minC = +(wDet * detMinC + (1 - wDet) * ensMin).toFixed(1);
         } else {
-            minC = +(detMinC ?? ensMin ?? clim.climMinC).toFixed(1);
+            minC = roundOne(detMinC ?? ensMin);
         }
-        if (minC > maxC) {
+        if (minC !== null && maxC !== null && minC > maxC) {
             const mid = +((maxC + minC) / 2).toFixed(1);
             maxC = +(mid + 0.5).toFixed(1);
             minC = +(mid - 0.5).toFixed(1);
@@ -1230,18 +1318,15 @@ function buildZoneDayRecord({
 
         const detPrecip = weightedMean(precipEntries);
         const ensPrecip = toNum(ensQ?.precipP50Mm);
-        precipMm = +(Math.max(0, detPrecip !== null && ensPrecip !== null ? wDet * detPrecip + (1 - wDet) * ensPrecip : (detPrecip ?? ensPrecip ?? 0))).toFixed(1);
-        precipP75Mm = +(Math.max(precipMm, toNum(ensQ?.precipP75Mm) ?? precipMm * 1.5)).toFixed(1);
-        windObj = windDaySamples.length ? blendWindVectors(windDaySamples) : (() => {
-            const ws = +(toNum(ensQ?.windP50Ms) ?? 4.0).toFixed(1);
-            const wg = +(Math.max(ws * 1.6, toNum(ensQ?.windP90Ms) ?? ws * 1.9)).toFixed(1);
-            return windSpeedOnly(ws, wg);
-        })();
+        const blendedPrecip = detPrecip !== null && ensPrecip !== null ? wDet * detPrecip + (1 - wDet) * ensPrecip : detPrecip ?? ensPrecip;
+        precipMm = blendedPrecip === null ? null : +Math.max(0, blendedPrecip).toFixed(2);
+        precipP75Mm = precipMm === null ? toNum(ensQ?.precipP75Mm) : +(Math.max(precipMm, toNum(ensQ?.precipP75Mm) ?? precipMm * 1.5)).toFixed(1);
+        windObj = windDaySamples.length ? blendWindVectors(windDaySamples) : ensembleWind(ensQ);
     } else {
         // Archive or Deterministic (0..9)
-        maxC = +(detMaxC ?? clim.climMaxC).toFixed(1);
-        minC = +(detMinC ?? clim.climMinC).toFixed(1);
-        if (minC > maxC) {
+        maxC = roundOne(detMaxC ?? ensQ?.maxP50C);
+        minC = roundOne(detMinC ?? ensQ?.minP50C);
+        if (minC !== null && maxC !== null && minC > maxC) {
             const mid = +((maxC + minC) / 2).toFixed(1);
             maxC = +(mid + 0.5).toFixed(1);
             minC = +(mid - 0.5).toFixed(1);
@@ -1268,20 +1353,23 @@ function buildZoneDayRecord({
             fallbackSpread
         );
 
-        const hourSumPrecip = sortedRealHours.length ? sortedRealHours.reduce((s, h) => s + h.precipMm, 0) : null;
+        const hourSumPrecip = precipByHour.size === 24 ? completePrecipSum([...precipByHour.values()]) : null;
         const dailyPrecipMean = weightedMean(precipEntries);
-        precipMm = +(Math.max(0, dailyPrecipMean ?? hourSumPrecip ?? 0)).toFixed(1);
-        precipP75Mm = +(Math.max(precipMm, toNum(ensQ?.precipP75Mm) ?? (isArchive ? precipMm : precipMm * 1.3))).toFixed(1);
+        const dailyTotal = dailyPrecipMean ?? hourSumPrecip ?? toNum(ensQ?.precipP50Mm);
+        precipMm = dailyTotal === null ? null : +Math.max(0, dailyTotal).toFixed(2);
+        precipP75Mm = precipMm === null ? toNum(ensQ?.precipP75Mm) : +(Math.max(precipMm, toNum(ensQ?.precipP75Mm) ?? (isArchive ? precipMm : precipMm * 1.3))).toFixed(1);
 
         if (windDaySamples.length) {
             windObj = blendWindVectors(windDaySamples);
-        } else if (sortedRealHours.length) {
+        } else if (realHours.some(h => Number.isFinite(h.windMs))) {
             // Hour slots keep a compass label, not degrees: speed blends, bearing stays unknown
-            windObj = blendWindVectors(sortedRealHours.map((h) => ({ speedMs: h.windMs, gustMs: h.gustMs, dirDeg: null, weight: 1 })));
+            windObj = blendWindVectors(realHours.map((h) => ({ speedMs: h.windMs, gustMs: h.gustMs, dirDeg: null, weight: 1 })));
         } else {
-            windObj = windSpeedOnly(3.5, 6.0);
+            windObj = ensembleWind(ensQ);
         }
     }
+
+    const dayMeanC = maxC === null || minC === null ? null : roundOne((maxC + minC) / 2);
 
     // Extract companion soil, snow depth, humidity, pressure, cloud cover
     const avgArr = (arr) => {
@@ -1302,23 +1390,23 @@ function buildZoneDayRecord({
     // Soil profile: same honesty rule — without archive / companion data the values below are an
     // air-temperature heuristic and every consumer (UI, field-ops cards) must be able to tell.
     const modelledSoil0C = toNum(rawArchiveDay?.soil0C) ?? avgArr(compHourVals.map((c) => c.soil0C));
-    const soilEstimated = modelledSoil0C === null;
+    const soilEstimated = modelledSoil0C === null && dayMeanC !== null;
 
     const soil0C =
         modelledSoil0C ??
-        +((maxC + minC) * 0.42).toFixed(1);
+        (dayMeanC === null ? null : roundOne(dayMeanC * 0.84));
     const soil6C =
         toNum(rawArchiveDay?.soil6C) ??
         avgArr(compHourVals.map((c) => c.soil6C)) ??
-        +(soil0C * 0.86 + 0.3).toFixed(1);
+        (soil0C === null ? null : +(soil0C * 0.86 + 0.3).toFixed(1));
     const soil18C =
         toNum(rawArchiveDay?.soil18C) ??
         avgArr(compHourVals.map((c) => c.soil18C)) ??
-        +(soil6C * 0.8 + 0.7).toFixed(1);
+        (soil6C === null ? null : +(soil6C * 0.8 + 0.7).toFixed(1));
     const soil54C =
         toNum(rawArchiveDay?.soil54C) ??
         avgArr(compHourVals.map((c) => c.soil54C)) ??
-        +(soil18C * 0.7 + 1.5).toFixed(1);
+        (soil18C === null ? null : +(soil18C * 0.7 + 1.5).toFixed(1));
 
     // Humidity / dew point: without archive, hourly or Google data the numbers come from a formula.
     // They still feed the precipitation-phase logic, but are flagged so charts do not plot them as data.
@@ -1337,7 +1425,7 @@ function buildZoneDayRecord({
     const dewPointC =
         toNum(rawArchiveDay?.dewPointC) ??
         (sortedRealHours.length ? avgArr(sortedRealHours.map((h) => h.dewPointC)) : null) ??
-        +(((maxC + minC) / 2) - (100 - humidity) / 5).toFixed(1);
+        (dayMeanC === null ? null : roundOne(dayMeanC - (100 - humidity) / 5));
 
     const cloudCoverPct = Math.round(
         clamp(
@@ -1372,7 +1460,6 @@ function buildZoneDayRecord({
         )
     );
 
-    const dayMeanC = +((maxC + minC) / 2).toFixed(1);
     const dayPhase = classifyPrecipPhase(maxC, humidity, precipMm > 0 ? precipMm : null, soil0C);
     const nightPhase = classifyPrecipPhase(minC, Math.min(98, humidity + 8), precipMm > 0 ? precipMm : null, soil0C);
     const meanPhase = classifyPrecipPhase(dayMeanC, humidity, precipMm, soil0C);
@@ -1411,54 +1498,48 @@ function buildZoneDayRecord({
         }
     }
 
-    const precipDay = Math.round(
-        clamp(
-            toNum(googleData?.dailyByDate?.get(isoDate)?.precipDay) ??
-                toNum(compDaily?.precipProbMax) ??
-                (sortedRealHours.length ? Math.max(...sortedRealHours.filter((h) => h.hour >= 8 && h.hour <= 20).map((h) => h.precipProb)) : null) ??
-                (ensQ?.probPrecipOver5 ? Math.min(95, Math.max(10, ensQ.probPrecipOver5 + precipMm * 10)) : null) ??
-                Math.min(95, precipMm > 0.1 ? 25 + precipMm * 14 : 8),
-            0,
-            100
-        )
-    );
-    const precipNight = Math.round(
-        clamp(
-            toNum(googleData?.dailyByDate?.get(isoDate)?.precipNight) ??
-                (sortedRealHours.length ? Math.max(...sortedRealHours.filter((h) => h.hour >= 20 || h.hour <= 7).map((h) => h.precipProb)) : null) ??
-                Math.round(precipDay * 0.8),
-            0,
-            100
-        )
-    );
+    const reportedProb = (night) => {
+        const probs = [...precipByHour].filter(([h, p]) => (h < 8 || h >= 20) === night && p.precipProb !== null);
+        return probs.length ? Math.max(...probs.map(([, p]) => p.precipProb)) : null;
+    };
+    // A provider's following night can extend past midnight. Only a calendar-day maximum covers this date.
+    const dailyPrecipProbability = toNum(compDaily?.precipProbMax);
+    const precipDay = toNum(googleData?.dailyByDate?.get(isoDate)?.precipDay) ?? toNum(compDaily?.precipProbMax) ?? reportedProb(false);
+    const precipNight = toNum(googleData?.dailyByDate?.get(isoDate)?.precipNight) ?? reportedProb(true);
 
     const gDaily = googleData?.dailyByDate?.get(isoDate);
-    const repOmCode =
-        toNum(rawArchiveDay?.weatherCode) ??
-        toNum(omModelsData.ecmwf_ifs025?.dailyByDate?.get(isoDate)?.weatherCode) ??
-        toNum(omModelsData.ecmwf_aifs025?.dailyByDate?.get(isoDate)?.weatherCode) ??
-        toNum(omModelsData.gfs_seamless?.dailyByDate?.get(isoDate)?.weatherCode);
-    const wDay = gDaily
-        ? { ru: gDaily.dayCond, en: gDaily.dayCondEn, icon: gDaily.iconType }
-        : repOmCode !== null
-        ? wmoCodeToWeather(repOmCode, maxC, false)
-        : wmoCodeToWeather(precipMm >= 1.5 ? (dayPhase.potentialPhase === 'snow' ? 73 : 61) : cloudCoverPct > 75 ? 3 : cloudCoverPct > 35 ? 2 : 0, maxC, false);
-
-    const wNight = gDaily
-        ? { ru: gDaily.nightCond, en: gDaily.nightCondEn, icon: gDaily.nightIconType }
-        : repOmCode !== null
-        ? wmoCodeToWeather(repOmCode, minC, true)
-        : wmoCodeToWeather(precipMm >= 1.5 ? (nightPhase.potentialPhase === 'snow' ? 71 : 61) : cloudCoverPct > 70 ? 3 : cloudCoverPct > 35 ? 2 : 0, minC, true);
+    const weightedSources = [...modelSourcesForDay].sort((a, b) => b.weight - a.weight);
+    const dailyWeather = (night) => {
+        const t = night ? minC : maxC;
+        const google = night ? gDaily?.nightWeather : gDaily?.dayWeather;
+        const dailyReports = [
+            reportedWeather(rawArchiveDay?.weatherCode, 'Архив', t, night),
+            ...weightedSources.map(m => reportedWeather(m.dailyRec?.weatherCode, m.modelId, t, night))
+        ];
+        const hourlyStorms = [...reportsByHour].filter(([h, w]) => (h < 8 || h >= 20) === night && stormPriority(w)).map(([, w]) => w);
+        // Daily WMO is the worst condition in 24 hours. It has no night-time stamp.
+        const eligibleDaily = night ? dailyReports.filter(w => !stormPriority(w)) : dailyReports;
+        const reported = chooseWeather([google, ...hourlyStorms, ...eligibleDaily]);
+        if (reported && stormPriority(reported) && dailyReports.includes(reported)) {
+            return { ...reported, dailyOnly: true };
+        }
+        if (reported) return reported;
+        if (night && dailyReports.some(stormPriority)) return UNKNOWN_CONDITION;
+        // The appropriate shift may extend into tomorrow. Infer from its total after dates are joined.
+        return { ...UNKNOWN_CONDITION, estimateFromPeriod: true };
+    };
+    const wDay = dailyWeather(false);
+    const wNight = dailyWeather(true);
 
     const hours =
         sortedRealHours.length === 24
             ? sortedRealHours
+            : dayMeanC === null
+            ? Array.from({ length: 24 }, (_, hour) => ({ hour, hourStr: `${String(hour).padStart(2, '0')}:00`, tempC: null, isSynthetic: true }))
             : buildSyntheticHours({
                   maxC,
                   minC,
                   humidity,
-                  precipMm,
-                  precipProb: precipDay,
                   windMs: windObj.windMs,
                   gustMs: windObj.gustMs,
                   windDeg: windObj.windDeg,
@@ -1467,10 +1548,25 @@ function buildZoneDayRecord({
                   cloudCoverPct,
                   soil0C,
                   astronomy,
-                  dayIcon: wDay.icon,
-                  nightIcon: wNight.icon
+                  // A daily maximum code does not place a thunderstorm in a specific hour.
+                  dayIcon: UNKNOWN_CONDITION.icon,
+                  nightIcon: UNKNOWN_CONDITION.icon
               });
 
+    for (const slot of hours) {
+        if (slot.isSynthetic) {
+            const reading = precipByHour.get(slot.hour);
+            slot.precipMm = reading?.precipMm ?? null;
+            slot.precipProb = reading?.precipProb ?? null;
+            slot.precipPhase = slot.precipMm === null || slot.tempC == null ? null : classifyPrecipPhase(slot.tempC, slot.humidity, slot.precipMm, slot.soil0C).phase;
+        }
+        slot.precipInterval = precipInterval(localHourStart(isoDate, slot.hour), 1, slot.precipMm);
+        const reported = reportsByHour.get(slot.hour);
+        if (slot.isSynthetic && reported) {
+            slot.weather = reported;
+            slot.iconType = reported.icon;
+        }
+    }
     const nightHours = hours.filter((h) => h.hour >= 20 || h.hour <= 7);
     const nightCloud = nightHours.length ? avgArr(nightHours.map((h) => h.cloudCoverPct)) : cloudCoverPct;
     const nightWind = nightHours.length ? avgArr(nightHours.map((h) => h.windMs)) : windObj.windMs;
@@ -1482,35 +1578,33 @@ function buildZoneDayRecord({
     });
 
     const minSigma = Math.max(0.8, (minQ.p90 - minQ.p10) / 2.56);
-    const probFrostBelowMinus20 =
+    const probFrostBelowMinus20 = minC === null ? null :
         toNum(ensQ?.probBelowMinus20) ?? Math.round(clamp(normCdf((-20 - minC) / minSigma) * 100, 0, 100));
-    const probSnowOver5mm =
+    const probSnowOver5mm = precipMm === null || dayMeanC === null ? null :
         meanPhase.potentialPhase === 'rain' && maxC > 3
             ? 0
             : (toNum(ensQ?.probPrecipOver5) ?? Math.round(clamp(snowMm >= 5 ? 75 : snowMm * 12, 0, 100)));
 
-    let label;
-    if (offsetFromToday === -1) label = 'Вчера (Архив)';
-    else if (offsetFromToday < -1) label = 'Архив';
-    else if (offsetFromToday === 0) label = 'Сегодня';
-    else if (offsetFromToday === 1) label = 'Завтра';
-    else label = dateMeta.isWeekend ? `${dateMeta.dayShort} (Вых.)` : dateMeta.dayShort;
+    // The blended point forecast can fall outside the members' interval. Keep the
+    // reported percentiles intact; the calculated spread is a separate estimate.
+    const hasMembers = ensQ && (ensQ.temperatureMemberCount ?? ensQ.memberCount ?? Infinity) >= 2 &&
+        TEMP_QUANTILE_FIELDS.every(key => Number.isFinite(ensQ[key]));
+    const temperatureRange = hasMembers
+        ? { kind: 'ensemble', sources: Array.isArray(ensQ.sources) ? ensQ.sources : [] }
+        : { kind: 'estimate' };
 
     return {
-        id: `day_${isoDate}`,
-        idx: 0,
-        isoDate,
-        offsetFromToday,
-        dayShort: dateMeta.dayShort,
-        dateStr: dateMeta.dateStr,
-        fullDateLabel: `${dateMeta.dayShort}, ${dateMeta.dateStr} ${dateMeta.year}${isArchive ? ' (Архив)' : offsetFromToday === 0 ? ' (Сегодня)' : ''}`,
-        label,
-        zone,
-        confidencePct,
-        isArchive,
-        dayCond: wDay.ru,
+        ...identity,
+        hasForecast: true,
+        precipTimeBasis: 'interval-start',
+        precipBlocks: [...(metNoData?.precipBlocks || []), ...(googleData?.precipBlocks || [])]
+            .filter(b => localParts(b.startMs).isoDate === isoDate),
+        confidencePct: null,
+        temperatureRange,
+        dayCond: weatherLabel(wDay),
+        dayConditionIsDaily: Boolean(wDay.dailyOnly),
         dayCondEn: wDay.en,
-        nightCond: inversion.active && minC < 0 ? `${wNight.ru} (выхолаживание)` : wNight.ru,
+        nightCond: inversion.active && minC < 0 ? `${weatherLabel(wNight)} (выхолаживание)` : weatherLabel(wNight),
         nightCondEn: wNight.en,
         iconType: wDay.icon,
         nightIconType: wNight.icon,
@@ -1518,29 +1612,30 @@ function buildZoneDayRecord({
         maxF: cToF(maxC),
         minC,
         minF: cToF(minC),
-        maxP10C: maxQ.p10,
-        maxP25C: maxQ.p25,
-        maxP75C: maxQ.p75,
-        maxP90C: maxQ.p90,
-        minP10C: minQ.p10,
-        minP25C: minQ.p25,
-        minP75C: minQ.p75,
-        minP90C: minQ.p90,
+        maxP10C: hasMembers ? ensQ.maxP10C : maxQ.p10,
+        maxP25C: hasMembers ? ensQ.maxP25C : maxQ.p25,
+        maxP75C: hasMembers ? ensQ.maxP75C : maxQ.p75,
+        maxP90C: hasMembers ? ensQ.maxP90C : maxQ.p90,
+        minP10C: hasMembers ? ensQ.minP10C : minQ.p10,
+        minP25C: hasMembers ? ensQ.minP25C : minQ.p25,
+        minP75C: hasMembers ? ensQ.minP75C : minQ.p75,
+        minP90C: hasMembers ? ensQ.minP90C : minQ.p90,
         climMaxC: clim.climMaxC,
         climMinC: clim.climMinC,
-        climAnomalyC: +(dayMeanC - clim.climMeanC).toFixed(1),
+        climAnomalyC: dayMeanC === null ? null : roundOne(dayMeanC - clim.climMeanC),
         humidity,
         uv,
+        dailyPrecipProbability,
         precipDay,
         precipNight,
         precipDayType: dayPhase.potentialShortRu,
         precipNightType: nightPhase.potentialShortRu,
         precipMm,
         precipP75Mm,
-        rainMm,
-        snowMm,
+        rainMm: dayMeanC === null ? toNum(rawArchiveDay?.rainMm) : rainMm,
+        snowMm: dayMeanC === null ? null : snowMm,
         snowDepthCm: +Number(snowDepthCm).toFixed(1),
-        precipPhase: meanPhase.phase,
+        precipPhase: precipMm === null || dayMeanC === null ? null : meanPhase.phase,
         windMs: windObj.windMs,
         windMph: windObj.windMph,
         gustMs: windObj.gustMs,
@@ -1548,12 +1643,12 @@ function buildZoneDayRecord({
         windDirShort: windObj.windDirShort,
         windDirFull: windObj.windDirFull,
         windDeg: windObj.windDeg,
-        soil0C: +Number(soil0C).toFixed(1),
-        soil6C: +Number(soil6C).toFixed(1),
-        soil18C: +Number(soil18C).toFixed(1),
-        soil54C: +Number(soil54C).toFixed(1),
-        soilTempC: +Number(soil0C).toFixed(1),
-        dewPointC: +Number(dewPointC).toFixed(1),
+        soil0C: roundOne(soil0C),
+        soil6C: roundOne(soil6C),
+        soil18C: roundOne(soil18C),
+        soil54C: roundOne(soil54C),
+        soilTempC: roundOne(soil0C),
+        dewPointC: roundOne(dewPointC),
         cloudCoverPct,
         pressureStationHpa: pObj.stationHpa,
         pressureStationMm: pObj.stationMm,
@@ -1564,19 +1659,23 @@ function buildZoneDayRecord({
         inversion,
         nextNightMinC: minC,
         nextNightMinF: cToF(minC),
-        nextNightMaxC: +((maxC + minC) / 2).toFixed(1),
-        nextNightMaxF: cToF((maxC + minC) / 2),
+        nextNightMaxC: dayMeanC,
+        nextNightMaxF: cToF(dayMeanC),
         nextNightPrecipProb: precipNight,
-        nextNightPrecipMm: +(precipMm * 0.4).toFixed(1),
+        nextNightPrecipMm: null,
         nextNightPrecipType: nightPhase.potentialShortRu,
         nextNightWindMs: windObj.windMs,
         nextNightGustMs: windObj.gustMs,
         nextNightWindDirShort: windObj.windDirShort,
-        nextNightCond: wNight.ru,
+        nextNightCond: weatherLabel(wNight),
+        nightPeriodWeather: gDaily?.nightWeather || null,
         nextNightIconType: wNight.icon,
         probFrostBelowMinus20,
         probSnowOver5mm,
         dataQuality: {
+            estimateDayCondition: Boolean(wDay.estimateFromPeriod),
+            estimateNightCondition: Boolean(wNight.estimateFromPeriod),
+            roadRiskInputsAvailable: zone !== 'subseasonal' && (modelSourcesForDay.some(coversRoadRisk) || rawArchiveDay?.roadRiskInputsAvailable === true),
             soilEstimated,
             snowEstimated,
             humidityEstimated,
@@ -1589,44 +1688,87 @@ function buildZoneDayRecord({
     };
 }
 
+function conditionFromPeriod(mm, temp, humidity, cloud, soil, night) {
+    if (mm === null || temp == null) return UNKNOWN_CONDITION;
+    const phase = classifyPrecipPhase(temp, humidity, mm, soil);
+    const code = mm >= 1.5 ? (phase.potentialPhase === 'snow' ? 71 : 61) : cloud > 75 ? 3 : cloud > 35 ? 2 : 0;
+    return wmoCodeToWeather(code, temp, night);
+}
+
 function finalizeDaysSequence(days, todayIso) {
     const sorted = [...days].sort((a, b) => a.isoDate.localeCompare(b.isoDate));
     for (let i = 0; i < sorted.length; i++) {
         const d = sorted[i];
         d.idx = i;
         d.offsetFromToday = diffDaysIso(d.isoDate, todayIso);
+        if (d.hasForecast === false) continue;
         const isConsecutivePrev = i > 0 && diffDaysIso(d.isoDate, sorted[i - 1].isoDate) === 1;
         // null (not 0, and never a jump against a default value) when either day lacks pressure
         d.deltaP24hMm = isConsecutivePrev ? diffOrNull(d.pressureStationMm, sorted[i - 1].pressureStationMm) : null;
 
         // True overnight: 20:00 of day d .. 08:00 of day d+1
         const nextDay = sorted[i + 1] && diffDaysIso(sorted[i + 1].isoDate, d.isoDate) === 1 ? sorted[i + 1] : null;
-        const evening = (d.hours || []).filter((h) => h.hour >= 20);
-        const morning = nextDay ? (nextDay.hours || []).filter((h) => h.hour <= 8) : (d.hours || []).filter((h) => h.hour <= 7);
+        const evening = (d.hours || []).filter((h) => h.hour >= SHIFT_END);
+        const morning = (nextDay?.hours || []).filter((h) => h.hour < SHIFT_START);
+        const shiftHours = SHIFT_END - SHIFT_START;
+        const nightHours = 24 - shiftHours;
+        const intervals = [d, nextDay].flatMap(day => [
+            ...(Array.isArray(day?.precipBlocks) ? day.precipBlocks : []), ...(day?.hours || []).map(h => h.precipInterval)
+        ]);
+        d.dayShiftPrecip = sumPrecipIntervals(intervals, localHourStart(d.isoDate, SHIFT_START), shiftHours);
+        d.nextNightPrecip = sumPrecipIntervals(intervals, localHourStart(d.isoDate, SHIFT_END), nightHours);
+        d.nextNightPrecipMm = d.nextNightPrecip.mm;
+        if (d.precipMm == null && d.precipTimeBasis === 'interval-start') {
+            d.precipMm = sumPrecipIntervals(intervals, localHourStart(d.isoDate, 0), 24).mm;
+        }
+        if (d.dataQuality?.estimateDayCondition) {
+            const condition = conditionFromPeriod(d.dayShiftPrecip.mm, d.maxC, d.humidity, d.cloudCoverPct, d.soil0C, false);
+            d.dayCond = condition.ru;
+            d.dayCondEn = condition.en;
+            d.iconType = condition.icon;
+        }
+        if (d.dataQuality?.estimateNightCondition) {
+            const condition = conditionFromPeriod(d.nextNightPrecip.mm, d.minC, d.humidity, d.cloudCoverPct, d.soil0C, true);
+            d.nightCond = condition.ru;
+            d.nightCondEn = condition.en;
+            d.nightIconType = condition.icon;
+        }
         const overnight = [...evening, ...morning];
+        d.nextNightComplete = overnight.length === nightHours && overnight.every(h => Number.isFinite(h.tempC));
         if (overnight.length) {
             const temps = overnight.map((h) => h.tempC);
             const nMin = +Math.min(...temps).toFixed(1);
             const nMax = +Math.max(...temps).toFixed(1);
-            const nPrecipSum = +overnight.reduce((s, h) => s + (h.precipMm || 0), 0).toFixed(1);
-            const nProb = Math.max(...overnight.map((h) => h.precipProb || 0));
+            const nPrecipSum = d.nextNightPrecip.mm;
+            const nProb = overnight.length === nightHours && overnight.every(h => Number.isFinite(h.precipProb)) ? Math.max(...overnight.map(h => h.precipProb)) : null;
             const nHum = Math.round(overnight.reduce((s, h) => s + (h.humidity || 75), 0) / overnight.length);
             const nSoil = +(overnight.reduce((s, h) => s + (h.soil0C ?? d.soil0C), 0) / overnight.length).toFixed(1);
             const nWind = blendWindVectors(overnight.map((h) => ({ speedMs: h.windMs, gustMs: h.gustMs, dirDeg: d.windDeg, weight: 1 })));
             const nPhase = classifyPrecipPhase(nMin, nHum, nPrecipSum > 0 ? nPrecipSum : null, nSoil);
 
-            d.nextNightMinC = nMin;
-            d.nextNightMinF = cToF(nMin);
-            d.nextNightMaxC = nMax;
-            d.nextNightMaxF = cToF(nMax);
+            d.nextNightMinC = d.nextNightComplete ? nMin : null;
+            d.nextNightMinF = d.nextNightComplete ? cToF(nMin) : null;
+            d.nextNightMaxC = d.nextNightComplete ? nMax : null;
+            d.nextNightMaxF = d.nextNightComplete ? cToF(nMax) : null;
             d.nextNightPrecipProb = nProb;
-            d.nextNightPrecipMm = nPrecipSum;
             d.nextNightPrecipType = nPhase.potentialShortRu;
             d.nextNightWindMs = nWind.windMs;
             d.nextNightGustMs = nWind.gustMs;
             d.nextNightWindDirShort = nWind.windDirShort;
-            d.nextNightCond = d.nightCond;
-            d.nextNightIconType = d.nightIconType;
+            // The upcoming night uses this evening and tomorrow morning, never
+            // a thunderstorm that already passed at 03:00 on the selected date.
+            const nightReport = chooseWeather([
+                d.nightPeriodWeather,
+                ...evening.map(h => h.weather),
+                ...(nextDay?.hours || []).filter(h => h.hour < 8).map(h => h.weather)
+            ]);
+            if (stormPriority(nightReport) || stormPriority({ icon: d.nightIconType })) {
+                d.nextNightCond = weatherLabel(nightReport || UNKNOWN_CONDITION);
+                d.nextNightIconType = nightReport?.icon || UNKNOWN_CONDITION.icon;
+            } else {
+                d.nextNightCond = d.nightCond;
+                d.nextNightIconType = d.nightIconType;
+            }
         }
     }
     return sorted;
@@ -1662,28 +1804,24 @@ export function buildUnifiedDataset(rawBundle = {}, options = {}) {
     }
 
     // Resolve "today" in Asia/Krasnoyarsk (UTC+7)
-    const abanNow = formatAbanTimestamp(rawBundle.fetchedAtIso);
-    const googleFirstDate = googleData.dailyByDate.size ? [...googleData.dailyByDate.keys()].sort()[0] : null;
-    const todayIso =
-        options.todayIso ||
-        rawBundle.openMeteoMulti?.current?.time?.slice(0, 10) ||
-        rawBundle.openMeteoCompanion?.current?.time?.slice(0, 10) ||
-        googleFirstDate ||
-        abanNow.isoDate;
-
-    const currentHour =
-        utcIsoToAbanParts(rawBundle.openMeteoMulti?.current?.time)?.hour ??
-        utcIsoToAbanParts(rawBundle.openMeteoCompanion?.current?.time)?.hour ??
-        abanNow.hour;
+    const receivedMs = Date.parse(rawBundle.fetchedAtIso);
+    const receivedAtIso = new Date(Number.isFinite(receivedMs) ? receivedMs : Date.now()).toISOString();
+    const abanNow = formatAbanTimestamp(receivedAtIso);
+    const todayIso = options.todayIso || abanNow.isoDate;
+    const currentHour = abanNow.hour;
 
     // Collect all dates across active sources
     const dateSet = new Set();
     for (const m of Object.values(omModelsData)) {
         for (const d of m.dailyByDate.keys()) dateSet.add(d);
-        for (const d of m.hourlyByDate.keys()) dateSet.add(d);
+        for (const [date, hours] of m.hourlyByDate) {
+            // The first midnight accumulation may precede the requested forecast range.
+            if ([...hours.values()].some(h => h.tempC !== null || h.weatherCode !== null)) dateSet.add(date);
+        }
     }
     for (const d of googleData.dailyByDate.keys()) dateSet.add(d);
     for (const d of googleData.hourlyByDate.keys()) dateSet.add(d);
+    for (const d of metNoData.hourlyByDate.keys()) dateSet.add(d);
     for (const d of metNoData.dailyByDate.keys()) dateSet.add(d);
     for (const d of ensMap.keys()) dateSet.add(d);
 
@@ -1700,16 +1838,10 @@ export function buildUnifiedDataset(rawBundle = {}, options = {}) {
         dateSet.add(iso);
     }
 
-    // Ensure continuous 0..34 forecast range whenever ensemble35 is supplied (or 0..15 for multi-model)
-    if (ensMap.size) {
-        for (let off = 0; off <= 34; off++) {
-            dateSet.add(addDaysIso(todayIso, off));
-        }
-    } else if (Object.keys(omModelsData).length) {
-        for (let off = 0; off <= 15; off++) {
-            dateSet.add(addDaysIso(todayIso, off));
-        }
-    }
+    // Keep forecast dates selectable even when a provider returns only part of its horizon.
+    const horizon = ensMap.size ? 35 : Object.keys(omModelsData).length ? 16 :
+        googleData.dailyByDate.size || googleData.hourlyByDate.size || metNoData.hourlyByDate.size ? 10 : 0;
+    for (let off = 0; off < horizon; off++) dateSet.add(addDaysIso(todayIso, off));
 
     const sortedDates = [...dateSet].sort();
     const rawDays = sortedDates.map((isoDate) =>
@@ -1731,8 +1863,8 @@ export function buildUnifiedDataset(rawBundle = {}, options = {}) {
 
     const days = finalizeDaysSequence(rawDays, todayIso);
     const todayIdx = days.findIndex((d) => d.isoDate === todayIso);
-    const todayDay = days[todayIdx >= 0 ? todayIdx : Math.min(0, days.length - 1)] || null;
-    const tomorrowDay = todayIdx >= 0 && days[todayIdx + 1] ? days[todayIdx + 1] : todayDay;
+    const todayDay = days[todayIdx] || null;
+    const tomorrowDay = days.find(d => d.isoDate === addDaysIso(todayIso, 1));
     const yesterdayDay = todayIdx > 0 ? days[todayIdx - 1] : null;
     const todaySlot = todayDay?.hours?.[currentHour] || todayDay?.hours?.[12] || null;
 
@@ -1742,12 +1874,12 @@ export function buildUnifiedDataset(rawBundle = {}, options = {}) {
     const aqCur = rawBundle.airQuality?.current;
     let airQuality;
     if (aqCur && (toNum(aqCur.pm2_5) !== null || toNum(aqCur.european_aqi) !== null)) {
-        const pm25 = +(toNum(aqCur.pm2_5) ?? 0).toFixed(1);
-        const pm10 = +(toNum(aqCur.pm10) ?? 0).toFixed(1);
-        const co = Math.round(toNum(aqCur.carbon_monoxide) ?? 0);
-        const aqi = Math.round(toNum(aqCur.european_aqi) ?? 0);
-        let statusRu = 'Отличный';
-        let smogRisk = 'low';
+        const pm25 = roundOne(aqCur.pm2_5);
+        const pm10 = roundOne(aqCur.pm10);
+        const co = roundOne(aqCur.carbon_monoxide);
+        const aqi = toNum(aqCur.european_aqi) === null ? null : Math.round(aqCur.european_aqi);
+        let statusRu = aqi === null ? 'Индекс не указан' : 'Отличный';
+        let smogRisk = aqi === null ? 'unknown' : 'low';
         if (aqi > 80 || pm25 >= 50) {
             statusRu = 'Плохой (смог)';
             smogRisk = 'high';
@@ -1756,10 +1888,8 @@ export function buildUnifiedDataset(rawBundle = {}, options = {}) {
             smogRisk = 'moderate';
         } else if (aqi > 40) {
             statusRu = 'Умеренный';
-            smogRisk = 'low';
         } else if (aqi > 20) {
             statusRu = 'Хороший';
-            smogRisk = 'low';
         }
         airQuality = { pm25, pm10, co, aqi, statusRu, smogRisk };
     } else {
@@ -1777,14 +1907,12 @@ export function buildUnifiedDataset(rawBundle = {}, options = {}) {
     const curHumEntries = [];
     const curMslEntries = [];
     const curSurfEntries = [];
-    const curPrecipEntries = [];
 
     if (gCur && toNum(gCur.temperature?.degrees) !== null) {
         const gw = MODEL_META.google_wn3.weights.short48h * (mos?.models?.google_wn3?.weightMultiplier ?? 1);
         curTempEntries.push({ value: toNum(gCur.temperature.degrees), weight: gw });
         if (toNum(gCur.relativeHumidity) !== null) curHumEntries.push({ value: toNum(gCur.relativeHumidity), weight: gw });
         if (toNum(gCur.airPressure?.meanSeaLevelMillibars) !== null) curMslEntries.push({ value: toNum(gCur.airPressure.meanSeaLevelMillibars), weight: gw });
-        if (toNum(gCur.precipitation?.qpf?.quantity) !== null) curPrecipEntries.push({ value: toNum(gCur.precipitation.qpf.quantity), weight: gw });
         const gWs = parseGoogleSpeedMs(gCur.wind?.speed);
         if (gWs !== null) {
             curWindSamples.push({
@@ -1800,7 +1928,6 @@ export function buildUnifiedDataset(rawBundle = {}, options = {}) {
         if (toNum(omCur.relative_humidity_2m) !== null) curHumEntries.push({ value: toNum(omCur.relative_humidity_2m), weight: 0.45 });
         if (toNum(omCur.pressure_msl) !== null) curMslEntries.push({ value: toNum(omCur.pressure_msl), weight: 0.45 });
         if (toNum(omCur.surface_pressure) !== null) curSurfEntries.push({ value: toNum(omCur.surface_pressure), weight: 0.45 });
-        if (toNum(omCur.precipitation) !== null) curPrecipEntries.push({ value: toNum(omCur.precipitation), weight: 0.45 });
         if (toNum(omCur.wind_speed_10m) !== null) {
             curWindSamples.push({
                 speedMs: toNum(omCur.wind_speed_10m),
@@ -1813,28 +1940,36 @@ export function buildUnifiedDataset(rawBundle = {}, options = {}) {
     if (compCur && toNum(compCur.surface_pressure) !== null && !curSurfEntries.length) {
         curSurfEntries.push({ value: toNum(compCur.surface_pressure), weight: 0.4 });
     }
-    if (!curTempEntries.length && todaySlot) {
+    if (!curTempEntries.length && Number.isFinite(todaySlot?.tempC)) {
         curTempEntries.push({ value: todaySlot.tempC, weight: 1 });
         curHumEntries.push({ value: todaySlot.humidity, weight: 1 });
-        curPrecipEntries.push({ value: todaySlot.precipMm, weight: 1 });
         curWindSamples.push({ speedMs: todaySlot.windMs, gustMs: todaySlot.gustMs, dirDeg: todayDay?.windDeg ?? null, weight: 1 });
     }
 
-    const curTempC = +(weightedMean(curTempEntries) ?? todaySlot?.tempC ?? 0).toFixed(1);
+    const curTempC = roundOne(weightedMean(curTempEntries) ?? todaySlot?.tempC);
     const curWind = curWindSamples.length ? blendWindVectors(curWindSamples) : {
-        windMs: todaySlot?.windMs ?? 0, windMph: todaySlot?.windMph ?? 0,
-        gustMs: todaySlot?.gustMs ?? 0, gustMph: msToMph(todaySlot?.gustMs ?? 0),
+        windMs: todaySlot?.windMs ?? null, windMph: todaySlot?.windMph ?? null,
+        gustMs: todaySlot?.gustMs ?? null, gustMph: msToMph(todaySlot?.gustMs ?? null),
         windDeg: todayDay?.windDeg ?? null, windDirShort: todayDay?.windDirShort ?? NO_DIRECTION.s
     };
     const curHumidity = Math.round(clamp(weightedMean(curHumEntries) ?? todaySlot?.humidity ?? 70, 10, 100));
     const curWetBulbC = computeWetBulbC(curTempC, curHumidity);
     const curFeelsC = computeApparentTempC(curTempC, curWind.windMs, curHumidity);
-    const curDewPointC = +(todaySlot?.dewPointC ?? (curTempC - (100 - curHumidity) / 5)).toFixed(1);
-    const curSoil0C = +(todaySlot?.soil0C ?? todayDay?.soil0C ?? 0).toFixed(1);
-    const curPrecipMm = +(Math.max(0, weightedMean(curPrecipEntries) ?? todaySlot?.precipMm ?? 0)).toFixed(1);
-    const curPrecipProb = Math.round(
-        clamp(toNum(gCur?.precipitation?.probability?.percent) ?? todaySlot?.precipProb ?? todayDay?.precipDay ?? 0, 0, 100)
-    );
+    const curDewPointC = roundOne(todaySlot?.dewPointC ?? (curTempC === null ? null : curTempC - (100 - curHumidity) / 5));
+    const curSoil0C = roundOne(todaySlot?.soil0C ?? todayDay?.soil0C);
+    // Current observations can cover different intervals. Keep one source and its label together.
+    let curPrecipMm = todaySlot?.precipMm ?? null;
+    let curPrecipProb = todaySlot?.precipProb ?? null;
+    let precipPeriodLabel = `Осадки ${hourRangeLabel(currentHour)}`;
+    if (toNum(gCur?.precipitation?.qpf?.quantity) !== null) {
+        curPrecipMm = toNum(gCur.precipitation.qpf.quantity);
+        curPrecipProb = toNum(gCur.precipitation.probability?.percent);
+        precipPeriodLabel = 'Осадки за последний час';
+    } else if (toNum(omCur?.precipitation) !== null && toNum(omCur.interval) > 0) {
+        curPrecipMm = toNum(omCur.precipitation);
+        curPrecipProb = null;
+        precipPeriodLabel = `Осадки за последние ${omCur.interval / 60} мин`;
+    }
     const curPhaseObj = classifyPrecipPhase(curTempC, curHumidity, curPrecipMm, curSoil0C);
     const curPress = resolvePressure(
         weightedMean(curSurfEntries) ?? todaySlot?.pressureStationHpa,
@@ -1853,18 +1988,29 @@ export function buildUnifiedDataset(rawBundle = {}, options = {}) {
     }
     const p24hAgoMm = yesterdayDay?.hours?.[currentHour]?.pressureStationMm ?? yesterdayDay?.pressureStationMm ?? null;
 
-    const isCurNight = todayDay ? (currentHour < todayDay.astronomy.sunriseHour || currentHour > todayDay.astronomy.sunsetHour) : false;
-    const curMeta = gCur?.weatherCondition
-        ? googleCondToMeta(gCur.weatherCondition, curTempC, isCurNight)
-        : wmoCodeToWeather(omCur?.weather_code ?? (curPrecipMm > 0 ? (curPhaseObj.phase === 'snow' ? 71 : 61) : 2), curTempC, isCurNight);
+    const isCurNight = todayDay?.astronomy ? (currentHour < todayDay.astronomy.sunriseHour || currentHour > todayDay.astronomy.sunsetHour) : false;
+    const curMeta = chooseWeather([
+        gCur?.weatherCondition ? { ...googleCondToMeta(gCur.weatherCondition, curTempC, isCurNight), source: 'google_wn3' } : null,
+        reportedWeather(omCur?.weather_code, 'Open-Meteo', curTempC, isCurNight),
+        todayDay?.isoDate === todayIso && todaySlot?.hour === currentHour ? todaySlot.weather : null
+    ]) || UNKNOWN_CONDITION;
 
+    // A provider may still return yesterday's observation after local midnight.
+    // Label the oldest contributing reading; keep the retrieval time on the dataset.
+    const readingTimes = [
+        toNum(omCur?.temperature_2m) !== null ? weatherTimeMs(omCur.time) : NaN,
+        toNum(gCur?.temperature?.degrees) !== null ? weatherTimeMs(gCur.currentTime) : NaN
+    ].filter(Number.isFinite);
+    const estimateAtIso = readingTimes.length ? new Date(Math.min(...readingTimes)).toISOString() : receivedAtIso;
     const current = {
+        estimateAtIso,
+        hasMeasurements: curTempEntries.length > 0,
         tempC: curTempC,
         tempF: cToF(curTempC),
         feelsC: curFeelsC,
         feelsF: cToF(curFeelsC),
         wetBulbC: curWetBulbC,
-        condRu: curMeta.ru,
+        condRu: weatherLabel(curMeta),
         iconType: curMeta.icon,
         windMs: curWind.windMs,
         windMph: curWind.windMph,
@@ -1872,9 +2018,10 @@ export function buildUnifiedDataset(rawBundle = {}, options = {}) {
         gustMph: curWind.gustMph,
         windDeg: curWind.windDeg,
         windDirShort: curWind.windDirShort,
+        precipPeriodLabel,
         precipProb: curPrecipProb,
         precipMm: curPrecipMm,
-        precipPhase: curPhaseObj.phase,
+        precipPhase: curPrecipMm === null ? null : curPhaseObj.phase,
         snowDepthCm: todayDay?.snowDepthCm ?? 0,
         snowEstimated: Boolean(todayDay?.dataQuality?.snowEstimated),
         soilEstimated: Boolean(todayDay?.dataQuality?.soilEstimated),
@@ -1892,7 +2039,7 @@ export function buildUnifiedDataset(rawBundle = {}, options = {}) {
         deltaP3hMm: diffOrNull(curPress.stationMm, p3hAgoMm),
         deltaP24hMm: diffOrNull(curPress.stationMm, p24hAgoMm),
         uv: Math.round(toNum(gCur?.uvIndex) ?? todayDay?.uv ?? 0),
-        obsTimeLabel: `п. Абан • ${abanNow.label}`
+        obsTimeLabel: `п. Абан • ${formatAbanTimestamp(estimateAtIso).label}`
     };
 
     // ------------------------------------------------------------------------
@@ -1910,29 +2057,30 @@ export function buildUnifiedDataset(rawBundle = {}, options = {}) {
         targetDay = tomorrowDay;
         targetSuffix = ' (завтра)';
     }
-    const shiftSlot = targetDay?.hours?.[targetHour] || todaySlot;
+    const shiftSlot = targetDay?.hours?.[targetHour];
     const h3Raw = currentHour + 3;
     const h3Hour = h3Raw % 24;
     const h3Day = h3Raw >= 24 ? tomorrowDay : todayDay;
-    const h3Slot = h3Day?.hours?.[h3Hour] || shiftSlot;
+    const h3Slot = h3Day?.hours?.[h3Hour];
 
-    const shiftMeta = wmoCodeToWeather(shiftSlot?.precipMm > 0.2 ? (shiftSlot.precipPhase === 'snow' ? 71 : 61) : (shiftSlot?.cloudCoverPct > 70 ? 3 : 1), shiftSlot?.tempC ?? curTempC, targetHour >= 20 || targetHour < 7);
+    const shiftDate = currentHour >= 20 ? addDaysIso(todayIso, 1) : todayIso;
+    const shiftMeta = (targetDay?.isoDate === shiftDate && targetDay.hours?.[targetHour]?.weather) || UNKNOWN_CONDITION;
 
     const controlPoint = {
         targetLabel: `Смена ${String(targetHour).padStart(2, '0')}:00${targetSuffix}`,
-        tempC: shiftSlot?.tempC ?? curTempC,
-        tempF: cToF(shiftSlot?.tempC ?? curTempC),
-        feelsC: shiftSlot?.feelsC ?? curFeelsC,
-        condRu: shiftMeta.ru,
-        badgeRu: shiftMeta.ru.split(' ')[0],
-        iconType: shiftSlot?.iconType || shiftMeta.icon,
-        precipProb: shiftSlot?.precipProb ?? curPrecipProb,
-        windMs: shiftSlot?.windMs ?? curWind.windMs,
-        windMph: shiftSlot?.windMph ?? curWind.windMph,
-        windDirShort: shiftSlot?.windDirShort ?? curWind.windDirShort,
-        soil0C: shiftSlot?.soil0C ?? curSoil0C,
+        tempC: shiftSlot?.tempC ?? null,
+        tempF: shiftSlot ? cToF(shiftSlot.tempC) : null,
+        feelsC: shiftSlot?.feelsC ?? null,
+        condRu: shiftSlot ? weatherLabel(shiftMeta) : 'Нет прогноза',
+        badgeRu: shiftMeta === UNKNOWN_CONDITION ? 'Нет данных' : shiftMeta.ru.split(' ')[0],
+        iconType: shiftMeta.icon,
+        precipProb: shiftSlot?.precipProb ?? null,
+        windMs: shiftSlot?.windMs ?? null,
+        windMph: shiftSlot?.windMph ?? null,
+        windDirShort: shiftSlot?.windDirShort ?? null,
+        soil0C: shiftSlot?.soil0C ?? null,
         next3hLabel: `Через 3 ч (${String(h3Hour).padStart(2, '0')}:00)`,
-        next3hTempC: h3Slot?.tempC ?? curTempC
+        next3hTempC: h3Slot?.tempC ?? null
     };
 
     const sourceType =
@@ -1944,18 +2092,22 @@ export function buildUnifiedDataset(rawBundle = {}, options = {}) {
             ? 'live_super_ensemble'
             : 'live_multi_ensemble';
 
+    const forecastDayCount = days.filter(d => !d.isArchive && d.hasForecast).length;
     const sourceLabel =
         mode === 'google_wn3'
             ? 'WeatherNext 3 Live (Абан)'
+            : !activeModels.length && ensMap.size
+            ? `Ансамбль Open-Meteo · дней с прогнозом: ${forecastDayCount}`
             : mode === 'open_meteo'
-            ? `Open-Meteo ${days.filter((d) => !d.isArchive).length}д (${preferredOmModel})`
-            : `Супер-Ансамбль (${activeModels.length} мод. • ${days.filter((d) => !d.isArchive).length}д)`;
+            ? `Open-Meteo ${forecastDayCount}д (${preferredOmModel})`
+            : `Супер-Ансамбль (${activeModels.length} мод. • ${forecastDayCount}д)`;
 
     return {
         version: 4,
         sourceType,
         sourceLabel,
         syncedAt: abanNow.label,
+        receivedAtIso,
         latencyMs,
         isPartial: Boolean(rawBundle.isPartial),
         activeModels,
@@ -1988,7 +2140,7 @@ export function mergeArchiveDaysIntoDataset(dataset, archiveInput) {
     const byIso = new Map(dataset.days.map((d) => [d.isoDate, d]));
 
     for (const raw of rawList) {
-        if (!raw?.isoDate) continue;
+        if (!raw?.isoDate || raw.hasForecast === false) continue;
         const isoDate = String(raw.isoDate).slice(0, 10);
         const existing = byIso.get(isoDate);
         // Never overwrite deterministic/ensemble forecast days with archive
@@ -1996,7 +2148,7 @@ export function mergeArchiveDaysIntoDataset(dataset, archiveInput) {
 
         // If already canonical archive DayRecord, preserve/update safely
         if (raw.version === 4 || (raw.zone === 'archive' && Array.isArray(raw.hours) && raw.hours.length === 24 && raw.astronomy)) {
-            byIso.set(isoDate, { ...raw, id: `day_${isoDate}`, zone: 'archive', isArchive: true, confidencePct: 99 });
+            byIso.set(isoDate, { ...raw, id: `day_${isoDate}`, zone: 'archive', isArchive: true, confidencePct: null });
             continue;
         }
 
@@ -2016,7 +2168,7 @@ export function mergeArchiveDaysIntoDataset(dataset, archiveInput) {
         });
         normalized.zone = 'archive';
         normalized.isArchive = true;
-        normalized.confidencePct = 99;
+        normalized.confidencePct = null;
         normalized.label = diffDaysIso(isoDate, todayIso) === -1 ? 'Вчера (Архив)' : 'Архив';
 
         byIso.set(isoDate, normalized);
@@ -2032,54 +2184,44 @@ export function mergeArchiveDaysIntoDataset(dataset, archiveInput) {
 // ============================================================================
 // 4. TIME-WINDOW STATS & 5-DAY PENTAD SUMMARIES
 // ============================================================================
+function completePrecipSum(hours) {
+    return hours.length && hours.every(h => Number.isFinite(h.precipMm))
+        ? +hours.reduce((sum, h) => sum + h.precipMm, 0).toFixed(2) : null;
+}
+
 export function computeDayWindowStats(day, timeWindowKey = 'full') {
     const winCfg = TIME_WINDOWS[timeWindowKey] || TIME_WINDOWS.full;
-    let hours = Array.isArray(day?.hours) && day.hours.length ? day.hours : [];
-    if (!hours.length && day) {
-        hours = buildSyntheticHours({
-            maxC: day.maxC ?? 0,
-            minC: day.minC ?? 0,
-            humidity: day.humidity ?? 70,
-            precipMm: day.precipMm ?? 0,
-            precipProb: day.precipDay ?? 10,
-            windMs: day.windMs ?? 3,
-            gustMs: day.gustMs ?? 5,
-            windDeg: day.windDeg ?? null,
-            pressureStationMm: day.pressureStationMm ?? null,
-            pressureMslMm: day.pressureMslMm ?? null,
-            cloudCoverPct: day.cloudCoverPct ?? 40,
-            soil0C: day.soil0C ?? 0,
-            astronomy: day.astronomy,
-            dayIcon: day.iconType || 'partly-sunny',
-            nightIcon: day.nightIconType || 'partly-cloudy-night'
-        });
-    }
-
-    const activeRaw = hours.filter((h) => winCfg.isHourActive(h.hour, day));
-    const activeHours = activeRaw.length ? activeRaw : hours;
+    const hours = Array.isArray(day?.hours) ? day.hours : [];
+    const activeHours = hours.filter(h => winCfg.isHourActive(h.hour, day));
     if (!activeHours.length) {
         return {
-            hours: [],
-            activeHours: [],
-            avgC: 0,
-            avgF: 32,
-            minC: 0,
-            maxC: 0,
-            avgWindMs: 0,
-            maxGustMs: 0,
-            maxPrecipProb: 0,
-            sumPrecipMm: 0
+            hours,
+            activeHours,
+            avgC: null,
+            avgF: null,
+            minC: null,
+            maxC: null,
+            avgWindMs: null,
+            maxGustMs: null,
+            maxPrecipProb: null,
+            sumPrecipMm: null
         };
     }
 
-    const temps = activeHours.map((h) => Number(h.tempC) || 0);
-    const avgC = +(temps.reduce((a, b) => a + b, 0) / activeHours.length).toFixed(1);
-    const minC = +Math.min(...temps).toFixed(1);
-    const maxC = +Math.max(...temps).toFixed(1);
-    const avgWindMs = +(activeHours.reduce((a, h) => a + (Number(h.windMs) || 0), 0) / activeHours.length).toFixed(1);
-    const maxGustMs = +Math.max(...activeHours.map((h) => Number(h.gustMs) || Number(h.windMs) || 0)).toFixed(1);
-    const maxPrecipProb = Math.round(Math.max(...activeHours.map((h) => Number(h.precipProb) || 0)));
-    const sumPrecipMm = +activeHours.reduce((a, h) => a + (Number(h.precipMm) || 0), 0).toFixed(1);
+    const available = key => activeHours.map(h => toNum(h[key])).filter(Number.isFinite);
+    const average = values => values.length ? +(values.reduce((sum, v) => sum + v, 0) / values.length).toFixed(1) : null;
+    const temps = available('tempC');
+    const avgC = average(temps);
+    const minC = temps.length ? Math.min(...temps) : null;
+    const maxC = temps.length ? Math.max(...temps) : null;
+    const avgWindMs = average(available('windMs'));
+    const gusts = available('gustMs');
+    const maxGustMs = gusts.length ? Math.max(...gusts) : null;
+    const probabilities = activeHours.map(h => h.precipProb).filter(Number.isFinite);
+    const maxPrecipProb = timeWindowKey === 'night' ? day.nextNightPrecipProb ?? null :
+        probabilities.length ? Math.max(...probabilities) : null;
+    const sumPrecipMm = timeWindowKey === 'night' ? day.nextNightPrecip?.mm ?? null :
+        timeWindowKey === 'day_shift' ? day.dayShiftPrecip?.mm ?? null : completePrecipSum(activeHours);
 
     return {
         hours,
@@ -2095,11 +2237,23 @@ export function computeDayWindowStats(day, timeWindowKey = 'full') {
     };
 }
 
+export function hasDryWindow(day) {
+    if (!Number.isFinite(day.precipMm) || day.precipMm >= 0.5) return false;
+    if (Number.isFinite(day.dailyPrecipProbability)) return day.dailyPrecipProbability < 15;
+    const hours = new Map((day.hours || []).map(slot => [slot.hour, slot]));
+    for (let hour = 0; hour < 24; hour++) {
+        const slot = hours.get(hour);
+        if (!slot || !(Number.isFinite(slot.precipProb) ? slot.precipProb < 15 : slot.precipMm === 0)) return false;
+    }
+    return true;
+}
+
 export function buildPentadSummary(days) {
     if (!Array.isArray(days) || !days.length) return [];
     const pentads = [];
     for (let i = 0; i < days.length; i += 5) {
-        const chunk = days.slice(i, i + 5);
+        const chunk = days.slice(i, i + 5).filter(d => d.hasForecast !== false);
+        if (!chunk.length) continue;
         const n = chunk.length;
         const first = chunk[0];
         const last = chunk[n - 1];
@@ -2110,19 +2264,26 @@ export function buildPentadSummary(days) {
             return vals.length ? +(vals.reduce((a, b) => a + b, 0) / vals.length).toFixed(decimals) : null;
         };
 
-        const maxC = avg((d) => d.maxC);
-        const minC = avg((d) => d.minC);
-        const absMaxC = +Math.max(...chunk.map((d) => d.maxC)).toFixed(1);
-        const absMinC = +Math.min(...chunk.map((d) => d.minC)).toFixed(1);
-        const meanC = +((maxC + minC) / 2).toFixed(1);
+        const maxC = avgAvailable(d => d.maxC);
+        const minC = avgAvailable(d => d.minC);
+        const extreme = (field, fn) => {
+            const values = chunk.map(d => d[field]).filter(Number.isFinite);
+            return values.length ? fn(...values) : null;
+        };
+        const absMaxC = extreme('maxC', Math.max);
+        const absMinC = extreme('minC', Math.min);
+        const meanC = maxC === null || minC === null ? null : roundOne((maxC + minC) / 2);
 
         const wind = blendWindVectors(
             chunk.map((d) => ({ speedMs: d.windMs, gustMs: d.gustMs, dirDeg: d.windDeg ?? null, weight: 1 }))
         );
-        const precipMm = +chunk.reduce((s, d) => s + (d.precipMm ?? 0), 0).toFixed(1);
-        const precipP75Mm = +chunk.reduce((s, d) => s + (d.precipP75Mm ?? d.precipMm ?? 0), 0).toFixed(1);
-        const snowMm = +chunk.reduce((s, d) => s + (d.snowMm ?? 0), 0).toFixed(1);
-        const rainMm = +chunk.reduce((s, d) => s + (d.rainMm ?? 0), 0).toFixed(1);
+        const complete = chunk.length === Math.min(5, days.length - i);
+        const completeSum = field => complete && chunk.every(d => Number.isFinite(d[field]))
+            ? +chunk.reduce((sum, d) => sum + d[field], 0).toFixed(2) : null;
+        const precipMm = completeSum('precipMm');
+        const precipP75Mm = completeSum('precipP75Mm');
+        const snowMm = completeSum('snowMm');
+        const rainMm = completeSum('rainMm');
 
         const startDay = first.dateStr.split(' ')[0];
         const endParts = last.dateStr.split(' ');
@@ -2132,20 +2293,13 @@ export function buildPentadSummary(days) {
             ? `${startDay}–${endParts[0]} ${endParts[1]}`
             : `${first.dateStr}–${last.dateStr}`;
 
-        const qMax = enforceQuantiles(
-            maxC,
-            avg((d) => d.maxP10C ?? d.maxC),
-            avg((d) => d.maxP25C ?? d.maxC),
-            avg((d) => d.maxP75C ?? d.maxC),
-            avg((d) => d.maxP90C ?? d.maxC)
-        );
-        const qMin = enforceQuantiles(
-            minC,
-            avg((d) => d.minP10C ?? d.minC),
-            avg((d) => d.minP25C ?? d.minC),
-            avg((d) => d.minP75C ?? d.minC),
-            avg((d) => d.minP90C ?? d.minC)
-        );
+        const ranges = Object.fromEntries(TEMP_QUANTILE_FIELDS.map(key => [
+            key, chunk.every(d => Number.isFinite(d[key])) ? avg(d => d[key]) : null
+        ]));
+        const kinds = new Set(chunk.map(d => hasEnsembleRange(d) ? 'ensemble' : d.temperatureRange?.kind === 'estimate' ? 'estimate' : 'unknown'));
+        const temperatureRange = kinds.size === 1 && kinds.has('ensemble')
+            ? { kind: 'ensemble', sources: [...new Set(chunk.flatMap(d => d.temperatureRange.sources || []))] }
+            : { kind: kinds.size === 1 ? [...kinds][0] : 'mixed' };
 
         const repZone = chunk[Math.floor(n / 2)].zone;
 
@@ -2168,7 +2322,7 @@ export function buildPentadSummary(days) {
             const mMin = avgAvailable((d) => d.modelBreakdown?.[mId]?.minC);
             if (mMax !== null || mMin !== null) modelBreakdown[mId] = { maxC: mMax, minC: mMin };
         }
-        const meanPhase = classifyPrecipPhase(meanC, Math.round(avg((d) => d.humidity ?? 70)), precipMm, avg((d) => d.soil0C ?? 0));
+        const meanPhase = classifyPrecipPhase(meanC, Math.round(avg((d) => d.humidity ?? 70)), precipMm, avgAvailable(d => d.soil0C));
 
         pentads.push({
             id: first.id,
@@ -2182,7 +2336,8 @@ export function buildPentadSummary(days) {
             dateStr: label,
             dayShort: `${n}д`,
             zone: repZone,
-            confidencePct: Math.round(avg((d) => d.confidencePct ?? 70)),
+            confidencePct: null,
+            temperatureRange,
             maxC,
             maxF: cToF(maxC),
             minC,
@@ -2190,37 +2345,30 @@ export function buildPentadSummary(days) {
             absMaxC,
             absMinC,
             meanC,
-            maxP10C: qMax.p10,
-            maxP25C: qMax.p25,
-            maxP75C: qMax.p75,
-            maxP90C: qMax.p90,
-            minP10C: qMin.p10,
-            minP25C: qMin.p25,
-            minP75C: qMin.p75,
-            minP90C: qMin.p90,
+            ...ranges,
             climMaxC: avg((d) => d.climMaxC),
             climMinC: avg((d) => d.climMinC),
-            climAnomalyC: avg((d) => d.climAnomalyC),
+            climAnomalyC: avgAvailable(d => d.climAnomalyC),
             humidity: Math.round(avg((d) => d.humidity ?? 70)),
             precipMm,
             precipP75Mm,
             snowMm,
             rainMm,
-            precipDay: Math.round(Math.max(...chunk.map((d) => d.precipDay ?? 0))),
-            precipDayType: meanPhase.potentialShortRu,
-            precipPhase: meanPhase.phase,
+            precipDay: complete && chunk.every(d => Number.isFinite(d.precipDay)) ? extreme('precipDay', Math.max) : null,
+            precipDayType: meanC === null || precipMm === null ? null : meanPhase.potentialShortRu,
+            precipPhase: precipMm === null || meanC === null ? null : meanPhase.phase,
             snowDepthCm: +Math.max(...chunk.map((d) => d.snowDepthCm ?? 0)).toFixed(1),
             windMs: wind.windMs,
             windMph: wind.windMph,
-            gustMs: +Math.max(...chunk.map((d) => d.gustMs ?? 0)).toFixed(1),
-            gustMph: msToMph(Math.max(...chunk.map((d) => d.gustMs ?? 0))),
+            gustMs: extreme('gustMs', Math.max),
+            gustMph: msToMph(extreme('gustMs', Math.max)),
             windDeg: wind.windDeg,
             windDirShort: wind.windDirShort,
-            soil0C: avg((d) => d.soil0C ?? 0),
-            soil6C: avg((d) => d.soil6C ?? 0),
-            soil18C: avg((d) => d.soil18C ?? 0),
-            soil54C: avg((d) => d.soil54C ?? 0),
-            dewPointC: avg((d) => d.dewPointC ?? 0),
+            soil0C: avgAvailable(d => d.soil0C),
+            soil6C: avgAvailable(d => d.soil6C),
+            soil18C: avgAvailable(d => d.soil18C),
+            soil54C: avgAvailable(d => d.soil54C),
+            dewPointC: avgAvailable(d => d.dewPointC),
             pressureStationMm: avgAvailable((d) => d.pressureStationMm, 0),
             pressureMslMm: avgAvailable((d) => d.pressureMslMm, 0),
             deltaP24hMm: peakDeltaP !== null ? Math.round(peakDeltaP) : null,

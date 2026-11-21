@@ -159,6 +159,7 @@ test('computeApparentTempC and computeFieldOpsMetrics produce valid physical out
   assert.ok(warmApparent >= 27, `expected muggy apparent temp >= 27C, got ${warmApparent}`);
 
   const coldDay = {
+    dataQuality: { roadRiskInputsAvailable: true },
     isoDate: '2026-11-25',
     maxC: -18,
     minC: -32,
